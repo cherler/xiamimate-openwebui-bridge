@@ -1,0 +1,34 @@
+services:
+  open-webui:
+    image: ${OPEN_WEBUI_IMAGE:-ghcr.io/open-webui/open-webui:main}
+    restart: unless-stopped
+    ports:
+      - "${OPEN_WEBUI_PORT:-3000}:8080"
+    environment:
+      OPENAI_API_BASE_URL: http://pipelines:9099/v1
+      OPENAI_API_KEY: ${PIPELINES_API_KEY}
+      WEBUI_SECRET_KEY: ${OPEN_WEBUI_SECRET_KEY}
+    volumes:
+      - ./data/open-webui:/app/backend/data
+      - ./tools:/opt/xiamimate/tools:ro
+    depends_on:
+      - pipelines
+
+  pipelines:
+    image: ${PIPELINES_IMAGE:-ghcr.io/open-webui/pipelines:main}
+    restart: unless-stopped
+    ports:
+      - "${PIPELINES_PORT:-9099}:9099"
+    environment:
+      PIPELINES_API_KEY: ${PIPELINES_API_KEY}
+      PIPELINES_DIR: /app/pipelines
+      XIAMIMATE_MODEL_PREFIX: ${XIAMIMATE_MODEL_PREFIX:-xiamimate}
+      CHAT_BACKEND_BASE_URL: ${CHAT_BACKEND_BASE_URL:-http://chat-backend:8200}
+      CHAT_BACKEND_TIMEOUT: ${CHAT_BACKEND_TIMEOUT:-30}
+      CHAT_BACKEND_SERVICE_SECRET: ${CHAT_BACKEND_SERVICE_SECRET}
+      CHAT_BACKEND_SERVICE_NAME: ${CHAT_BACKEND_SERVICE_NAME:-open-webui-pipeline}
+      DIFY_REQUEST_TIMEOUT: ${DIFY_REQUEST_TIMEOUT:-180}
+      AGENT_OPENAI_MODEL: ${AGENT_OPENAI_MODEL:-MiniMax-M2.7-highspeed}
+    volumes:
+      - ./pipelines:/app/pipelines
+      - ./tools:/app/tools:ro

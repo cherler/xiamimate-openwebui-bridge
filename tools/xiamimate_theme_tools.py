@@ -1,0 +1,285 @@
+"""
+title: XiaMimate Theme Tools
+author: GitHub Copilot
+date: 2026-04-14
+version: 0.2.0
+description: Native Open WebUI tool wrappers for XiaMimate theme_api and Dify knowledge base retrieval.
+requirements: requests
+"""
+
+import json
+import os
+from typing import Iterable, List, Optional
+
+import requests
+
+
+INTERNAL_SERVICE_SECRET_HEADER_NAME = "X-Internal-Service-Secret"
+INTERNAL_SERVICE_NAME_HEADER_NAME = "X-Internal-Service-Name"
+
+
+class Tools:
+    def __init__(self):
+        self.chat_backend_base_url = (os.getenv("CHAT_BACKEND_BASE_URL") or "").rstrip("/")
+        self.timeout = int(os.getenv("CHAT_BACKEND_TIMEOUT") or "30")
+        self.service_secret = os.getenv("CHAT_BACKEND_SERVICE_SECRET") or ""
+        self.service_name = os.getenv("CHAT_BACKEND_SERVICE_NAME") or "open-webui-pipeline"
+
+    def search_knowledge_base(
+        self,
+        query: str,
+        top_k: int = 5,
+    ) -> str:
+        """Search the cross-border e-commerce knowledge base for platform rules, operational guides, and market insights about TikTok Shop, Temu, and Amazon.
+
+        Use this tool when answering questions about platform policies, seller requirements, category regulations, logistics, compliance, operational best practices, or any domain knowledge that is not numerical product data.
+
+        :param query: The search query describing what knowledge you need. Be specific, e.g. "TikTok Shop US seller onboarding requirements" or "Temu semi-managed vs fully-managed differences".
+        :param top_k: Number of top relevant snippets to return (default 5).
+        :return: Formatted knowledge snippets with source attribution.
+        """
+        return self._proxy_result(
+            path="/internal/provider/dify-dataset/retrieve",
+            payload={"query": query, "top_k": top_k},
+            error_prefix="知识库检索失败",
+        )
+
+    def resolve_candidates(
+        self,
+        product_query: str,
+        marketplace: str = "US",
+        query_aliases: str = "",
+        category_hints: str = "",
+        price_min: Optional[float] = None,
+        price_max: Optional[float] = None,
+        max_candidates: int = 30,
+        active_only: bool = True,
+    ) -> str:
+        """Resolve a candidate ASIN pool for a product theme.
+
+        :param product_query: Product keyword or theme to analyze.
+        :param marketplace: Marketplace code such as US, UK, DE, or JP.
+        :param query_aliases: Optional CSV string of query aliases.
+        :param category_hints: Optional CSV string of category hints.
+        :param price_min: Optional lower bound for current price.
+        :param price_max: Optional upper bound for current price.
+        :param max_candidates: Maximum number of ASINs to return.
+        :param active_only: Whether to keep only active candidates.
+        :return: JSON response from theme_api.
+        """
+        return self._request(
+            "/api/product-theme/resolve-candidates",
+            {
+                "product_query": product_query,
+                "marketplace": marketplace,
+                "query_aliases": self._normalize_csv(query_aliases),
+                "category_hints": self._normalize_csv(category_hints),
+                "price_min": price_min,
+                "price_max": price_max,
+                "max_candidates": max_candidates,
+                "active_only": active_only,
+            },
+        )
+
+    def candidate_pool_stats(
+        self,
+        candidate_asins: str,
+        marketplace: str = "US",
+        window_days: int = 30,
+    ) -> str:
+        """Get descriptive statistics for a resolved candidate pool.
+
+        :param candidate_asins: CSV string of candidate ASINs.
+        :param marketplace: Marketplace code such as US, UK, DE, or JP.
+        :param window_days: Lookback window for the pool metrics.
+        :return: JSON response from theme_api.
+        """
+        return self._request(
+            "/api/product-theme/candidate-pool-stats",
+            {
+                "candidate_asins": self._normalize_csv(candidate_asins),
+                "marketplace": marketplace,
+                "window_days": window_days,
+            },
+        )
+
+    def candidate_pool_trends(
+        self,
+        candidate_asins: str,
+        marketplace: str = "US",
+        window_days: int = 30,
+    ) -> str:
+        """Get trend diagnostics for a candidate pool.
+
+        :param candidate_asins: CSV string of candidate ASINs.
+        :param marketplace: Marketplace code such as US, UK, DE, or JP.
+        :param window_days: Lookback window for trend calculations.
+        :return: JSON response from theme_api.
+        """
+        return self._request(
+            "/api/product-theme/candidate-pool-trends",
+            {
+                "candidate_asins": self._normalize_csv(candidate_asins),
+                "marketplace": marketplace,
+                "window_days": window_days,
+            },
+        )
+
+    def candidate_pool_weak_forecast(
+        self,
+        candidate_asins: str,
+        marketplace: str = "US",
+        window_days: int = 30,
+        top_n: int = 5,
+    ) -> str:
+        """Get weak-signal forecast markers for a candidate pool.
+
+        :param candidate_asins: CSV string of candidate ASINs.
+        :param marketplace: Marketplace code such as US, UK, DE, or JP.
+        :param window_days: Lookback window for forecast features.
+        :param top_n: Number of top opportunity or risk signals to keep.
+        :return: JSON response from theme_api.
+        """
+        return self._request(
+            "/api/product-theme/candidate-pool-weak-forecast",
+            {
+                "candidate_asins": self._normalize_csv(candidate_asins),
+                "marketplace": marketplace,
+                "window_days": window_days,
+                "top_n": top_n,
+            },
+        )
+
+    def top_asin_drilldown(
+        self,
+        candidate_asins: str,
+        marketplace: str = "US",
+        window_days: int = 30,
+        top_n: Optional[int] = None,
+    ) -> str:
+        """Inspect the strongest ASINs in a candidate pool.
+
+        :param candidate_asins: CSV string of candidate ASINs.
+        :param marketplace: Marketplace code such as US, UK, DE, or JP.
+        :param window_days: Lookback window for the drilldown.
+        :param top_n: Optional limit for the number of ASINs returned.
+        :return: JSON response from theme_api.
+        """
+        payload = {
+            "candidate_asins": self._normalize_csv(candidate_asins),
+            "marketplace": marketplace,
+            "window_days": window_days,
+        }
+        if top_n is not None:
+            payload["top_n"] = top_n
+        return self._request("/api/product-theme/top-asin-drilldown", payload)
+
+    def category_benchmark(
+        self,
+        candidate_asins: str,
+        marketplace: str = "US",
+        window_days: int = 30,
+    ) -> str:
+        """Compare a candidate pool against its benchmark category.
+
+        :param candidate_asins: CSV string of candidate ASINs.
+        :param marketplace: Marketplace code such as US, UK, DE, or JP.
+        :param window_days: Lookback window for the benchmark snapshot.
+        :return: JSON response from theme_api.
+        """
+        return self._request(
+            "/api/product-theme/category-benchmark",
+            {
+                "candidate_asins": self._normalize_csv(candidate_asins),
+                "marketplace": marketplace,
+                "window_days": window_days,
+            },
+        )
+
+    def _normalize_csv(self, value) -> List[str]:
+        if value is None:
+            return []
+
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            try:
+                parsed = json.loads(stripped)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, list):
+                return self._flatten_csv_items(parsed)
+            return [item.strip() for item in stripped.split(",") if item.strip()]
+
+        if isinstance(value, dict):
+            nested_values = (
+                value.get("candidate_asins")
+                or value.get("asins")
+                or value.get("items")
+                or value.get("candidates")
+                or value.get("data")
+            )
+            if nested_values is not None:
+                return self._normalize_csv(nested_values)
+
+        if isinstance(value, (list, tuple, set)):
+            return self._flatten_csv_items(value)
+
+        return [str(value).strip()] if str(value).strip() else []
+
+    def _flatten_csv_items(self, values: Iterable) -> List[str]:
+        items: List[str] = []
+        for value in values:
+            if isinstance(value, dict):
+                text = str(
+                    value.get("asin")
+                    or value.get("code")
+                    or value.get("id")
+                    or ""
+                ).strip()
+            else:
+                text = str(value).strip()
+            if text:
+                items.append(text)
+        return items
+
+    def _request(self, path: str, payload: dict) -> str:
+        operation = path.rsplit("/", 1)[-1].replace("-", "_")
+        return self._proxy_result(
+            path="/internal/provider/theme-api/%s" % operation,
+            payload={"payload": payload},
+            error_prefix="theme_api 请求失败",
+        )
+
+    def _proxy_result(self, path: str, payload: dict, error_prefix: str) -> str:
+        if not self.chat_backend_base_url:
+            return "CHAT_BACKEND_BASE_URL 未配置。"
+        if not self.service_secret:
+            return "CHAT_BACKEND_SERVICE_SECRET 未配置。"
+
+        response = None
+        try:
+            response = requests.post(
+                "%s%s" % (self.chat_backend_base_url, path),
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    INTERNAL_SERVICE_SECRET_HEADER_NAME: self.service_secret,
+                    INTERNAL_SERVICE_NAME_HEADER_NAME: self.service_name,
+                },
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            wrapper = response.json()
+            if wrapper.get("success") is not True:
+                detail = str(wrapper.get("message") or "")
+                if detail.startswith(error_prefix):
+                    return detail[:4000]
+                return "%s:\n%s" % (error_prefix, detail[:4000])
+            return str((wrapper.get("data") or {}).get("result") or "")
+        except requests.RequestException as exc:
+            detail = response.text if response is not None else str(exc)
+            if detail.startswith(error_prefix):
+                return detail[:4000]
+            return "%s:\n%s" % (error_prefix, detail[:4000])

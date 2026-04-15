@@ -1,0 +1,5 @@
+.env
+data/
+__pycache__/
+pipelines/xiamimate/
+pipelines/xiamimate_mode_router/
