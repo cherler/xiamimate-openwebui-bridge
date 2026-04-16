@@ -15,6 +15,7 @@ import re
 import time
 import uuid
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 from inspect import signature
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
@@ -29,6 +30,7 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 1. 需要数据时优先调用已挂载的工具，不要凭空编造指标。
 2. 需要平台规则、运营方法、合规要求等知识时，先调用 search_knowledge_base 工具检索知识库，不要依赖自身训练数据。
 3. 需要商品数据时，使用工具链：resolve_candidates -> candidate_pool_stats / candidate_pool_trends / candidate_pool_weak_forecast / top_asin_drilldown / category_benchmark。
+4. 当 top_asin_drilldown 返回空结果或用户提供了本地数据库可能没有的 ASIN 时，使用 keepa_asin_lookup 直连 Keepa API 查询实时数据。
 4. 如果工具尚未返回数据，只能给出分析框架、验证路径和风险提醒，明确标注为待验证。
 5. 输出尽量围绕结论、证据、风险、下一步动作。
 6. 每个结论标注数据来源类型：知识库 / 推理 / 工具数据。
@@ -46,6 +48,15 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 - candidate_pool_weak_forecast: 弱信号预测标记
 - top_asin_drilldown: 头部 ASIN 下钻
 - category_benchmark: 类目基准对比
+- keepa_asin_lookup: 直连 Keepa API 查询 ASIN 商品详情（当本地数据库没有相关 ASIN 时使用）
+"""
+
+TOOL_ONLY_SYSTEM_PROMPT = AGENT_SYSTEM_PROMPT + """
+
+/tool 模式附加规则：
+- 只允许依赖当前已挂载工具完成分析，不要联网搜索，不要假设存在外部网页结果。
+- 如果工具还未返回证据，就明确写成“待工具验证”，不要把推测写成事实。
+- 优先给出下一步所需的最小工具调用，再基于工具结果汇总结论。
 """
 
 TOOL_RESULT_TEMPLATE = """以下是工具执行结果，请基于这些结果继续回答用户原问题。
@@ -66,11 +77,13 @@ ALLOWED_AGENT_TOOLS = {
     "candidate_pool_weak_forecast",
     "top_asin_drilldown",
     "category_benchmark",
+    "keepa_asin_lookup",
 }
 
 COMMAND_TO_MODE = {
     "/agent": "agent",
     "/wf": "workflow",
+    "/tool": "tool",
     "/workflow": "workflow",
 }
 
@@ -90,21 +103,22 @@ INTERNAL_SERVICE_NAME_HEADER_NAME = "X-Internal-Service-Name"
 IDEMPOTENCY_KEY_HEADER_NAME = "Idempotency-Key"
 
 POINT_COST_BY_EVENT = {
-    "minimax_request": 1,
-    "dify_workflow_run": 8,
-    "dify_knowledge_retrieve": 1,
-    "theme_api_call": 2,
-    "tavily_search": 2,
+    "llm_request": 1,
+    "workflow_run": 8,
+    "kb_retrieve": 1,
+    "product_api_call": 1,
+    "web_search": 1,
 }
 
 TOOL_BILLING_EVENT = {
-    "search_knowledge_base": "dify_knowledge_retrieve",
-    "resolve_candidates": "theme_api_call",
-    "candidate_pool_stats": "theme_api_call",
-    "candidate_pool_trends": "theme_api_call",
-    "candidate_pool_weak_forecast": "theme_api_call",
-    "top_asin_drilldown": "theme_api_call",
-    "category_benchmark": "theme_api_call",
+    "search_knowledge_base": "kb_retrieve",
+    "resolve_candidates": "product_api_call",
+    "candidate_pool_stats": "product_api_call",
+    "candidate_pool_trends": "product_api_call",
+    "candidate_pool_weak_forecast": "product_api_call",
+    "top_asin_drilldown": "product_api_call",
+    "category_benchmark": "product_api_call",
+    "keepa_asin_lookup": "product_api_call",
 }
 
 WORKFLOW_SUGGESTION_PROMPTS = [
@@ -243,10 +257,12 @@ class Pipeline:
             self._rewrite_last_user_message(messages, normalized_user_message) if command_used else messages
         )
 
+        self._disable_web_search_feature(body)
+
         if mode == "workflow":
             return self._run_workflow(query=normalized_user_message, body=body, model=response_model)
-        if mode == "agent":
-            return self._run_agent(messages=normalized_messages, body=body, model=response_model)
+        if mode in {"agent", "tool"}:
+            return self._run_agent(messages=normalized_messages, body=body, model=response_model, mode=mode)
 
         return self._chat_response(content="未识别的 XiaMimate 模式。请使用 Agent。", model=response_model)
 
@@ -271,8 +287,8 @@ class Pipeline:
             billing_context = self._ensure_billing_context(body)
             workflow_charge = self._charge_billing_event(
                 billing_context=billing_context,
-                event_type="dify_workflow_run",
-                description="Dify workflow run",
+                event_type="workflow_run",
+                    description="Workflow 请求",
                 meta={
                     "mode": "workflow",
                     "stream": bool(body.get("stream")),
@@ -309,7 +325,7 @@ class Pipeline:
             self._refund_billing_event(
                 billing_context=billing_context,
                 charge=workflow_charge,
-                description="Dify workflow request failed",
+                description="Workflow 请求失败，已退款",
                 meta={"mode": "workflow", "error": str(exc)[:500]},
             )
             return self._chat_response(content=self._error_text(str(exc)), model=model)
@@ -320,7 +336,13 @@ class Pipeline:
 
         return self._chat_response(content=json.dumps(response, ensure_ascii=False, indent=2), model=model)
 
-    def _run_agent(self, messages: List[dict], body: dict, model: str) -> Union[dict, Iterator[bytes], str]:
+    def _run_agent(
+        self,
+        messages: List[dict],
+        body: dict,
+        model: str,
+        mode: str = "agent",
+    ) -> Union[dict, Iterator[bytes], str]:
         if not self.valves.CHAT_BACKEND_SERVICE_SECRET:
             return "CHAT_BACKEND_SERVICE_SECRET 未配置。"
 
@@ -335,10 +357,11 @@ class Pipeline:
                 body=body,
                 model=model,
                 billing_context=billing_context,
+                mode=mode,
             )
 
         try:
-            answer = self._run_agent_loop(messages=messages, body=body, billing_context=billing_context)
+            answer = self._run_agent_loop(messages=messages, body=body, billing_context=billing_context, mode=mode)
         except RuntimeError as exc:
             return self._error_text(str(exc))
 
@@ -350,39 +373,70 @@ class Pipeline:
         body: dict,
         model: str,
         billing_context: dict,
+        mode: str,
     ) -> Iterator[bytes]:
         response_id = "%s-%s" % (model, uuid.uuid4())
         created = int(time.time())
         conversation = deepcopy(messages or [])
         answer_started = False
+        used_tools = False
+        reasoning_open = False
 
         def emit_text_chunk(content: str) -> bytes:
-            return self._sse_chunk(
-                {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant", "content": content},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
+            return self._stream_content_chunk(
+                response_id=response_id,
+                created=created,
+                model=model,
+                content=content,
+            )
+
+        def emit_reasoning_chunks(content: str) -> List[bytes]:
+            nonlocal reasoning_open
+
+            chunks: List[bytes] = []
+            if not reasoning_open:
+                reasoning_open = True
+                chunks.append(
+                    self._stream_reasoning_open_chunk(
+                        response_id=response_id,
+                        created=created,
+                        model=model,
+                    )
+                )
+            if content:
+                chunks.append(
+                    self._stream_reasoning_text_chunk(
+                        response_id=response_id,
+                        created=created,
+                        model=model,
+                        content=content,
+                    )
+                )
+            return chunks
+
+        def close_reasoning_chunk() -> Optional[bytes]:
+            nonlocal reasoning_open
+
+            if not reasoning_open:
+                return None
+            reasoning_open = False
+            return self._stream_reasoning_close_chunk(
+                response_id=response_id,
+                created=created,
+                model=model,
             )
 
         try:
-            yield emit_text_chunk(self._format_agent_progress("正在分析问题"))
+            for chunk in emit_reasoning_chunks(self._format_agent_progress("正在分析问题")):
+                yield chunk
 
             for round_index in range(6):
-                payload = self._prepare_agent_payload(messages=conversation, body=body)
+                payload = self._prepare_agent_payload(messages=conversation, body=body, mode=mode)
                 payload["stream"] = False
                 minimax_charge = self._charge_billing_event(
                     billing_context=billing_context,
-                    event_type="minimax_request",
-                    description="MiniMax agent request",
+                    event_type="llm_request",
+                    description="LLM 请求",
                     meta={
                         "mode": "agent",
                         "model": payload.get("model"),
@@ -396,7 +450,7 @@ class Pipeline:
                     self._refund_billing_event(
                         billing_context=billing_context,
                         charge=minimax_charge,
-                        description="MiniMax agent request failed",
+                        description="LLM 请求失败，已退款",
                         meta={"mode": "agent", "stream": True, "error": str(exc)[:500]},
                     )
                     raise
@@ -407,18 +461,29 @@ class Pipeline:
                 if not tool_calls:
                     final_answer = self._clean_agent_content(content) or str(content or "").strip()
                     status_line = "正在生成最终答复" if round_index == 0 else "工具执行完成，正在生成最终答复"
-                    yield emit_text_chunk(self._format_agent_progress(status_line))
-                    yield emit_text_chunk("\n---\n\n")
+                    for chunk in emit_reasoning_chunks(self._format_agent_progress(status_line)):
+                        yield chunk
 
-                    for chunk in self._stream_agent_final_answer_chunks(payload=payload, fallback_content=final_answer):
-                        answer_started = True
-                        yield emit_text_chunk(chunk)
+                    close_chunk = close_reasoning_chunk()
+                    if close_chunk is not None:
+                        yield close_chunk
+
+                    if used_tools or self._agent_stream_contains_internal_markup(content):
+                        for chunk in self._split_text(final_answer):
+                            answer_started = True
+                            yield emit_text_chunk(chunk)
+                    else:
+                        for chunk in self._stream_agent_final_answer_chunks(payload=payload, fallback_content=final_answer):
+                            answer_started = True
+                            yield emit_text_chunk(chunk)
                     break
 
+                used_tools = True
                 conversation.append({"role": "assistant", "content": content})
 
                 tool_names = ", ".join(tool_call["name"] for tool_call in tool_calls)
-                yield emit_text_chunk(self._format_agent_progress("正在调用工具: %s" % tool_names))
+                for chunk in emit_reasoning_chunks(self._format_agent_progress("正在调用工具: %s" % tool_names)):
+                    yield chunk
 
                 tool_results = []
                 for tool_call in tool_calls:
@@ -431,26 +496,25 @@ class Pipeline:
                         )
                     )
                     tool_status = "失败" if self._tool_result_has_error(result) else "完成"
-                    yield emit_text_chunk(
+                    for chunk in emit_reasoning_chunks(
                         self._format_agent_progress("工具 %s 已%s" % (tool_call["name"], tool_status))
-                    )
+                    ):
+                        yield chunk
 
                 conversation.append({"role": "user", "content": "\n\n".join(tool_results)})
 
             if not answer_started:
                 raise RuntimeError("Agent 工具调用轮次超过上限，已中止。")
         except RuntimeError as exc:
+            close_chunk = close_reasoning_chunk()
+            if close_chunk is not None:
+                yield close_chunk
             yield emit_text_chunk("\n" + self._error_text(str(exc)))
 
-        yield self._sse_chunk(
-            {
-                "id": response_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }
-        )
+        close_chunk = close_reasoning_chunk()
+        if close_chunk is not None:
+            yield close_chunk
+        yield self._stream_stop_chunk(response_id=response_id, created=created, model=model)
         yield b"data: [DONE]\n\n"
 
     def _resolve_mode(
@@ -466,7 +530,7 @@ class Pipeline:
         effective_model = str(body.get("model", model_id) or model_id or "")
         model_mode = effective_model.split(".")[-1].lower() if effective_model else ""
 
-        mode = requested_mode or command_mode or (model_mode if model_mode in {"agent", "workflow"} else "agent")
+        mode = requested_mode or command_mode or (model_mode if model_mode in {"agent", "tool", "workflow"} else "agent")
         query = (command_query if command_mode else (user_message or last_user_text or "")).strip()
         return mode, query, command_mode is not None
 
@@ -498,7 +562,18 @@ class Pipeline:
                 path="/v1/me/account-overview",
                 headers=self._chat_backend_user_headers(body),
             )
-            content = self._format_account_overview(command=command, overview=overview)
+            portal_url = ""
+            try:
+                token_resp = self._chat_backend_request(
+                    method="POST",
+                    path="/internal/portal/create-token",
+                    headers=self._chat_backend_user_headers(body),
+                    internal=True,
+                )
+                portal_url = token_resp.get("portal_url", "")
+            except Exception as exc:
+                print("xiamimate portal token creation failed", str(exc))
+            content = self._format_account_overview(command=command, overview=overview, portal_url=portal_url)
         except RuntimeError as exc:
             content = self._error_text(str(exc))
 
@@ -506,7 +581,7 @@ class Pipeline:
             return self._stream_text_response(content=content, model=model)
         return self._chat_response(content=content, model=model)
 
-    def _format_account_overview(self, command: str, overview: dict) -> str:
+    def _format_account_overview(self, command: str, overview: dict, portal_url: str = "") -> str:
         user = overview.get("user") or {}
         points_account = overview.get("points_account") or {}
         usage_summary = overview.get("usage_summary") or {}
@@ -515,72 +590,255 @@ class Pipeline:
         subscriptions = overview.get("subscriptions") or []
         daily_quota = overview.get("daily_quota_state") or {}
         point_cost_by_event = overview.get("point_cost_by_event") or {}
+        event_display = overview.get("event_pricing_display") or {}
 
         display_name = str(user.get("display_name") or user.get("user_id") or "当前用户")
-        user_id = str(user.get("user_id") or "")
+        email = str(user.get("email") or "")
         balance_points = int(points_account.get("balance_points") or 0)
         plan_tier = str(overview.get("plan_tier") or user.get("plan_tier") or "unknown")
+        event_count_30d = int(usage_summary.get("event_count_30d") or 0)
 
-        lines = [f"用户: {display_name}"]
-        if user_id:
-            lines.append(f"User ID: {user_id}")
+        lines: List[str] = []
+
+        if portal_url:
+            lines.append("🔗 **账户门户**")
+            lines.extend(
+                self._render_markdown_table(
+                    headers=["功能", "链接"],
+                    rows=[["账户详情", f"[打开账户门户查看详细消费记录]({portal_url})"]],
+                )
+            )
+            lines.append("")
+
+        lines.append("👤 **用户信息**")
+        user_rows = [["用户", display_name]]
+        if email:
+            user_rows.append(["邮箱", email])
+        user_rows.append(["套餐", self._plan_tier_label(plan_tier)])
+        if command in {"overview", "points"}:
+            user_rows.append(["积分余额", f"{balance_points} 点"])
+        if command in {"overview", "usage"}:
+            user_rows.append(["近30天使用", f"{event_count_30d} 次"])
+        lines.extend(self._render_markdown_table(headers=["字段", "内容"], rows=user_rows))
 
         if command in {"overview", "points"}:
-            lines.extend(
-                [
-                    f"当前积分余额: {balance_points}",
-                    f"累计赠送积分: {int(points_account.get('lifetime_granted_points') or 0)}",
-                    f"累计购买积分: {int(points_account.get('lifetime_purchased_points') or 0)}",
-                    f"累计消费积分: {int(points_account.get('lifetime_spent_points') or 0)}",
-                ]
-            )
+            lines.append("")
+            lines.append("💰 **积分概览**")
+            points_rows = [
+                ["当前积分余额", str(balance_points)],
+                ["累计赠送积分", str(int(points_account.get("lifetime_granted_points") or 0))],
+                ["累计购买积分", str(int(points_account.get("lifetime_purchased_points") or 0))],
+                ["累计消费积分", str(int(points_account.get("lifetime_spent_points") or 0))],
+            ]
             if daily_quota:
                 quota_points = int(daily_quota.get("quota_points") or 0)
                 consumed_points = int(daily_quota.get("consumed_points") or 0)
-                lines.append(
-                    f"Guest 当日配额: {max(0, quota_points - consumed_points)}/{quota_points} (日期 {daily_quota.get('quota_date')})"
+                points_rows.append(
+                    [
+                        "Guest 当日配额",
+                        "%s/%s（日期 %s）"
+                        % (max(0, quota_points - consumed_points), quota_points, daily_quota.get("quota_date") or "-"),
+                    ]
                 )
+            lines.extend(self._render_markdown_table(headers=["项目", "数值"], rows=points_rows))
             if recent_ledger:
                 lines.append("")
-                lines.append("最近账本:")
+                lines.append("🧾 **最近账本**")
+                ledger_rows = []
                 for row in recent_ledger[:6]:
                     delta = int(row.get("points_delta") or 0)
                     sign = "+" if delta >= 0 else ""
-                    lines.append(
-                        f"- {row.get('created_at')} | {row.get('entry_type')} | {sign}{delta} | 余额 {row.get('balance_after_points')} | {row.get('description') or row.get('event_type') or ''}"
+                    ledger_rows.append(
+                        [
+                            self._format_beijing_time(row.get("created_at")),
+                            self._ledger_entry_type_label(row.get("entry_type"), row.get("event_type")),
+                            "%s%s" % (sign, delta),
+                            str(row.get("balance_after_points") or 0),
+                            self._ledger_description_label(row),
+                        ]
                     )
+                lines.extend(
+                    self._render_markdown_table(
+                        headers=["时间", "类型", "变动", "余额", "说明"],
+                        rows=ledger_rows,
+                    )
+                )
 
         if command in {"overview", "usage"}:
             lines.append("")
-            lines.append("使用汇总:")
-            lines.append(f"- 1 天内 units: {usage_summary.get('units_1d', 0)}")
-            lines.append(f"- 7 天内 units: {usage_summary.get('units_7d', 0)}")
-            lines.append(f"- 30 天内 units: {usage_summary.get('units_30d', 0)}")
-            lines.append(f"- 30 天内事件数: {usage_summary.get('event_count_30d', 0)}")
+            lines.append("📈 **使用汇总（按计费单位统计）**")
+            lines.extend(
+                self._render_markdown_table(
+                    headers=["周期", "数值"],
+                    rows=[
+                        ["1 天内总用量", str(usage_summary.get("units_1d", 0))],
+                        ["7 天内总用量", str(usage_summary.get("units_7d", 0))],
+                        ["30 天内总用量", str(usage_summary.get("units_30d", 0))],
+                        ["30 天内事件数", str(usage_summary.get("event_count_30d", 0))],
+                    ],
+                )
+            )
             if usage_by_type:
-                lines.append("- 30 天内按事件类型:")
+                lines.append("")
+                lines.append("- 30 天内按事件类型：")
+                usage_rows = []
                 for row in usage_by_type[:8]:
-                    lines.append(f"  {row.get('event_type')}: {row.get('total_units')}")
+                    event_type = str(row.get("event_type") or "")
+                    label = self._event_type_label(event_type, event_display)
+                    usage_rows.append([label, str(row.get("total_units") or 0)])
+                lines.extend(self._render_markdown_table(headers=["行为", "30天总用量"], rows=usage_rows))
 
         if command in {"overview", "plan"}:
             lines.append("")
-            lines.append(f"当前套餐: {plan_tier}")
+            lines.append("📦 **套餐与计价**")
+            plan_rows = [["当前套餐", self._plan_tier_label(plan_tier)]]
             entitlements = overview.get("entitlements") or {}
             if entitlements:
-                lines.append(f"套餐权益: {json.dumps(entitlements, ensure_ascii=False)}")
+                plan_rows.append(["套餐权益", self._plan_entitlements_label(entitlements)])
             if subscriptions:
                 latest = subscriptions[0]
-                lines.append(
-                    f"订阅状态: {latest.get('status')} | package={latest.get('package_code')} | monthly_points={latest.get('monthly_points')}"
+                plan_rows.append(
+                    [
+                        "订阅状态",
+                        "状态：%s；套餐：%s；月度积分：%s"
+                        % (
+                            latest.get("status") or "-",
+                            latest.get("package_code") or "-",
+                            latest.get("monthly_points") or "-",
+                        ),
+                    ]
                 )
+            lines.extend(self._render_markdown_table(headers=["项目", "说明"], rows=plan_rows))
             if point_cost_by_event:
-                lines.append("当前计价:")
+                lines.append("")
+                lines.append("- 当前计价：")
+                pricing_rows = []
                 for event_type, points in point_cost_by_event.items():
-                    lines.append(f"- {event_type}: {points} 积分/单位")
+                    label = self._event_type_label(event_type, event_display)
+                    pricing_rows.append([label, "%s 积分/次" % points])
+                lines.extend(self._render_markdown_table(headers=["行为", "价格"], rows=pricing_rows))
 
         lines.append("")
-        lines.append("可用命令: /me  /points  /usage  /plan")
+        lines.append("🧭 **可用命令**")
+        lines.append("- /me  /points  /usage  /plan")
         return "\n".join(lines)
+
+    def _render_markdown_table(self, headers: List[str], rows: List[List[str]]) -> List[str]:
+        if not rows:
+            return []
+        table_lines = ["| %s |" % " | ".join(headers), "| %s |" % " | ".join(["---"] * len(headers))]
+        for row in rows:
+            table_lines.append("| %s |" % " | ".join(self._escape_table_cell(cell) for cell in row))
+        return table_lines
+
+    def _escape_table_cell(self, value: Any) -> str:
+        text = str(value or "-")
+        return text.replace("|", "\\|").replace("\n", "<br>")
+
+    def _format_beijing_time(self, value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return "-"
+        try:
+            normalized = text.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(normalized)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return text
+
+    def _plan_tier_label(self, value: str) -> str:
+        mapping = {
+            "free": "免费版",
+            "guest": "访客版",
+            "standard": "标准版",
+            "pro": "专业版",
+            "admin": "管理员",
+        }
+        return mapping.get((value or "").strip().lower(), value or "-")
+
+    def _event_type_label(self, event_type: str, event_display: dict) -> str:
+        alias_mapping = {
+            "llm_request": "LLM请求",
+            "minimax_request": "LLM请求",
+            "workflow_run": "workflow请求",
+            "kb_retrieve": "知识库检索",
+            "dify_knowledge_retrieve": "知识库检索",
+            "product_api_call": "商品API检索",
+            "web_search": "网络搜索",
+        }
+        if event_type in event_display:
+            return str(event_display.get(event_type) or event_type)
+        return alias_mapping.get(event_type, event_type or "-")
+
+    def _ledger_entry_type_label(self, entry_type: Any, event_type: Any) -> str:
+        entry_text = str(entry_type or "").strip().lower()
+        mapping = {
+            "consume": "消费",
+            "refund": "退款",
+            "grant": "赠送",
+            "signup_gift": "注册赠送",
+            "admin_grant": "后台加积分",
+            "subscription_grant": "订阅发放",
+        }
+        if entry_text in mapping:
+            return mapping[entry_text]
+        if entry_text:
+            return mapping.get(entry_text, entry_text)
+        return self._event_type_label(str(event_type or ""), {})
+
+    def _ledger_description_label(self, row: dict) -> str:
+        description = str(row.get("description") or "").strip()
+        event_type = str(row.get("event_type") or "").strip()
+        known_descriptions = {
+            "MiniMax agent request": "LLM 请求",
+            "MiniMax agent request failed": "LLM 请求失败，已退款",
+            "Dify workflow run": "Workflow 请求",
+            "Dify workflow request failed": "Workflow 请求失败，已退款",
+        }
+        if description in known_descriptions:
+            return known_descriptions[description]
+        if description.startswith("Tool call: "):
+            tool_name = description.replace("Tool call: ", "", 1).strip()
+            return "工具调用：%s" % self._tool_name_label(tool_name)
+        if description.startswith("Tool call failed: "):
+            tool_name = description.replace("Tool call failed: ", "", 1).strip()
+            return "工具调用失败：%s" % self._tool_name_label(tool_name)
+        if description.startswith("Tool call returned error: "):
+            tool_name = description.replace("Tool call returned error: ", "", 1).strip()
+            return "工具调用异常：%s" % self._tool_name_label(tool_name)
+        if description:
+            return description
+        return self._event_type_label(event_type, {})
+
+    def _tool_name_label(self, tool_name: str) -> str:
+        mapping = {
+            "search_knowledge_base": "知识库检索",
+            "resolve_candidates": "候选池解析",
+            "candidate_pool_stats": "候选池统计",
+            "candidate_pool_trends": "候选池趋势",
+            "candidate_pool_weak_forecast": "弱信号预测",
+            "top_asin_drilldown": "头部 ASIN 深挖",
+            "category_benchmark": "类目基准对比",
+            "keepa_asin_lookup": "Keepa ASIN 查询",
+        }
+        return mapping.get(tool_name, tool_name or "-")
+
+    def _plan_entitlements_label(self, entitlements: dict) -> str:
+        if not isinstance(entitlements, dict) or not entitlements:
+            return "-"
+        parts: List[str] = []
+        daily_theme_runs = entitlements.get("daily_theme_runs")
+        if daily_theme_runs is not None:
+            parts.append("每日主题分析次数 %s 次" % daily_theme_runs)
+        retention_days = entitlements.get("history_retention_days")
+        if retention_days is not None:
+            parts.append("历史记录保留 %s 天" % retention_days)
+        daily_points = entitlements.get("daily_points")
+        if daily_points is not None:
+            parts.append("每日积分额度 %s 点" % daily_points)
+        return "；".join(parts) if parts else json.dumps(entitlements, ensure_ascii=False)
 
     def _extract_last_user_text(self, messages: List[dict]) -> str:
         for message in reversed(messages or []):
@@ -638,22 +896,50 @@ class Pipeline:
         answer_started = False
         answer_chunks: List[str] = []
         emitted_progress = set()
+        reasoning_open = False
 
         def emit_text_chunk(content: str) -> bytes:
-            return self._sse_chunk(
-                {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant", "content": content},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
+            return self._stream_content_chunk(
+                response_id=response_id,
+                created=created,
+                model=model,
+                content=content,
+            )
+
+        def emit_reasoning_chunks(content: str) -> List[bytes]:
+            nonlocal reasoning_open
+
+            chunks: List[bytes] = []
+            if not reasoning_open:
+                reasoning_open = True
+                chunks.append(
+                    self._stream_reasoning_open_chunk(
+                        response_id=response_id,
+                        created=created,
+                        model=model,
+                    )
+                )
+            if content:
+                chunks.append(
+                    self._stream_reasoning_text_chunk(
+                        response_id=response_id,
+                        created=created,
+                        model=model,
+                        content=content,
+                    )
+                )
+            return chunks
+
+        def close_reasoning_chunk() -> Optional[bytes]:
+            nonlocal reasoning_open
+
+            if not reasoning_open:
+                return None
+            reasoning_open = False
+            return self._stream_reasoning_close_chunk(
+                response_id=response_id,
+                created=created,
+                model=model,
             )
 
         try:
@@ -668,7 +954,8 @@ class Pipeline:
 
                 start_line = self._format_workflow_progress(5, "工作流已启动，正在解析需求")
                 emitted_progress.add(start_line)
-                yield emit_text_chunk(start_line)
+                for rc in emit_reasoning_chunks(start_line):
+                    yield rc
 
                 for event in self._iter_sse_events(response):
                     event_type = str(event.get("event") or "").strip()
@@ -678,7 +965,8 @@ class Pipeline:
                         stage_line = self._format_workflow_progress(10, "已连接 Dify Chatflow，开始执行节点")
                         if stage_line not in emitted_progress:
                             emitted_progress.add(stage_line)
-                            yield emit_text_chunk(stage_line)
+                            for rc in emit_reasoning_chunks(stage_line):
+                                yield rc
                         continue
 
                     if event_type == "node_finished":
@@ -691,30 +979,43 @@ class Pipeline:
                         stage_line = self._format_workflow_progress(percent, "%s 完成" % stage_label)
                         if stage_line not in emitted_progress:
                             emitted_progress.add(stage_line)
-                            yield emit_text_chunk(stage_line)
+                            for rc in emit_reasoning_chunks(stage_line):
+                                yield rc
                         continue
 
                     if event_type in {"message", "agent_message", "text_chunk"}:
-                        chunk = self._extract_workflow_answer(event)
-                        if not chunk:
+                        answer_text = self._extract_workflow_answer(event)
+                        if not answer_text:
                             continue
                         if not answer_started:
                             answer_started = True
-                            yield emit_text_chunk(self._format_workflow_progress(95, "工作流执行完成，正在整理最终报告"))
-                            yield emit_text_chunk("\n---\n\n")
-                        answer_chunks.append(chunk)
-                        yield emit_text_chunk(chunk)
+                            final_stage = self._format_workflow_progress(100, "工作流执行完成，正在整理最终报告")
+                            if final_stage not in emitted_progress:
+                                emitted_progress.add(final_stage)
+                                for rc in emit_reasoning_chunks(final_stage):
+                                    yield rc
+                            close_chunk = close_reasoning_chunk()
+                            if close_chunk is not None:
+                                yield close_chunk
+                        answer_chunks.append(answer_text)
+                        yield emit_text_chunk(answer_text)
                         continue
 
                     if event_type == "workflow_finished":
                         final_answer = self._extract_workflow_answer(event)
                         if final_answer and not answer_started:
                             answer_started = True
-                            yield emit_text_chunk(self._format_workflow_progress(95, "工作流执行完成，正在整理最终报告"))
-                            yield emit_text_chunk("\n---\n\n")
-                            for chunk in self._split_text(final_answer):
-                                answer_chunks.append(chunk)
-                                yield emit_text_chunk(chunk)
+                            final_stage = self._format_workflow_progress(100, "工作流执行完成，正在整理最终报告")
+                            if final_stage not in emitted_progress:
+                                emitted_progress.add(final_stage)
+                                for rc in emit_reasoning_chunks(final_stage):
+                                    yield rc
+                            close_chunk = close_reasoning_chunk()
+                            if close_chunk is not None:
+                                yield close_chunk
+                            for text_chunk in self._split_text(final_answer):
+                                answer_chunks.append(text_chunk)
+                                yield emit_text_chunk(text_chunk)
                         continue
 
                     if event_type == "error":
@@ -723,10 +1024,16 @@ class Pipeline:
 
                 if not answer_started:
                     final_answer = "".join(answer_chunks).strip() or "工作流已完成，但未返回可展示的结果。"
-                    yield emit_text_chunk(self._format_workflow_progress(95, "工作流执行完成，正在整理最终报告"))
-                    yield emit_text_chunk("\n---\n\n")
-                    for chunk in self._split_text(final_answer):
-                        yield emit_text_chunk(chunk)
+                    final_stage = self._format_workflow_progress(100, "工作流执行完成，正在整理最终报告")
+                    if final_stage not in emitted_progress:
+                        emitted_progress.add(final_stage)
+                        for rc in emit_reasoning_chunks(final_stage):
+                            yield rc
+                    close_chunk = close_reasoning_chunk()
+                    if close_chunk is not None:
+                        yield close_chunk
+                    for text_chunk in self._split_text(final_answer):
+                        yield emit_text_chunk(text_chunk)
 
         except requests.RequestException as exc:
             if not answer_started:
@@ -736,6 +1043,9 @@ class Pipeline:
                     description="Dify workflow stream request failed",
                     meta={"mode": "workflow_stream", "error": str(exc)[:500]},
                 )
+            close_chunk = close_reasoning_chunk()
+            if close_chunk is not None:
+                yield close_chunk
             detail = self._error_text(str(exc))
             yield emit_text_chunk("\n" + detail)
         except RuntimeError as exc:
@@ -746,17 +1056,15 @@ class Pipeline:
                     description="Dify workflow stream runtime failed",
                     meta={"mode": "workflow_stream", "error": str(exc)[:500]},
                 )
+            close_chunk = close_reasoning_chunk()
+            if close_chunk is not None:
+                yield close_chunk
             yield emit_text_chunk("\n" + self._error_text(str(exc)))
 
-        yield self._sse_chunk(
-            {
-                "id": response_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }
-        )
+        close_chunk = close_reasoning_chunk()
+        if close_chunk is not None:
+            yield close_chunk
+        yield self._stream_stop_chunk(response_id=response_id, created=created, model=model)
         yield b"data: [DONE]\n\n"
 
     def _iter_sse_events(self, response: requests.Response) -> Iterator[dict]:
@@ -804,8 +1112,8 @@ class Pipeline:
         return "⏳ /agent · %s\n" % description
 
     def _workflow_progress_percent(self, finished_count: int) -> int:
-        percent = 8 + int((finished_count * 84) / max(1, WORKFLOW_ESTIMATED_STEPS))
-        return max(8, min(92, percent))
+        percent = 8 + int((finished_count * 88) / max(1, WORKFLOW_ESTIMATED_STEPS))
+        return max(8, min(98, percent))
 
     def _format_workflow_progress(self, percent: int, description: str) -> str:
         total_slots = 10
@@ -857,7 +1165,7 @@ class Pipeline:
 
         return ""
 
-    def _prepare_agent_payload(self, messages: List[dict], body: dict) -> dict:
+    def _prepare_agent_payload(self, messages: List[dict], body: dict, mode: str = "agent") -> dict:
         # Only forward parameters that MiniMax API actually supports.
         # Exclude tools/tool_choice (MiniMax uses text-based tool calling),
         # stream_options, metadata, reasoning_effort, etc. which cause errors.
@@ -879,7 +1187,7 @@ class Pipeline:
         }
         payload = {key: value for key, value in body.items() if key in allowed_params}
         payload["model"] = self.valves.AGENT_OPENAI_MODEL
-        payload["messages"] = self._inject_agent_system_prompt(messages)
+        payload["messages"] = self._inject_agent_system_prompt(messages, mode=mode)
 
         user_value = payload.get("user")
         if isinstance(user_value, dict):
@@ -887,16 +1195,22 @@ class Pipeline:
 
         return payload
 
-    def _run_agent_loop(self, messages: List[dict], body: dict, billing_context: dict) -> str:
+    def _run_agent_loop(
+        self,
+        messages: List[dict],
+        body: dict,
+        billing_context: dict,
+        mode: str = "agent",
+    ) -> str:
         conversation = deepcopy(messages or [])
 
         for _ in range(6):
-            payload = self._prepare_agent_payload(messages=conversation, body=body)
+            payload = self._prepare_agent_payload(messages=conversation, body=body, mode=mode)
             payload["stream"] = False
             minimax_charge = self._charge_billing_event(
                 billing_context=billing_context,
-                event_type="minimax_request",
-                description="MiniMax agent request",
+                event_type="llm_request",
+                description="LLM 请求",
                 meta={
                     "mode": "agent",
                     "model": payload.get("model"),
@@ -909,7 +1223,7 @@ class Pipeline:
                 self._refund_billing_event(
                     billing_context=billing_context,
                     charge=minimax_charge,
-                    description="MiniMax agent request failed",
+                    description="LLM 请求失败，已退款",
                     meta={"mode": "agent", "error": str(exc)[:500]},
                 )
                 raise
@@ -1143,6 +1457,9 @@ class Pipeline:
         stream_payload = dict(payload)
         stream_payload["stream"] = True
         streamed = False
+        stream_state = {"pending": "", "in_think": False, "blocked": False}
+        emitted_parts: List[str] = []
+        fallback_text = self._clean_agent_content(fallback_content or "已完成，但未返回可展示的结果。")
 
         try:
             with self._chat_backend_stream_request(
@@ -1154,17 +1471,92 @@ class Pipeline:
                     chunk = self._extract_openai_stream_delta_text(event)
                     if not chunk:
                         continue
+                    cleaned_chunk = self._consume_agent_stream_text(stream_state, chunk)
+                    if not cleaned_chunk:
+                        continue
                     streamed = True
-                    yield chunk
+                    emitted_parts.append(cleaned_chunk)
+                    yield cleaned_chunk
         except RuntimeError as exc:
             print("xiamimate.agent final stream failed", str(exc))
+
+        flushed_chunk = self._flush_agent_stream_text(stream_state)
+        if flushed_chunk:
+            streamed = True
+            emitted_parts.append(flushed_chunk)
+            yield flushed_chunk
+
+        emitted_text = "".join(emitted_parts)
+        if fallback_text and fallback_text.startswith(emitted_text):
+            remainder = fallback_text[len(emitted_text) :]
+            if remainder:
+                for chunk in self._split_text(remainder):
+                    yield chunk
+            if streamed or emitted_text:
+                return
 
         if streamed:
             return
 
-        final_text = fallback_content or "已完成，但未返回可展示的结果。"
+        final_text = fallback_text or "已完成，但未返回可展示的结果。"
         for chunk in self._split_text(final_text):
             yield chunk
+
+    def _consume_agent_stream_text(self, state: dict, chunk: str) -> str:
+        if state.get("blocked"):
+            return ""
+
+        pending = "%s%s" % (state.get("pending") or "", chunk or "")
+        if self._agent_stream_contains_internal_markup(pending):
+            state["pending"] = ""
+            state["in_think"] = False
+            state["blocked"] = True
+            return ""
+
+        in_think = bool(state.get("in_think"))
+        emitted: List[str] = []
+        think_open = "<think>"
+        think_close = "</think>"
+
+        while pending:
+            if in_think:
+                close_index = pending.find(think_close)
+                if close_index == -1:
+                    reserve = len(think_close) - 1
+                    pending = pending[-reserve:] if len(pending) > reserve else pending
+                    break
+                pending = pending[close_index + len(think_close) :]
+                in_think = False
+                continue
+
+            open_index = pending.find(think_open)
+            if open_index != -1:
+                if open_index > 0:
+                    emitted.append(pending[:open_index])
+                pending = pending[open_index + len(think_open) :]
+                in_think = True
+                continue
+
+            reserve = len(think_open) - 1
+            if len(pending) > reserve:
+                emitted.append(pending[:-reserve])
+                pending = pending[-reserve:]
+            break
+
+        state["pending"] = pending
+        state["in_think"] = in_think
+        return "".join(emitted)
+
+    def _flush_agent_stream_text(self, state: dict) -> str:
+        if state.get("blocked"):
+            state["pending"] = ""
+            return ""
+        if state.get("in_think"):
+            state["pending"] = ""
+            return ""
+        pending = str(state.get("pending") or "")
+        state["pending"] = ""
+        return self._clean_agent_content(pending)
 
     def _extract_assistant_content(self, response: dict) -> str:
         choices = response.get("choices") or []
@@ -1712,7 +2104,7 @@ class Pipeline:
                 tool_charge = self._charge_billing_event(
                     billing_context=billing_context,
                     event_type=billing_event,
-                    description="Tool call: %s" % tool_name,
+                    description="工具调用：%s" % self._tool_name_label(tool_name),
                     meta={
                         "tool_name": tool_name,
                         "parameters": parameters,
@@ -1728,7 +2120,7 @@ class Pipeline:
                 self._refund_billing_event(
                     billing_context=billing_context,
                     charge=tool_charge,
-                    description="Tool call failed: %s" % tool_name,
+                    description="工具调用失败：%s" % self._tool_name_label(tool_name),
                     meta={"tool_name": tool_name, "error": str(exc)[:500]},
                 )
             return "工具 %s 执行失败: %s" % (tool_name, str(exc))
@@ -1738,21 +2130,58 @@ class Pipeline:
             self._refund_billing_event(
                 billing_context=billing_context,
                 charge=tool_charge,
-                description="Tool call returned error: %s" % tool_name,
+                description="工具调用异常：%s" % self._tool_name_label(tool_name),
                 meta={"tool_name": tool_name, "result_preview": result_text[:500]},
             )
         if len(result_text) > 12000:
             return "%s\n\n[结果已截断，原始长度 %d 字符]" % (result_text[:12000], len(result_text))
         return result_text
 
-    def _clean_agent_content(self, content: str) -> str:
-        text = re.sub(r"<think>.*?</think>", "", content or "", flags=re.DOTALL)
-        text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL)
-        text = re.sub(r"\[TOOL_CALL\].*?\[/TOOL_CALL\]", "", text, flags=re.DOTALL)
-        text = re.sub(r"<minimax:tool_call>.*?</minimax:tool_call>", "", text, flags=re.DOTALL)
+    def _agent_stream_contains_internal_markup(self, text: str) -> bool:
+        normalized = (text or "").lower()
+        internal_markers = (
+            "minimax:tool_call",
+            "<tool_call>",
+            "</tool_call>",
+            "[tool_call]",
+            "[/tool_call]",
+            "<tool_response>",
+            "</tool_response>",
+            "<minimax:tool_call>",
+            "</minimax:tool_call>",
+            "<invoke name=",
+            "$params =",
+        )
+        return any(marker in normalized for marker in internal_markers)
+
+    def _strip_agent_internal_markup(self, content: str) -> str:
+        text = content or ""
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"\[TOOL_CALL\].*?\[/TOOL_CALL\]", "", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<minimax:tool_call>.*?</minimax:tool_call>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(
+            r"minimax:tool_call\s*.*?(?=(?:minimax:tool_call|<tool_response>|</tool_call>|</minimax:tool_call>|$))",
+            "",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        text = re.sub(r"<tool_response>.*?</tool_response>", "", text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r"\$PARAMS\s*=\s*\{.*?\}\s*[A-Za-z_][A-Za-z0-9_]*\(\$PARAMS\)", "", text, flags=re.DOTALL)
-        text = re.sub(r'<invoke name="[^"]+">.*?</invoke>', "", text, flags=re.DOTALL)
+        text = re.sub(r'<invoke name="[^"]+">.*?</invoke>', "", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"^[^\n]{0,4}/agent\s*·[^\n]*\n?", "", text, flags=re.MULTILINE)
+        text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
+
+    def _clean_agent_content(self, content: str) -> str:
+        return self._strip_agent_internal_markup(content)
+
+    def _disable_web_search_feature(self, body: dict) -> None:
+        features = body.get("features")
+        if not isinstance(features, dict):
+            features = {}
+            body["features"] = features
+        features["web_search"] = False
 
     def _chat_response(self, content: str, model: str) -> dict:
         return {
@@ -1776,48 +2205,22 @@ class Pipeline:
 
         for chunk in self._split_text(content):
             emitted = True
-            yield self._sse_chunk(
-                {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant", "content": chunk},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
+            yield self._stream_content_chunk(
+                response_id=response_id,
+                created=created,
+                model=model,
+                content=chunk,
             )
 
         if not emitted:
-            yield self._sse_chunk(
-                {
-                    "id": response_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant", "content": ""},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
+            yield self._stream_content_chunk(
+                response_id=response_id,
+                created=created,
+                model=model,
+                content="",
             )
 
-        yield self._sse_chunk(
-            {
-                "id": response_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }
-        )
+        yield self._stream_stop_chunk(response_id=response_id, created=created, model=model)
         yield b"data: [DONE]\n\n"
 
     def _split_text(self, content: str, chunk_size: int = 800) -> List[str]:
@@ -1826,17 +2229,77 @@ class Pipeline:
             return []
         return [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
 
+    def _stream_content_chunk(self, response_id: str, created: int, model: str, content: str) -> bytes:
+        return self._sse_chunk(
+            {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": content},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+        )
+
+    def _stream_reasoning_open_chunk(self, response_id: str, created: int, model: str) -> bytes:
+        return self._stream_content_chunk(
+            response_id=response_id,
+            created=created,
+            model=model,
+            content="<think>",
+        )
+
+    def _stream_reasoning_text_chunk(self, response_id: str, created: int, model: str, content: str) -> bytes:
+        return self._stream_content_chunk(
+            response_id=response_id,
+            created=created,
+            model=model,
+            content=content,
+        )
+
+    def _stream_reasoning_close_chunk(self, response_id: str, created: int, model: str) -> bytes:
+        return self._stream_content_chunk(
+            response_id=response_id,
+            created=created,
+            model=model,
+            content="</think>",
+        )
+
+    def _stream_stop_chunk(self, response_id: str, created: int, model: str) -> bytes:
+        return self._sse_chunk(
+            {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+        )
+
     def _sse_chunk(self, payload: dict) -> bytes:
         return ("data: %s\n\n" % json.dumps(payload, ensure_ascii=False)).encode("utf-8")
 
-    def _inject_agent_system_prompt(self, messages: List[dict]) -> List[dict]:
+    def _inject_agent_system_prompt(self, messages: List[dict], mode: str = "agent") -> List[dict]:
         clean_messages = deepcopy(messages or [])
+        system_prompt = self._agent_system_prompt_for_mode(mode)
         if clean_messages:
             first_message = clean_messages[0]
-            if first_message.get("role") == "system" and first_message.get("content") == AGENT_SYSTEM_PROMPT:
-                return clean_messages
-        clean_messages.insert(0, {"role": "system", "content": AGENT_SYSTEM_PROMPT})
+            if first_message.get("role") == "system":
+                if first_message.get("content") == system_prompt:
+                    return clean_messages
+                if first_message.get("content") in {AGENT_SYSTEM_PROMPT, TOOL_ONLY_SYSTEM_PROMPT}:
+                    first_message["content"] = system_prompt
+                    return clean_messages
+        clean_messages.insert(0, {"role": "system", "content": system_prompt})
         return clean_messages
+
+    def _agent_system_prompt_for_mode(self, mode: str) -> str:
+        return TOOL_ONLY_SYSTEM_PROMPT if mode == "tool" else AGENT_SYSTEM_PROMPT
 
     def _user_id(self, body: dict) -> str:
         user = body.get("user")

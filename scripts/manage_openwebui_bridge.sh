@@ -25,7 +25,7 @@ preview_bridge() {
     echo "pipelines_url=http://127.0.0.1:${PIPELINES_PORT}"
     echo "chat_backend_base_url=$CHAT_BACKEND_BASE_URL"
     echo "model_prefix=$XIAMIMATE_MODEL_PREFIX"
-    echo "images=${OPEN_WEBUI_IMAGE} | ${PIPELINES_IMAGE}"
+    echo "images=${OPEN_WEBUI_NGINX_IMAGE} | ${OPEN_WEBUI_IMAGE} | ${PIPELINES_IMAGE}"
     echo "baseline_root=${XIAMIMATE_BASELINE_ROOT:-}"
 }
 

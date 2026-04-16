@@ -22,7 +22,7 @@
 
 1. 本仓拥有 Open WebUI 与 Pipelines 的桥接运行时、slash router 与工具代理层。
 2. 上游 Dify、MiniMax 与 Theme API 密钥继续由 `chat_backend` 统一承接，本仓只保留 `CHAT_BACKEND_*` 接入参数。
-3. 当前 phase 5 默认将 bridge 指向 shadow `chat-backend`：`http://host.docker.internal:18200`。
+3. 当前 bridge 默认指向正式 `chat-backend`：`http://host.docker.internal:8200`。
 
 推荐启动方式：
 
@@ -31,11 +31,12 @@
 	- `OPEN_WEBUI_SECRET_KEY`
 	- `PIPELINES_API_KEY`
 	- `CHAT_BACKEND_SERVICE_SECRET`
-3. 预览解析后的参数：
+3. 默认 Nginx 镜像已改为 `nginx:latest`，会优先复用本机已有镜像；如需切换，可在 `.env` 里覆盖 `OPEN_WEBUI_NGINX_IMAGE`。
+4. 预览解析后的参数：
 	- `bash scripts/manage_openwebui_bridge.sh preview`
-4. 执行 dry-run 校验：
+5. 执行 dry-run 校验：
 	- `bash scripts/dry_run_validate_openwebui_bridge.sh`
-5. 如需影子启动：
+6. 如需影子启动：
 	- `bash scripts/manage_openwebui_bridge.sh up`
 
 首次启动注意：

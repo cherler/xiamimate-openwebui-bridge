@@ -32,6 +32,7 @@ if [[ -z "${XIAMIMATE_BASELINE_ROOT:-}" ]]; then
     fi
 fi
 
+set_default_if_missing "OPEN_WEBUI_NGINX_IMAGE" "nginx:latest"
 set_default_if_missing "OPEN_WEBUI_IMAGE" "ghcr.io/open-webui/open-webui:main"
 set_default_if_missing "PIPELINES_IMAGE" "ghcr.io/open-webui/pipelines:main"
 set_default_if_missing "OPEN_WEBUI_PORT" "13002"
@@ -39,7 +40,7 @@ set_default_if_missing "PIPELINES_PORT" "19099"
 set_default_if_missing "OPEN_WEBUI_SECRET_KEY" "replace-with-a-long-random-string"
 set_default_if_missing "PIPELINES_API_KEY" "replace-with-another-random-string"
 set_default_if_missing "XIAMIMATE_MODEL_PREFIX" "xiamimate"
-set_default_if_missing "CHAT_BACKEND_BASE_URL" "http://host.docker.internal:18200"
+set_default_if_missing "CHAT_BACKEND_BASE_URL" "http://host.docker.internal:8200"
 set_default_if_missing "CHAT_BACKEND_TIMEOUT" "30"
 set_default_if_missing "CHAT_BACKEND_SERVICE_SECRET" "replace-with-a-long-random-string"
 set_default_if_missing "CHAT_BACKEND_SERVICE_NAME" "open-webui-pipeline"

@@ -196,6 +196,27 @@ class Tools:
             },
         )
 
+    def keepa_asin_lookup(
+        self,
+        asins: str,
+        marketplace: str = "US",
+    ) -> str:
+        """Look up ASIN product details directly from the Keepa API when the local database does not contain the ASIN data. Returns product info in the same format as top_asin_drilldown.
+
+        Use this tool when top_asin_drilldown returns empty results or when you need real-time data for specific ASINs that may not be in the local database.
+
+        :param asins: CSV string of ASINs to look up (max 20).
+        :param marketplace: Marketplace code such as US, UK, DE, or JP.
+        :return: JSON response with ASIN product details from Keepa.
+        """
+        return self._request(
+            "/api/product-theme/keepa-asin-lookup",
+            {
+                "asins": self._normalize_csv(asins),
+                "marketplace": marketplace,
+            },
+        )
+
     def _normalize_csv(self, value) -> List[str]:
         if value is None:
             return []

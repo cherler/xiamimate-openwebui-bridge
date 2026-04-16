@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 COMMAND_TO_MODE = {
     "/agent": "agent",
+    "/tool": "tool",
     "/wf": "workflow",
     "/workflow": "workflow",
 }
@@ -59,6 +60,7 @@ class Pipeline:
         target_mode = COMMAND_TO_MODE[command]
         body["model"] = "%s.agent" % self.valves.model_prefix
         body["xiamimate_mode"] = target_mode
+        self._apply_mode_features(body, target_mode)
         self._write_message_text(last_user_message, remainder)
         body["messages"] = messages
         return body
@@ -108,9 +110,18 @@ class Pipeline:
 
         return normalized, remainder.strip()
 
+    def _apply_mode_features(self, body: dict, mode: str) -> None:
+        features = body.get("features")
+        if not isinstance(features, dict):
+            features = {}
+            body["features"] = features
+
+        features["web_search"] = False
+
     def _fallback_prompt(self, mode: str) -> str:
         prompts = {
             "agent": "请分析这个商品主题，并在需要时调用工具。",
+            "tool": "请只调用必要工具，不要联网搜索。",
             "workflow": "",
         }
         return prompts.get(mode, "请继续。")
