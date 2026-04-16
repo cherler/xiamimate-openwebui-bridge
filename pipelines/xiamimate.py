@@ -29,7 +29,7 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 工作原则：
 1. 需要数据时优先调用已挂载的工具，不要凭空编造指标。
 2. 需要平台规则、运营方法、合规要求等知识时，先调用 search_knowledge_base 工具检索知识库，不要依赖自身训练数据。
-3. 需要商品数据时，使用工具链：resolve_candidates -> candidate_pool_stats / candidate_pool_trends / candidate_pool_weak_forecast / top_asin_drilldown / category_benchmark。
+3. 需要商品数据时，先调用 resolve_candidates 拿到 candidate_asins，再调用 candidate_pool_stats / candidate_pool_trends / candidate_pool_weak_forecast / top_asin_drilldown / category_benchmark。
 4. 当 top_asin_drilldown 返回空结果或用户提供了本地数据库可能没有的 ASIN 时，使用 keepa_asin_lookup 直连 Keepa API 查询实时数据。
 4. 如果工具尚未返回数据，只能给出分析框架、验证路径和风险提醒，明确标注为待验证。
 5. 输出尽量围绕结论、证据、风险、下一步动作。
@@ -39,6 +39,7 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 - 当你决定调用工具时，直接输出工具调用指令，不要在工具调用之前添加任何文字（如"好的，我来帮你…"等）。
 - 等工具返回结果后，再给出分析和回答。
 - 如果需要同时调用多个工具，可以连续输出多个工具调用。
+- 后续工具如果依赖上一步输出参数，不要在同一轮猜测这些参数；先等待上一步工具结果。
 
 可用工具概览：
 - search_knowledge_base: 检索跨境电商知识库（平台规则、运营指南、市场洞察）
@@ -459,7 +460,13 @@ class Pipeline:
                 tool_calls = self._extract_tool_calls(content)
 
                 if not tool_calls:
-                    final_answer = self._clean_agent_content(content) or str(content or "").strip()
+                    cleaned = self._clean_agent_content(content)
+                    if cleaned:
+                        final_answer = cleaned
+                    elif self._agent_stream_contains_internal_markup(content):
+                        final_answer = "已完成分析，但未生成可展示的结果，请重试。"
+                    else:
+                        final_answer = str(content or "").strip()
                     status_line = "正在生成最终答复" if round_index == 0 else "工具执行完成，正在生成最终答复"
                     for chunk in emit_reasoning_chunks(self._format_agent_progress(status_line)):
                         yield chunk
@@ -562,17 +569,7 @@ class Pipeline:
                 path="/v1/me/account-overview",
                 headers=self._chat_backend_user_headers(body),
             )
-            portal_url = ""
-            try:
-                token_resp = self._chat_backend_request(
-                    method="POST",
-                    path="/internal/portal/create-token",
-                    headers=self._chat_backend_user_headers(body),
-                    internal=True,
-                )
-                portal_url = token_resp.get("portal_url", "")
-            except Exception as exc:
-                print("xiamimate portal token creation failed", str(exc))
+            portal_url = "/portal"
             content = self._format_account_overview(command=command, overview=overview, portal_url=portal_url)
         except RuntimeError as exc:
             content = self._error_text(str(exc))
@@ -720,7 +717,17 @@ class Pipeline:
 
         lines.append("")
         lines.append("🧭 **可用命令**")
-        lines.append("- /me  /points  /usage  /plan")
+        lines.extend(
+            self._render_markdown_table(
+                headers=["命令", "说明"],
+                rows=[
+                    ["/me", "查看账户综合概览（用户信息、积分、使用量、套餐）"],
+                    ["/points", "查看积分余额与近期账本明细"],
+                    ["/usage", "查看近 30 天使用汇总与按事件类型统计"],
+                    ["/plan", "查看当前套餐、权益与计价表"],
+                ],
+            )
+        )
         return "\n".join(lines)
 
     def _render_markdown_table(self, headers: List[str], rows: List[List[str]]) -> List[str]:
@@ -1232,7 +1239,11 @@ class Pipeline:
 
             if not tool_calls:
                 cleaned = self._clean_agent_content(content)
-                return cleaned or str(content or "").strip()
+                if cleaned:
+                    return cleaned
+                if self._agent_stream_contains_internal_markup(content):
+                    return "已完成分析，但未生成可展示的结果，请重试。"
+                return str(content or "").strip()
 
             conversation.append({"role": "assistant", "content": content})
 
@@ -1589,6 +1600,11 @@ class Pipeline:
             if parsed:
                 calls.append(parsed)
 
+        for match in re.findall(r"\$TOOL_CALL\$\s*(.*?)\s*\$END\$", text, flags=re.DOTALL):
+            parsed = self._parse_dollar_tool_call(match)
+            if parsed:
+                calls.append(parsed)
+
         for params_text, function_name in re.findall(
             r"\$PARAMS\s*=\s*(\{.*?\})\s*([A-Za-z_][A-Za-z0-9_]*)\(\$PARAMS\)",
             text,
@@ -1736,7 +1752,7 @@ class Pipeline:
         )
 
         for tool_name, args_block in pattern.findall(text):
-            parsed = self._normalize_tool_call(name=tool_name, parameters=self._parse_dash_parameters(args_block))
+            parsed = self._normalize_tool_call(name=tool_name, parameters=self._parse_tool_parameter_block(args_block))
             if parsed:
                 calls.append(parsed)
 
@@ -1752,7 +1768,7 @@ class Pipeline:
         )
 
         for tool_name, args_block in pattern.findall(text):
-            parsed = self._normalize_tool_call(name=tool_name, parameters=self._parse_dash_parameters(args_block))
+            parsed = self._normalize_tool_call(name=tool_name, parameters=self._parse_tool_parameter_block(args_block))
             if parsed:
                 calls.append(parsed)
 
@@ -1791,7 +1807,23 @@ class Pipeline:
         return calls
 
     def _parse_tool_call_block(self, raw_text: str) -> Optional[Dict[str, Any]]:
-        return self._parse_json_tool_call(raw_text) or self._parse_inline_tool_call(raw_text)
+        return self._parse_json_tool_call(raw_text) or self._parse_attr_tool_call(raw_text) or self._parse_inline_tool_call(raw_text)
+
+    def _parse_attr_tool_call(self, raw_text: str) -> Optional[Dict[str, Any]]:
+        text = (raw_text or "").strip()
+        name_match = re.search(r'name\s*=\s*"([^"]+)"', text)
+        if not name_match:
+            return None
+        tool_name = name_match.group(1).strip()
+
+        params: Dict[str, Any] = {}
+        params_match = re.search(r'(?:parameters|arguments)\s*=\s*"?\s*(\{.*\})', text, flags=re.DOTALL)
+        if params_match:
+            try:
+                params = json.loads(params_match.group(1))
+            except json.JSONDecodeError:
+                pass
+        return self._normalize_tool_call(name=tool_name, parameters=params if isinstance(params, dict) else {})
 
     def _parse_json_tool_call(self, raw_text: str) -> Optional[Dict[str, Any]]:
         try:
@@ -1831,9 +1863,47 @@ class Pipeline:
         if not tool_match:
             return None
 
-        args = self._parse_dash_parameters(raw_text)
+        args = self._extract_named_args_block(raw_text)
 
         return self._normalize_tool_call(name=tool_match.group(1), parameters=args)
+
+    def _parse_dollar_tool_call(self, raw_text: str) -> Optional[Dict[str, Any]]:
+        return self._parse_bracket_tool_call(raw_text)
+
+    def _extract_named_args_block(self, raw_text: str) -> Dict[str, Any]:
+        text = str(raw_text or "")
+        args_match = re.search(r"args\s*(?:=>|:)\s*\{(.*?)\}", text, flags=re.DOTALL)
+        args_source = args_match.group(1) if args_match else text
+        return self._parse_tool_parameter_block(args_source)
+
+    def _parse_tool_parameter_block(self, raw_text: str) -> Dict[str, Any]:
+        args = self._parse_dash_parameters(raw_text)
+        if args:
+            return args
+
+        parsed: Dict[str, Any] = {}
+        for raw_line in str(raw_text or "").splitlines():
+            line = raw_line.strip().rstrip(",")
+            if not line or line in {"{", "}"} or line.startswith("#") or line.startswith("//"):
+                continue
+
+            separator = None
+            for candidate in ("=>", "=", ":"):
+                if candidate in line:
+                    separator = candidate
+                    break
+
+            if separator is None:
+                continue
+
+            key, value = line.split(separator, 1)
+            normalized_key = str(key).strip().strip("\"'")
+            normalized_value = str(value).strip().rstrip(",")
+            if not normalized_key:
+                continue
+            parsed[normalized_key] = self._parse_argument_token(normalized_value)
+
+        return parsed
 
     def _parse_dash_parameters(self, raw_text: str) -> Dict[str, Any]:
         args: Dict[str, Any] = {}
@@ -1931,6 +2001,10 @@ class Pipeline:
                 "candidate_list": "candidate_asins",
                 "candidate_pool": "candidate_asins",
                 "asin_list": "candidate_asins",
+                "query": "product_query",
+                "category": "product_query",
+                "product": "product_query",
+                "product_keyword": "product_query",
                 "market": "marketplace",
             },
             "candidate_pool_trends": {
@@ -1938,6 +2012,10 @@ class Pipeline:
                 "candidate_list": "candidate_asins",
                 "candidate_pool": "candidate_asins",
                 "asin_list": "candidate_asins",
+                "query": "product_query",
+                "category": "product_query",
+                "product": "product_query",
+                "product_keyword": "product_query",
                 "market": "marketplace",
             },
             "candidate_pool_weak_forecast": {
@@ -1945,6 +2023,10 @@ class Pipeline:
                 "candidate_list": "candidate_asins",
                 "candidate_pool": "candidate_asins",
                 "asin_list": "candidate_asins",
+                "query": "product_query",
+                "category": "product_query",
+                "product": "product_query",
+                "product_keyword": "product_query",
                 "market": "marketplace",
             },
             "top_asin_drilldown": {
@@ -1952,6 +2034,10 @@ class Pipeline:
                 "candidate_list": "candidate_asins",
                 "candidate_pool": "candidate_asins",
                 "asin_list": "candidate_asins",
+                "query": "product_query",
+                "category": "product_query",
+                "product": "product_query",
+                "product_keyword": "product_query",
                 "market": "marketplace",
             },
             "category_benchmark": {
@@ -1959,6 +2045,10 @@ class Pipeline:
                 "candidate_list": "candidate_asins",
                 "candidate_pool": "candidate_asins",
                 "asin_list": "candidate_asins",
+                "query": "product_query",
+                "category": "product_query",
+                "product": "product_query",
+                "product_keyword": "product_query",
                 "market": "marketplace",
             },
         }
@@ -2145,6 +2235,8 @@ class Pipeline:
             "</tool_call>",
             "[tool_call]",
             "[/tool_call]",
+            "$tool_call$",
+            "$end$",
             "<tool_response>",
             "</tool_response>",
             "<minimax:tool_call>",
@@ -2159,6 +2251,7 @@ class Pipeline:
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r"\[TOOL_CALL\].*?\[/TOOL_CALL\]", "", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"\$TOOL_CALL\$.*?\$END\$", "", text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r"<minimax:tool_call>.*?</minimax:tool_call>", "", text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(
             r"minimax:tool_call\s*.*?(?=(?:minimax:tool_call|<tool_response>|</tool_call>|</minimax:tool_call>|$))",

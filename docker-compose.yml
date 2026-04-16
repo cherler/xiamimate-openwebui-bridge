@@ -2,10 +2,13 @@ services:
   nginx:
     image: ${OPEN_WEBUI_NGINX_IMAGE:-nginx:latest}
     restart: unless-stopped
+    environment:
+      CHAT_BACKEND_SERVICE_SECRET: ${CHAT_BACKEND_SERVICE_SECRET}
+      CHAT_BACKEND_TRUSTED_ADMIN_SERVICE_NAME: ${CHAT_BACKEND_TRUSTED_ADMIN_SERVICE_NAME:-openwebui-bridge-admin}
     ports:
       - "${OPEN_WEBUI_PORT:-3002}:8080"
     volumes:
-      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/default.conf:/etc/nginx/templates/default.conf.template:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

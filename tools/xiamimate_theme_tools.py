@@ -83,21 +83,31 @@ class Tools:
 
     def candidate_pool_stats(
         self,
-        candidate_asins: str,
+        candidate_asins: str = "",
         marketplace: str = "US",
         window_days: int = 30,
+        product_query: str = "",
     ) -> str:
         """Get descriptive statistics for a resolved candidate pool.
 
         :param candidate_asins: CSV string of candidate ASINs.
         :param marketplace: Marketplace code such as US, UK, DE, or JP.
         :param window_days: Lookback window for the pool metrics.
+        :param product_query: Optional product query fallback when candidate_asins is not yet available.
         :return: JSON response from theme_api.
         """
+        resolved_candidate_asins = self._ensure_candidate_asins(
+            candidate_asins=candidate_asins,
+            marketplace=marketplace,
+            product_query=product_query,
+        )
+        if isinstance(resolved_candidate_asins, str):
+            return resolved_candidate_asins
+
         return self._request(
             "/api/product-theme/candidate-pool-stats",
             {
-                "candidate_asins": self._normalize_csv(candidate_asins),
+                "candidate_asins": resolved_candidate_asins,
                 "marketplace": marketplace,
                 "window_days": window_days,
             },
@@ -105,21 +115,31 @@ class Tools:
 
     def candidate_pool_trends(
         self,
-        candidate_asins: str,
+        candidate_asins: str = "",
         marketplace: str = "US",
         window_days: int = 30,
+        product_query: str = "",
     ) -> str:
         """Get trend diagnostics for a candidate pool.
 
         :param candidate_asins: CSV string of candidate ASINs.
         :param marketplace: Marketplace code such as US, UK, DE, or JP.
         :param window_days: Lookback window for trend calculations.
+        :param product_query: Optional product query fallback when candidate_asins is not yet available.
         :return: JSON response from theme_api.
         """
+        resolved_candidate_asins = self._ensure_candidate_asins(
+            candidate_asins=candidate_asins,
+            marketplace=marketplace,
+            product_query=product_query,
+        )
+        if isinstance(resolved_candidate_asins, str):
+            return resolved_candidate_asins
+
         return self._request(
             "/api/product-theme/candidate-pool-trends",
             {
-                "candidate_asins": self._normalize_csv(candidate_asins),
+                "candidate_asins": resolved_candidate_asins,
                 "marketplace": marketplace,
                 "window_days": window_days,
             },
@@ -127,10 +147,11 @@ class Tools:
 
     def candidate_pool_weak_forecast(
         self,
-        candidate_asins: str,
+        candidate_asins: str = "",
         marketplace: str = "US",
         window_days: int = 30,
         top_n: int = 5,
+        product_query: str = "",
     ) -> str:
         """Get weak-signal forecast markers for a candidate pool.
 
@@ -138,12 +159,21 @@ class Tools:
         :param marketplace: Marketplace code such as US, UK, DE, or JP.
         :param window_days: Lookback window for forecast features.
         :param top_n: Number of top opportunity or risk signals to keep.
+        :param product_query: Optional product query fallback when candidate_asins is not yet available.
         :return: JSON response from theme_api.
         """
+        resolved_candidate_asins = self._ensure_candidate_asins(
+            candidate_asins=candidate_asins,
+            marketplace=marketplace,
+            product_query=product_query,
+        )
+        if isinstance(resolved_candidate_asins, str):
+            return resolved_candidate_asins
+
         return self._request(
             "/api/product-theme/candidate-pool-weak-forecast",
             {
-                "candidate_asins": self._normalize_csv(candidate_asins),
+                "candidate_asins": resolved_candidate_asins,
                 "marketplace": marketplace,
                 "window_days": window_days,
                 "top_n": top_n,
@@ -152,10 +182,11 @@ class Tools:
 
     def top_asin_drilldown(
         self,
-        candidate_asins: str,
+        candidate_asins: str = "",
         marketplace: str = "US",
         window_days: int = 30,
         top_n: Optional[int] = None,
+        product_query: str = "",
     ) -> str:
         """Inspect the strongest ASINs in a candidate pool.
 
@@ -163,10 +194,19 @@ class Tools:
         :param marketplace: Marketplace code such as US, UK, DE, or JP.
         :param window_days: Lookback window for the drilldown.
         :param top_n: Optional limit for the number of ASINs returned.
+        :param product_query: Optional product query fallback when candidate_asins is not yet available.
         :return: JSON response from theme_api.
         """
+        resolved_candidate_asins = self._ensure_candidate_asins(
+            candidate_asins=candidate_asins,
+            marketplace=marketplace,
+            product_query=product_query,
+        )
+        if isinstance(resolved_candidate_asins, str):
+            return resolved_candidate_asins
+
         payload = {
-            "candidate_asins": self._normalize_csv(candidate_asins),
+            "candidate_asins": resolved_candidate_asins,
             "marketplace": marketplace,
             "window_days": window_days,
         }
@@ -176,21 +216,31 @@ class Tools:
 
     def category_benchmark(
         self,
-        candidate_asins: str,
+        candidate_asins: str = "",
         marketplace: str = "US",
         window_days: int = 30,
+        product_query: str = "",
     ) -> str:
         """Compare a candidate pool against its benchmark category.
 
         :param candidate_asins: CSV string of candidate ASINs.
         :param marketplace: Marketplace code such as US, UK, DE, or JP.
         :param window_days: Lookback window for the benchmark snapshot.
+        :param product_query: Optional product query fallback when candidate_asins is not yet available.
         :return: JSON response from theme_api.
         """
+        resolved_candidate_asins = self._ensure_candidate_asins(
+            candidate_asins=candidate_asins,
+            marketplace=marketplace,
+            product_query=product_query,
+        )
+        if isinstance(resolved_candidate_asins, str):
+            return resolved_candidate_asins
+
         return self._request(
             "/api/product-theme/category-benchmark",
             {
-                "candidate_asins": self._normalize_csv(candidate_asins),
+                "candidate_asins": resolved_candidate_asins,
                 "marketplace": marketplace,
                 "window_days": window_days,
             },
@@ -264,6 +314,33 @@ class Tools:
             if text:
                 items.append(text)
         return items
+
+    def _ensure_candidate_asins(self, candidate_asins, marketplace: str, product_query: str):
+        normalized_candidate_asins = self._normalize_csv(candidate_asins)
+        if normalized_candidate_asins:
+            return normalized_candidate_asins
+
+        normalized_product_query = str(product_query or "").strip()
+        if not normalized_product_query:
+            return "缺少 candidate_asins；请先调用 resolve_candidates，或传入 product_query/category。"
+
+        resolved = self.resolve_candidates(
+            product_query=normalized_product_query,
+            marketplace=marketplace,
+        )
+        if resolved.startswith("theme_api 请求失败") or resolved.startswith("工具 ") or resolved.startswith("CHAT_BACKEND_"):
+            return resolved
+
+        try:
+            payload = json.loads(resolved)
+        except ValueError:
+            return "候选池解析结果不是合法 JSON，无法提取 candidate_asins。"
+
+        resolved_candidate_asins = self._normalize_csv(payload.get("candidate_asins"))
+        if not resolved_candidate_asins:
+            return "候选池解析结果缺少 candidate_asins，无法继续执行下游工具。"
+
+        return resolved_candidate_asins
 
     def _request(self, path: str, payload: dict) -> str:
         operation = path.rsplit("/", 1)[-1].replace("-", "_")
