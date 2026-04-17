@@ -1,0 +1,102 @@
+/* ─── 虾密小助手 · 统一导航栏 ─── */
+#xm-nav {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 36px;
+  background: #0d0d14;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  z-index: 999999;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 36px;
+  -webkit-font-smoothing: antialiased;
+  box-sizing: border-box;
+}
+#xm-nav * { box-sizing: border-box; }
+
+#xm-nav .xm-brand {
+  color: #e07040;
+  font-weight: 600;
+  font-size: 14px;
+  margin-right: 16px;
+  white-space: nowrap;
+  text-decoration: none;
+}
+#xm-nav .xm-brand:hover { color: #f08050; }
+
+#xm-nav .xm-links {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+#xm-nav .xm-links a {
+  color: #8b8b9e;
+  text-decoration: none;
+  padding: 4px 12px;
+  border-radius: 6px;
+  transition: color 0.15s, background 0.15s;
+  white-space: nowrap;
+  font-size: 13px;
+}
+#xm-nav .xm-links a:hover {
+  color: #e0e0e8;
+  background: rgba(255,255,255,0.07);
+}
+#xm-nav .xm-links a.xm-active {
+  color: #f0f0f8;
+  background: rgba(255,255,255,0.12);
+}
+
+#xm-nav .xm-right {
+  display: flex;
+  align-items: center;
+}
+#xm-nav .xm-btn {
+  color: #8b8b9e;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 13px;
+  padding: 4px 12px;
+  border-radius: 6px;
+  transition: color 0.15s, background 0.15s;
+  font-family: inherit;
+  line-height: inherit;
+}
+#xm-nav .xm-btn:hover {
+  color: #e0e0e8;
+  background: rgba(255,255,255,0.07);
+}
+
+/* Push page content below the fixed nav bar.
+   Tailwind's .h-screen = height:100vh which ignores body padding,
+   so we override it globally to subtract the nav bar height. */
+html { overflow: hidden !important; }
+body {
+  padding-top: 37px !important;
+  height: 100vh !important;
+  box-sizing: border-box !important;
+  overflow: hidden !important;
+}
+/* ─── Tailwind viewport-height fix ───
+   All classes that resolve to 100vh / 100dvh must subtract
+   the nav bar height so the bottom input isn't clipped. */
+.h-screen            { height:     calc(100vh  - 37px) !important; }
+.h-\[100dvh\]       { height:     calc(100dvh - 37px) !important; }
+.min-h-screen        { min-height: calc(100vh  - 37px) !important; }
+.min-h-\[100dvh\]   { min-height: calc(100dvh - 37px) !important; }
+.max-h-\[100dvh\]   { max-height: calc(100dvh - 37px) !important; }
+.max-h-dvh           { max-height: calc(100dvh - 37px) !important; }
+
+/* ─── Portal pages: hide built-in topbar navigation (unified nav bar replaces it) ─── */
+.topbar-actions { display: none !important; }
+
+/* ─── Public portal pages (guide/products/checkout): hide built-in top nav ─── */
+.workspace-topbar .top-route-nav { display: none !important; }
+.workspace-topbar .top-home-link { display: none !important; }

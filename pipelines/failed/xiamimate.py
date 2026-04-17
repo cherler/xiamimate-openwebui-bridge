@@ -23,20 +23,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import requests
 from pydantic import BaseModel
 
-# Load providers module directly by file path to avoid __init__.py package
-# shadowing the xiamimate.py pipeline file in the pipelines loader.
-def _load_providers():
-    _spec = importlib.util.spec_from_file_location(
-        "xiamimate_providers",
-        str(Path(__file__).resolve().parent / "xiamimate" / "providers.py"),
-    )
-    _mod = importlib.util.module_from_spec(_spec)
-    _spec.loader.exec_module(_mod)
-    return _mod
-
-_providers_mod = _load_providers()
-ProviderStrategy = _providers_mod.ProviderStrategy
-get_provider = _providers_mod.get_provider
+from xiamimate.providers import ProviderStrategy, get_provider
 
 
 AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。

@@ -9,6 +9,8 @@ services:
       - "${OPEN_WEBUI_PORT:-3002}:8080"
     volumes:
       - ./nginx/default.conf:/etc/nginx/templates/default.conf.template:ro
+      - ./nginx/xm-nav.css:/usr/share/nginx/html/_xm/nav.css:ro
+      - ./nginx/xm-nav.js:/usr/share/nginx/html/_xm/nav.js:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:
