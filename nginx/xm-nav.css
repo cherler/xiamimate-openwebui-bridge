@@ -56,6 +56,43 @@
 #xm-nav .xm-right {
   display: flex;
   align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+#xm-nav .xm-action-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.1);
+  background: rgba(255,255,255,0.04);
+  color: #d7d7e3;
+  text-decoration: none;
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
+  font: inherit;
+  line-height: 1;
+}
+#xm-nav .xm-action-link:hover {
+  color: #ffffff;
+  background: rgba(255,255,255,0.1);
+  border-color: rgba(255,255,255,0.18);
+}
+#xm-nav .xm-action-link svg {
+  width: 14px;
+  height: 14px;
+  display: block;
+  flex-shrink: 0;
+}
+#xm-nav .xm-action-text {
+  font-size: 12px;
+  white-space: nowrap;
+}
+#xm-nav .xm-action-button {
+  appearance: none;
+  -webkit-appearance: none;
 }
 #xm-nav .xm-btn {
   color: #8b8b9e;
@@ -74,11 +111,143 @@
   background: rgba(255,255,255,0.07);
 }
 
-/* Push page content below the fixed nav bar.
-   Tailwind's .h-screen = height:100vh which ignores body padding,
-   so we override it globally to subtract the nav bar height. */
-html { overflow: hidden !important; }
-body {
+#xm-contact-modal[hidden] { display: none !important; }
+#xm-contact-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1000001;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+}
+#xm-contact-modal .xm-contact-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(8, 10, 18, 0.55);
+  backdrop-filter: blur(6px);
+}
+#xm-contact-modal .xm-contact-card {
+  position: relative;
+  width: min(360px, calc(100vw - 24px));
+  background: rgba(255, 251, 245, 0.98);
+  color: #1e2a2f;
+  border-radius: 18px;
+  border: 1px solid rgba(17, 75, 95, 0.12);
+  box-shadow: 0 24px 60px rgba(8, 10, 18, 0.28);
+  padding: 18px;
+  display: grid;
+  gap: 14px;
+}
+#xm-contact-modal .xm-contact-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+#xm-contact-modal .xm-contact-title {
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+#xm-contact-modal .xm-contact-note {
+  margin-top: 6px;
+  color: #68767d;
+  font-size: 13px;
+  line-height: 1.6;
+}
+#xm-contact-modal .xm-contact-close,
+#xm-contact-modal .xm-contact-copy {
+  appearance: none;
+  -webkit-appearance: none;
+  font: inherit;
+}
+#xm-contact-modal .xm-contact-close {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  border: 1px solid rgba(17, 75, 95, 0.12);
+  background: #fff;
+  color: #68767d;
+  cursor: pointer;
+}
+#xm-contact-modal .xm-contact-close:hover {
+  color: #114b5f;
+  background: rgba(17, 75, 95, 0.08);
+}
+#xm-contact-modal .xm-contact-qr-wrap {
+  display: flex;
+  justify-content: center;
+}
+#xm-contact-modal .xm-contact-qr {
+  width: min(100%, 280px);
+  border-radius: 16px;
+  background: #fff;
+  border: 1px solid rgba(17, 75, 95, 0.12);
+  box-shadow: 0 14px 34px rgba(30, 42, 47, 0.1);
+}
+#xm-contact-modal .xm-contact-qr-fallback {
+  color: #68767d;
+  font-size: 13px;
+  line-height: 1.6;
+  text-align: center;
+  padding: 18px 12px;
+}
+#xm-contact-modal .xm-contact-id-box {
+  border: 1px solid rgba(17, 75, 95, 0.12);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(255, 251, 245, 0.98), rgba(244, 236, 223, 0.9));
+  padding: 14px 16px;
+}
+#xm-contact-modal .xm-contact-id-label {
+  color: #68767d;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+#xm-contact-modal .xm-contact-id-value {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+#xm-contact-modal .xm-contact-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+#xm-contact-modal .xm-contact-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 40px;
+  padding: 0 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(17, 75, 95, 0.12);
+  background: #fff;
+  color: #114b5f;
+  cursor: pointer;
+}
+#xm-contact-modal .xm-contact-copy:hover {
+  background: rgba(17, 75, 95, 0.08);
+}
+#xm-contact-modal .xm-contact-status {
+  color: #68767d;
+  font-size: 12px;
+  line-height: 1.5;
+}
+#xm-contact-modal .xm-contact-status:empty {
+  display: none;
+}
+html.xm-contact-open,
+body.xm-contact-open {
+  overflow: hidden !important;
+}
+
+/* Push page content below the fixed nav bar only on pages where the nav is injected.
+  Tailwind's .h-screen = height:100vh which ignores body padding,
+  so we scope the viewport fix under .xm-nav-active. */
+html.xm-nav-active { overflow: hidden !important; }
+body.xm-nav-active {
   padding-top: 37px !important;
   height: 100vh !important;
   box-sizing: border-box !important;
@@ -87,16 +256,46 @@ body {
 /* ─── Tailwind viewport-height fix ───
    All classes that resolve to 100vh / 100dvh must subtract
    the nav bar height so the bottom input isn't clipped. */
-.h-screen            { height:     calc(100vh  - 37px) !important; }
-.h-\[100dvh\]       { height:     calc(100dvh - 37px) !important; }
-.min-h-screen        { min-height: calc(100vh  - 37px) !important; }
-.min-h-\[100dvh\]   { min-height: calc(100dvh - 37px) !important; }
-.max-h-\[100dvh\]   { max-height: calc(100dvh - 37px) !important; }
-.max-h-dvh           { max-height: calc(100dvh - 37px) !important; }
+body.xm-nav-active .h-screen            { height:     calc(100vh  - 37px) !important; }
+body.xm-nav-active .h-\[100dvh\]       { height:     calc(100dvh - 37px) !important; }
+body.xm-nav-active .min-h-screen        { min-height: calc(100vh  - 37px) !important; }
+body.xm-nav-active .min-h-\[100dvh\]   { min-height: calc(100dvh - 37px) !important; }
+body.xm-nav-active .max-h-\[100dvh\]   { max-height: calc(100dvh - 37px) !important; }
+body.xm-nav-active .max-h-dvh           { max-height: calc(100dvh - 37px) !important; }
 
 /* ─── Portal pages: hide built-in topbar navigation (unified nav bar replaces it) ─── */
-.topbar-actions { display: none !important; }
+body.xm-nav-active .topbar-actions { display: none !important; }
 
 /* ─── Public portal pages (guide/products/checkout): hide built-in top nav ─── */
-.workspace-topbar .top-route-nav { display: none !important; }
-.workspace-topbar .top-home-link { display: none !important; }
+body.xm-nav-active .workspace-topbar .top-route-nav { display: none !important; }
+body.xm-nav-active .workspace-topbar .top-home-link { display: none !important; }
+body.xm-nav-active .workspace-topbar .top-utility-actions { display: none !important; }
+
+@media (max-width: 960px) {
+  #xm-nav {
+    height: auto;
+    min-height: 36px;
+    padding-top: 6px;
+    padding-bottom: 6px;
+    align-items: flex-start;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  #xm-nav .xm-links,
+  #xm-nav .xm-right {
+    flex-wrap: wrap;
+  }
+  html.xm-nav-active { overflow: auto !important; }
+  body.xm-nav-active {
+    padding-top: 69px !important;
+    height: auto !important;
+    min-height: 100vh !important;
+    overflow: auto !important;
+  }
+  body.xm-nav-active .h-screen            { height:     calc(100vh  - 69px) !important; }
+  body.xm-nav-active .h-\[100dvh\]       { height:     calc(100dvh - 69px) !important; }
+  body.xm-nav-active .min-h-screen        { min-height: calc(100vh  - 69px) !important; }
+  body.xm-nav-active .min-h-\[100dvh\]   { min-height: calc(100dvh - 69px) !important; }
+  body.xm-nav-active .max-h-\[100dvh\]   { max-height: calc(100dvh - 69px) !important; }
+  body.xm-nav-active .max-h-dvh           { max-height: calc(100dvh - 69px) !important; }
+}

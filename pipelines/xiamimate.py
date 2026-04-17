@@ -44,6 +44,7 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 工作原则：
 1. 需要数据时优先调用已挂载的工具，不要凭空编造指标。
 2. 需要平台规则、运营方法、合规要求等知识时，先调用 search_knowledge_base 工具检索知识库，不要依赖自身训练数据。
+3. 需要最新外部动态、站外情报、近期政策变化或实时市场讨论时，调用 web_search 工具，不要把旧知识当成最新事实。
 3. 需要商品数据时，先调用 resolve_candidates 拿到 candidate_asins，再调用 candidate_pool_stats / candidate_pool_trends / candidate_pool_weak_forecast / top_asin_drilldown / category_benchmark。
 4. 当 top_asin_drilldown 返回空结果或用户提供了本地数据库可能没有的 ASIN 时，使用 keepa_asin_lookup 直连 Keepa API 查询实时数据。
 4. 如果工具尚未返回数据，只能给出分析框架、验证路径和风险提醒，明确标注为待验证。
@@ -58,6 +59,7 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 
 可用工具概览：
 - search_knowledge_base: 检索跨境电商知识库（平台规则、运营指南、市场洞察）
+- web_search: 联网搜索最新外部信息并返回总结（平台动态、行业新闻、竞争情报、消费者趋势）
 - resolve_candidates: 解析候选 ASIN 池
 - candidate_pool_stats: 候选池描述统计
 - candidate_pool_trends: 候选池趋势诊断
@@ -87,6 +89,7 @@ TOOL_RESULT_TEMPLATE = """以下是工具执行结果，请基于这些结果继
 
 ALLOWED_AGENT_TOOLS = {
     "search_knowledge_base",
+    "web_search",
     "resolve_candidates",
     "candidate_pool_stats",
     "candidate_pool_trends",
@@ -98,6 +101,7 @@ ALLOWED_AGENT_TOOLS = {
 
 COMMAND_TO_MODE = {
     "/agent": "agent",
+    "/web": "web",
     "/wf": "workflow",
     "/tool": "tool",
     "/workflow": "workflow",
@@ -121,13 +125,14 @@ IDEMPOTENCY_KEY_HEADER_NAME = "Idempotency-Key"
 POINT_COST_BY_EVENT = {
     "llm_request": 1,
     "workflow_run": 8,
-    "kb_retrieve": 1,
-    "product_api_call": 1,
-    "web_search": 1,
+    "kb_retrieve": 2,
+    "product_api_call": 2,
+    "web_search": 2,
 }
 
 TOOL_BILLING_EVENT = {
     "search_knowledge_base": "kb_retrieve",
+    "web_search": "web_search",
     "resolve_candidates": "product_api_call",
     "candidate_pool_stats": "product_api_call",
     "candidate_pool_trends": "product_api_call",
@@ -141,6 +146,10 @@ WORKFLOW_SUGGESTION_PROMPTS = [
     {
         "title": ["/workflow 示例", "宠物自动喂食器在 TikTok 美国市场的前景"],
         "content": "/workflow 帮我调研一下宠物自动喂食器在 TikTok 美国市场的前景",
+    },
+    {
+        "title": ["/web 示例", "TikTok Shop 美国站最新政策"],
+        "content": "/web 帮我搜索并总结 2026 年 TikTok Shop 美国站最新入驻与合规政策变化",
     },
     {
         "title": ["工具调研示例", "portable blender 在 Amazon 美国市场是否值得做"],
@@ -281,18 +290,60 @@ class Pipeline:
 
         if mode == "workflow":
             return self._run_workflow(query=normalized_user_message, body=body, model=response_model)
+        if mode == "web":
+            return self._run_web_search(query=normalized_user_message, body=body, model=response_model)
         if mode in {"agent", "tool"}:
             return self._run_agent(messages=normalized_messages, body=body, model=response_model, mode=mode)
 
         return self._chat_response(content="未识别的 XiaMimate 模式。请使用 Agent。", model=response_model)
 
     def _run_workflow(self, query: str, body: dict, model: str) -> Union[dict, Iterator[bytes]]:
-        query = (query or "").strip()
-        if not query:
-            guidance = (
+        return self._run_dify_chatflow(
+            query=query,
+            body=body,
+            model=model,
+            event_type="workflow_run",
+            charge_description="Workflow 请求",
+            run_path="/internal/provider/dify-workflow/run",
+            run_stream_path="/internal/provider/dify-workflow/run-stream",
+            mode_tag="workflow",
+            guidance=(
                 "请在 /workflow 后直接写出调研需求，例如：\n"
                 "/workflow 帮我调研一下宠物自动喂食器在 TikTok 美国市场的前景"
-            )
+            ),
+        )
+
+    def _run_web_search(self, query: str, body: dict, model: str) -> Union[dict, Iterator[bytes]]:
+        return self._run_dify_chatflow(
+            query=query,
+            body=body,
+            model=model,
+            event_type="web_search",
+            charge_description="网络搜索",
+            run_path="/internal/provider/dify-web-search/run",
+            run_stream_path="/internal/provider/dify-web-search/run-stream",
+            mode_tag="web",
+            guidance=(
+                "请在 /web 后直接写出要联网搜索的问题，例如：\n"
+                "/web 帮我搜索并总结 2026 年 TikTok Shop 美国站最新入驻政策变化"
+            ),
+        )
+
+    def _run_dify_chatflow(
+        self,
+        query: str,
+        body: dict,
+        model: str,
+        *,
+        event_type: str,
+        charge_description: str,
+        run_path: str,
+        run_stream_path: str,
+        mode_tag: str,
+        guidance: str,
+    ) -> Union[dict, Iterator[bytes]]:
+        query = (query or "").strip()
+        if not query:
             if body.get("stream"):
                 return self._stream_text_response(content=guidance, model=model)
             return self._chat_response(content=guidance, model=model)
@@ -305,12 +356,12 @@ class Pipeline:
 
         try:
             billing_context = self._ensure_billing_context(body)
-            workflow_charge = self._charge_billing_event(
+            flow_charge = self._charge_billing_event(
                 billing_context=billing_context,
-                event_type="workflow_run",
-                    description="Workflow 请求",
+                event_type=event_type,
+                description=charge_description,
                 meta={
-                    "mode": "workflow",
+                    "mode": mode_tag,
                     "stream": bool(body.get("stream")),
                     "query_preview": query[:200],
                 },
@@ -322,18 +373,21 @@ class Pipeline:
             return self._chat_response(content=message, model=model)
 
         if body.get("stream"):
-            return self._run_workflow_stream(
+            return self._run_dify_chatflow_stream(
                 query=query,
                 body=body,
                 model=model,
                 billing_context=billing_context,
-                workflow_charge=workflow_charge,
+                flow_charge=flow_charge,
+                run_stream_path=run_stream_path,
+                mode_tag=mode_tag,
+                refund_description="%s失败，已退款" % charge_description,
             )
 
         try:
             response = self._chat_backend_request(
                 method="POST",
-                path="/internal/provider/dify-workflow/run",
+                path=run_path,
                 body={
                     "query": query,
                     "user": billing_context["user_id"],
@@ -344,9 +398,9 @@ class Pipeline:
         except RuntimeError as exc:
             self._refund_billing_event(
                 billing_context=billing_context,
-                charge=workflow_charge,
-                description="Workflow 请求失败，已退款",
-                meta={"mode": "workflow", "error": str(exc)[:500]},
+                charge=flow_charge,
+                description="%s失败，已退款" % charge_description,
+                meta={"mode": mode_tag, "error": str(exc)[:500]},
             )
             return self._chat_response(content=self._error_text(str(exc)), model=model)
 
@@ -822,6 +876,8 @@ class Pipeline:
             "MiniMax agent request failed": "LLM 请求失败，已退款",
             "Dify workflow run": "Workflow 请求",
             "Dify workflow request failed": "Workflow 请求失败，已退款",
+            "网络搜索": "网络搜索",
+            "网络搜索失败，已退款": "网络搜索失败，已退款",
         }
         if description in known_descriptions:
             return known_descriptions[description]
@@ -841,6 +897,7 @@ class Pipeline:
     def _tool_name_label(self, tool_name: str) -> str:
         mapping = {
             "search_knowledge_base": "知识库检索",
+            "web_search": "网络搜索",
             "resolve_candidates": "候选池解析",
             "candidate_pool_stats": "候选池统计",
             "candidate_pool_trends": "候选池趋势",
@@ -908,13 +965,16 @@ class Pipeline:
 
         return normalized_messages
 
-    def _run_workflow_stream(
+    def _run_dify_chatflow_stream(
         self,
         query: str,
         body: dict,
         model: str,
         billing_context: dict,
-        workflow_charge: dict,
+        flow_charge: dict,
+        run_stream_path: str,
+        mode_tag: str,
+        refund_description: str,
     ) -> Iterator[bytes]:
         response_id = "%s-%s" % (model, uuid.uuid4())
         created = int(time.time())
@@ -970,7 +1030,7 @@ class Pipeline:
 
         try:
             with self._chat_backend_stream_request(
-                path="/internal/provider/dify-workflow/run-stream",
+                path=run_stream_path,
                 body={
                     "query": query,
                     "user": billing_context["user_id"],
@@ -978,7 +1038,7 @@ class Pipeline:
             ) as response:
                 response.raise_for_status()
 
-                start_line = self._format_workflow_progress(5, "工作流已启动，正在解析需求")
+                start_line = self._format_dify_progress(mode_tag, 5, "已启动，正在解析需求")
                 emitted_progress.add(start_line)
                 for rc in emit_reasoning_chunks(start_line):
                     yield rc
@@ -988,7 +1048,7 @@ class Pipeline:
                     data = event.get("data") if isinstance(event.get("data"), dict) else {}
 
                     if event_type == "workflow_started":
-                        stage_line = self._format_workflow_progress(10, "已连接 Dify Chatflow，开始执行节点")
+                        stage_line = self._format_dify_progress(mode_tag, 10, "已连接 Dify Chatflow，开始执行节点")
                         if stage_line not in emitted_progress:
                             emitted_progress.add(stage_line)
                             for rc in emit_reasoning_chunks(stage_line):
@@ -1002,7 +1062,7 @@ class Pipeline:
                         finished_nodes.add(node_id)
                         stage_label = WORKFLOW_NODE_LABELS.get(node_id) or str(data.get("title") or node_id)
                         percent = self._workflow_progress_percent(len(finished_nodes))
-                        stage_line = self._format_workflow_progress(percent, "%s 完成" % stage_label)
+                        stage_line = self._format_dify_progress(mode_tag, percent, "%s 完成" % stage_label)
                         if stage_line not in emitted_progress:
                             emitted_progress.add(stage_line)
                             for rc in emit_reasoning_chunks(stage_line):
@@ -1015,7 +1075,7 @@ class Pipeline:
                             continue
                         if not answer_started:
                             answer_started = True
-                            final_stage = self._format_workflow_progress(100, "工作流执行完成，正在整理最终报告")
+                            final_stage = self._format_dify_progress(mode_tag, 100, "执行完成，正在整理最终结果")
                             if final_stage not in emitted_progress:
                                 emitted_progress.add(final_stage)
                                 for rc in emit_reasoning_chunks(final_stage):
@@ -1031,7 +1091,7 @@ class Pipeline:
                         final_answer = self._extract_workflow_answer(event)
                         if final_answer and not answer_started:
                             answer_started = True
-                            final_stage = self._format_workflow_progress(100, "工作流执行完成，正在整理最终报告")
+                            final_stage = self._format_dify_progress(mode_tag, 100, "执行完成，正在整理最终结果")
                             if final_stage not in emitted_progress:
                                 emitted_progress.add(final_stage)
                                 for rc in emit_reasoning_chunks(final_stage):
@@ -1049,8 +1109,8 @@ class Pipeline:
                         raise RuntimeError(error_text or "Dify Chatflow 返回错误事件。")
 
                 if not answer_started:
-                    final_answer = "".join(answer_chunks).strip() or "工作流已完成，但未返回可展示的结果。"
-                    final_stage = self._format_workflow_progress(100, "工作流执行完成，正在整理最终报告")
+                    final_answer = "".join(answer_chunks).strip() or "执行已完成，但未返回可展示的结果。"
+                    final_stage = self._format_dify_progress(mode_tag, 100, "执行完成，正在整理最终结果")
                     if final_stage not in emitted_progress:
                         emitted_progress.add(final_stage)
                         for rc in emit_reasoning_chunks(final_stage):
@@ -1065,9 +1125,9 @@ class Pipeline:
             if not answer_started:
                 self._refund_billing_event(
                     billing_context=billing_context,
-                    charge=workflow_charge,
-                    description="Dify workflow stream request failed",
-                    meta={"mode": "workflow_stream", "error": str(exc)[:500]},
+                    charge=flow_charge,
+                    description=refund_description,
+                    meta={"mode": "%s_stream" % mode_tag, "error": str(exc)[:500]},
                 )
             close_chunk = close_reasoning_chunk()
             if close_chunk is not None:
@@ -1078,9 +1138,9 @@ class Pipeline:
             if not answer_started:
                 self._refund_billing_event(
                     billing_context=billing_context,
-                    charge=workflow_charge,
-                    description="Dify workflow stream runtime failed",
-                    meta={"mode": "workflow_stream", "error": str(exc)[:500]},
+                    charge=flow_charge,
+                    description=refund_description,
+                    meta={"mode": "%s_stream" % mode_tag, "error": str(exc)[:500]},
                 )
             close_chunk = close_reasoning_chunk()
             if close_chunk is not None:
@@ -1141,11 +1201,11 @@ class Pipeline:
         percent = 8 + int((finished_count * 88) / max(1, WORKFLOW_ESTIMATED_STEPS))
         return max(8, min(98, percent))
 
-    def _format_workflow_progress(self, percent: int, description: str) -> str:
+    def _format_dify_progress(self, mode_tag: str, percent: int, description: str) -> str:
         total_slots = 10
         filled = max(0, min(total_slots, round((percent / 100) * total_slots)))
         bar = "#" * filled + "." * (total_slots - filled)
-        return "⏳ /workflow 进度 [%s] %d%% · %s\n" % (bar, percent, description)
+        return "⏳ /%s 进度 [%s] %d%% · %s\n" % (mode_tag, bar, percent, description)
 
     def _extract_workflow_answer(self, payload: dict) -> str:
         if not isinstance(payload, dict):
@@ -1451,6 +1511,7 @@ class Pipeline:
             "工具 ",
             "theme_api 请求失败:",
             "知识库检索失败:",
+            "网络搜索失败:",
             "CHAT_BACKEND_BASE_URL 未配置。",
             "CHAT_BACKEND_SERVICE_SECRET 未配置。",
         )
@@ -1992,6 +2053,13 @@ class Pipeline:
                 "type": "ignored_doc_type",
                 "source": "ignored_doc_type",
                 "priority": "ignored_priority",
+            },
+            "web_search": {
+                "question": "query",
+                "keyword": "query",
+                "keywords": "query",
+                "queries": "query",
+                "search_query": "query",
             },
             "resolve_candidates": {
                 "query": "product_query",

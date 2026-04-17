@@ -15,6 +15,7 @@ from pydantic import BaseModel
 COMMAND_TO_MODE = {
     "/agent": "agent",
     "/tool": "tool",
+    "/web": "web",
     "/wf": "workflow",
     "/workflow": "workflow",
 }
@@ -122,6 +123,7 @@ class Pipeline:
         prompts = {
             "agent": "请分析这个商品主题，并在需要时调用工具。",
             "tool": "请只调用必要工具，不要联网搜索。",
+            "web": "请基于联网搜索结果给出总结。",
             "workflow": "",
         }
         return prompts.get(mode, "请继续。")

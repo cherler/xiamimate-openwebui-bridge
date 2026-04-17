@@ -2,6 +2,22 @@
   if (document.getElementById('xm-nav')) return;
 
   var p = window.location.pathname;
+  if (p.indexOf('/admin/backoffice') === 0) return;
+  var wechatQrUrl = '/portal/contact/wechat-qr';
+  var wechatId = 'xiamimate';
+  var feedbackUrl = 'https://my.feishu.cn/share/base/form/shrcnQVnRPvEuOGjz9ojf05tD1d';
+
+  function mailIcon() {
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.75 6.75h16.5v10.5H3.75z"></path><path d="m4.5 7.5 7.5 6 7.5-6"></path></svg>';
+  }
+
+  function wechatIcon() {
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.2 5.5c-3.5 0-6.2 2.2-6.2 5.1 0 1.6.8 3 2.2 4l-.6 2.4 2.6-1.3c.6.1 1.3.2 2 .2 3.5 0 6.2-2.2 6.2-5.1S12.7 5.5 9.2 5.5Z"></path><path d="M15.5 10.2c3 0 5.5 1.9 5.5 4.5 0 1.3-.7 2.5-1.8 3.3l.5 2-2.2-1.1c-.6.1-1.2.2-1.9.2-3 0-5.5-1.9-5.5-4.5s2.5-4.4 5.4-4.4Z"></path><circle cx="7.2" cy="10.5" r=".8" fill="currentColor" stroke="none"></circle><circle cx="11.2" cy="10.5" r=".8" fill="currentColor" stroke="none"></circle><circle cx="13.8" cy="14.6" r=".8" fill="currentColor" stroke="none"></circle><circle cx="17.2" cy="14.6" r=".8" fill="currentColor" stroke="none"></circle></svg>';
+  }
+
+  function feedbackIcon() {
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.75 4.75 8v8L12 20.25 19.25 16V8L12 3.75Z"></path><path d="M12 7.75v5.25"></path><circle cx="12" cy="15.8" r=".9" fill="currentColor" stroke="none"></circle></svg>';
+  }
 
   function isActive(prefix) {
     if (prefix === '/') {
@@ -27,6 +43,11 @@
     }
   } catch(e) {}
 
+  document.documentElement.classList.add('xm-nav-active');
+  if (document.body) {
+    document.body.classList.add('xm-nav-active');
+  }
+
   var el = document.createElement('div');
   el.id = 'xm-nav';
   el.innerHTML =
@@ -38,10 +59,101 @@
       '<a href="/portal/products"' + cls('/portal/products') + '>\u8BA2\u9605\u4E0E\u5145\u503C</a>' +
     '</div>' +
     '<div class="xm-right">' +
+      '<a href="mailto:xiamijun88@qq.com" class="xm-action-link" aria-label="\u90AE\u4EF6\u8054\u7CFB" title="\u90AE\u4EF6\u8054\u7CFB">' + mailIcon() + '<span class="xm-action-text">\u90AE\u4EF6</span></a>' +
+      '<button type="button" class="xm-action-link xm-action-button" id="xm-wechat-trigger" aria-label="\u5FAE\u4FE1\u8054\u7CFB" title="\u5FAE\u4FE1\u8054\u7CFB">' + wechatIcon() + '<span class="xm-action-text">\u5FAE\u4FE1</span></button>' +
+      '<a href="' + feedbackUrl + '" target="_blank" rel="noreferrer" class="xm-action-link" aria-label="\u610F\u89C1\u53CD\u9988" title="\u610F\u89C1\u53CD\u9988">' + feedbackIcon() + '<span class="xm-action-text">\u53CD\u9988</span></a>' +
       (logged ? '<button type="button" class="xm-btn" id="xm-signout">\u9000\u51FA\u767B\u5F55</button>' : '') +
     '</div>';
 
   document.body.prepend(el);
+
+  var modal = document.createElement('div');
+  modal.id = 'xm-contact-modal';
+  modal.setAttribute('hidden', 'hidden');
+  modal.innerHTML =
+    '<div class="xm-contact-backdrop" data-close="1"></div>' +
+    '<div class="xm-contact-card" role="dialog" aria-modal="true" aria-labelledby="xm-contact-title">' +
+      '<div class="xm-contact-header">' +
+        '<div>' +
+          '<div class="xm-contact-title" id="xm-contact-title">\u5FAE\u4FE1\u8054\u7CFB</div>' +
+          '<div class="xm-contact-note">\u626B\u7801\u5373\u53EF\u6DFB\u52A0\u5FAE\u4FE1\uFF0C\u4E5F\u53EF\u4EE5\u76F4\u63A5\u590D\u5236\u5FAE\u4FE1\u53F7 ' + wechatId + '。</div>' +
+        '</div>' +
+        '<button type="button" class="xm-contact-close" id="xm-contact-close" aria-label="\u5173\u95ED">×</button>' +
+      '</div>' +
+      '<div class="xm-contact-qr-wrap">' +
+        '<img class="xm-contact-qr" id="xm-contact-qr" src="' + wechatQrUrl + '" alt="\u5FAE\u4FE1\u4E8C\u7EF4\u7801" />' +
+        '<div class="xm-contact-qr-fallback" id="xm-contact-qr-fallback" hidden>\u4E8C\u7EF4\u7801\u6682\u65F6\u52A0\u8F7D\u5931\u8D25\uFF0C\u53EF\u5148\u590D\u5236\u4E0B\u65B9\u5FAE\u4FE1\u53F7\u8054\u7CFB。</div>' +
+      '</div>' +
+      '<div class="xm-contact-id-box">' +
+        '<div class="xm-contact-id-label">\u5FAE\u4FE1\u53F7</div>' +
+        '<div class="xm-contact-id-value" id="xm-contact-id">' + wechatId + '</div>' +
+      '</div>' +
+      '<div class="xm-contact-actions">' +
+        '<button type="button" class="xm-contact-copy" id="xm-contact-copy">\u590D\u5236\u5FAE\u4FE1\u53F7</button>' +
+        '<span class="xm-contact-status" id="xm-contact-status"></span>' +
+      '</div>' +
+    '</div>';
+  document.body.appendChild(modal);
+
+  function openWechatModal() {
+    modal.hidden = false;
+    document.documentElement.classList.add('xm-contact-open');
+    document.body.classList.add('xm-contact-open');
+  }
+
+  function closeWechatModal() {
+    modal.hidden = true;
+    document.documentElement.classList.remove('xm-contact-open');
+    document.body.classList.remove('xm-contact-open');
+  }
+
+  var wechatTrigger = document.getElementById('xm-wechat-trigger');
+  var closeBtn = document.getElementById('xm-contact-close');
+  var copyBtn = document.getElementById('xm-contact-copy');
+  var statusEl = document.getElementById('xm-contact-status');
+  var qrImg = document.getElementById('xm-contact-qr');
+  var qrFallback = document.getElementById('xm-contact-qr-fallback');
+
+  if (wechatTrigger) {
+    wechatTrigger.addEventListener('click', openWechatModal);
+  }
+  if (closeBtn) {
+    closeBtn.addEventListener('click', closeWechatModal);
+  }
+  modal.addEventListener('click', function(event) {
+    if (event.target && event.target.getAttribute('data-close') === '1') {
+      closeWechatModal();
+    }
+  });
+  document.addEventListener('keydown', function(event) {
+    if (event.key === 'Escape' && !modal.hidden) {
+      closeWechatModal();
+    }
+  });
+  if (qrImg) {
+    qrImg.addEventListener('error', function() {
+      qrImg.hidden = true;
+      if (qrFallback) {
+        qrFallback.hidden = false;
+      }
+    });
+  }
+  if (copyBtn) {
+    copyBtn.addEventListener('click', function() {
+      function done(message) {
+        if (statusEl) statusEl.textContent = message;
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(wechatId).then(function() {
+          done('\u5FAE\u4FE1\u53F7\u5DF2\u590D\u5236\uFF0C\u53EF\u4EE5\u76F4\u63A5\u5230\u5FAE\u4FE1\u91CC\u7C98\u8D34\u6DFB\u52A0\u3002');
+        }).catch(function() {
+          done('\u590D\u5236\u5931\u8D25\uFF0C\u8BF7\u624B\u52A8\u6DFB\u52A0\u5FAE\u4FE1\u53F7\uFF1A' + wechatId);
+        });
+        return;
+      }
+      done('\u5F53\u524D\u6D4F\u89C8\u5668\u4E0D\u652F\u6301\u81EA\u52A8\u590D\u5236\uFF0C\u8BF7\u624B\u52A8\u6DFB\u52A0\u5FAE\u4FE1\u53F7\uFF1A' + wechatId);
+    });
+  }
 
   // Signout handler
   var btn = document.getElementById('xm-signout');
