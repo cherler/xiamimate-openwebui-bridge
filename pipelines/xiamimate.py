@@ -654,6 +654,7 @@ class Pipeline:
     def _format_account_overview(self, command: str, overview: dict, portal_url: str = "") -> str:
         user = overview.get("user") or {}
         points_account = overview.get("points_account") or {}
+        balance_breakdown = overview.get("balance_breakdown") or {}
         usage_summary = overview.get("usage_summary") or {}
         usage_by_type = overview.get("usage_by_type_30d") or []
         recent_ledger = overview.get("recent_ledger") or []
@@ -696,6 +697,9 @@ class Pipeline:
             lines.append("💰 **积分概览**")
             points_rows = [
                 ["当前积分余额", str(balance_points)],
+                ["月包余额", str(int(balance_breakdown.get("subscription_balance_points") or 0))],
+                ["充值包余额", str(int(balance_breakdown.get("recharge_balance_points") or 0))],
+                ["其他赠送余额", str(int(balance_breakdown.get("other_balance_points") or 0))],
                 ["累计赠送积分", str(int(points_account.get("lifetime_granted_points") or 0))],
                 ["累计购买积分", str(int(points_account.get("lifetime_purchased_points") or 0))],
                 ["累计消费积分", str(int(points_account.get("lifetime_spent_points") or 0))],
@@ -711,6 +715,10 @@ class Pipeline:
                     ]
                 )
             lines.extend(self._render_markdown_table(headers=["项目", "数值"], rows=points_rows))
+            lines.append("")
+            lines.append("- 扣减规则：%s" % self._consumption_policy_text(balance_breakdown))
+            lines.append("- 扣减顺序：%s" % self._consumption_priority_text(balance_breakdown))
+            lines.append("- 计费提示：一次 Workflow 固定按 8 积分计费，内部检索和工具调用会保留记录，但当前不会重复额外收费。")
             if recent_ledger:
                 lines.append("")
                 lines.append("🧾 **最近账本**")
@@ -721,15 +729,16 @@ class Pipeline:
                     ledger_rows.append(
                         [
                             self._format_beijing_time(row.get("created_at")),
-                            self._ledger_entry_type_label(row.get("entry_type"), row.get("event_type")),
+                            self._ledger_item_label(row),
                             "%s%s" % (sign, delta),
+                            self._ledger_source_summary_label(row),
                             str(row.get("balance_after_points") or 0),
                             self._ledger_description_label(row),
                         ]
                     )
                 lines.extend(
                     self._render_markdown_table(
-                        headers=["时间", "类型", "变动", "余额", "说明"],
+                        headers=["时间", "消费项目", "变动", "扣减来源", "余额", "说明"],
                         rows=ledger_rows,
                     )
                 )
@@ -748,6 +757,9 @@ class Pipeline:
                     ],
                 )
             )
+            lines.append("")
+            lines.append("- 说明：这里按计费单位统计使用量，不直接等于人民币金额。实际扣费优先消耗月包积分，月包不足时再扣充值包积分。")
+            lines.append("- 常见计价：LLM 请求 1 积分/次，知识库检索 2 积分/次，商品 API 检索 2 积分/次，网络搜索 2 积分/次，Workflow 8 积分/次。")
             if usage_by_type:
                 lines.append("")
                 lines.append("- 30 天内按事件类型：")
@@ -840,17 +852,67 @@ class Pipeline:
 
     def _event_type_label(self, event_type: str, event_display: dict) -> str:
         alias_mapping = {
-            "llm_request": "LLM请求",
-            "minimax_request": "LLM请求",
-            "workflow_run": "workflow请求",
+            "llm_request": "LLM 请求",
+            "minimax_request": "LLM 请求",
+            "workflow_run": "Workflow 请求",
             "kb_retrieve": "知识库检索",
             "dify_knowledge_retrieve": "知识库检索",
-            "product_api_call": "商品API检索",
+            "product_api_call": "商品 API 检索",
             "web_search": "网络搜索",
         }
         if event_type in event_display:
             return str(event_display.get(event_type) or event_type)
         return alias_mapping.get(event_type, event_type or "-")
+
+    def _balance_source_label(self, source: Any) -> str:
+        mapping = {
+            "subscription": "月包积分",
+            "recharge": "充值包积分",
+            "other": "其他赠送积分",
+        }
+        normalized = str(source or "").strip().lower()
+        return mapping.get(normalized, "其他赠送积分")
+
+    def _consumption_policy_text(self, balance_breakdown: dict) -> str:
+        return str(
+            balance_breakdown.get("consumption_policy_text")
+            or "消费时优先扣减月包积分；月包不足时再扣充值包积分；充值包积分永久有效。"
+        )
+
+    def _consumption_priority_text(self, balance_breakdown: dict) -> str:
+        priority = balance_breakdown.get("consumption_priority") or ["subscription", "recharge", "other"]
+        labels = [self._balance_source_label(item) for item in priority]
+        return " -> ".join(labels)
+
+    def _ledger_item_label(self, row: dict) -> str:
+        entry_type = str(row.get("entry_type") or "").strip().lower()
+        if entry_type == "consume":
+            return self._event_type_label(str(row.get("event_type") or ""), {})
+        return self._ledger_entry_type_label(row.get("entry_type"), row.get("event_type"))
+
+    def _ledger_source_summary_label(self, row: dict) -> str:
+        meta = row.get("meta_json") or {}
+        allocations = meta.get("balance_source_allocations") or []
+        totals: Dict[str, int] = {}
+        for item in allocations:
+            source = str((item or {}).get("source") or "other").strip().lower() or "other"
+            points = int((item or {}).get("points") or 0)
+            if points <= 0:
+                continue
+            totals[source] = totals.get(source, 0) + points
+        entry_type = str(row.get("entry_type") or "").strip().lower()
+        if not totals and entry_type == "subscription_expire":
+            expired_points = abs(int(row.get("points_delta") or 0))
+            if expired_points > 0:
+                totals["subscription"] = expired_points
+        if not totals:
+            return "按系统默认顺序扣减"
+        parts = []
+        for source in ["subscription", "recharge", "other"]:
+            points = totals.get(source, 0)
+            if points > 0:
+                parts.append("%s %s" % (self._balance_source_label(source), points))
+        return "；".join(parts)
 
     def _ledger_entry_type_label(self, entry_type: Any, event_type: Any) -> str:
         entry_text = str(entry_type or "").strip().lower()
@@ -870,14 +932,16 @@ class Pipeline:
 
     def _ledger_description_label(self, row: dict) -> str:
         description = str(row.get("description") or "").strip()
-        event_type = str(row.get("event_type") or "").strip()
+        entry_type = str(row.get("entry_type") or "").strip().lower()
+        event_type = str(row.get("event_type") or "").strip().lower()
         known_descriptions = {
-            "MiniMax agent request": "LLM 请求",
-            "MiniMax agent request failed": "LLM 请求失败，已退款",
-            "Dify workflow run": "Workflow 请求",
-            "Dify workflow request failed": "Workflow 请求失败，已退款",
-            "网络搜索": "网络搜索",
-            "网络搜索失败，已退款": "网络搜索失败，已退款",
+            "MiniMax agent request": "按 LLM 请求次数计费。",
+            "MiniMax agent request failed": "LLM 请求失败，系统已自动退款。",
+            "Dify workflow run": "一次 Workflow 固定计费 8 积分，内部步骤只保留审计记录，不重复收费。",
+            "Dify workflow request failed": "Workflow 请求失败，系统已自动退款。",
+            "网络搜索": "按网络搜索次数计费。",
+            "网络搜索失败，已退款": "网络搜索失败，系统已自动退款。",
+            "expired subscription points removed": "当前订阅周期结束后，未使用完的月包积分会自动清零。",
         }
         if description in known_descriptions:
             return known_descriptions[description]
@@ -892,6 +956,19 @@ class Pipeline:
             return "工具调用异常：%s" % self._tool_name_label(tool_name)
         if description:
             return description
+        if entry_type == "consume":
+            usage_mapping = {
+                "workflow_run": "一次 Workflow 固定计费 8 积分，内部检索和工具调用只保留记录，不重复收费。",
+                "llm_request": "按 LLM 请求次数计费。",
+                "kb_retrieve": "按知识库检索次数计费。",
+                "dify_knowledge_retrieve": "按知识库检索次数计费。",
+                "product_api_call": "按商品 API 检索次数计费。",
+                "web_search": "按网络搜索次数计费。",
+            }
+            if event_type in usage_mapping:
+                return usage_mapping[event_type]
+        if entry_type == "subscription_expire":
+            return "当前订阅周期结束后，未使用完的月包积分会自动清零。"
         return self._event_type_label(event_type, {})
 
     def _tool_name_label(self, tool_name: str) -> str:
