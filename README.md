@@ -23,6 +23,7 @@
 1. 本仓拥有 Open WebUI 与 Pipelines 的桥接运行时、slash router 与工具代理层。
 2. 上游 Dify、MiniMax 与 Theme API 密钥继续由 `chat_backend` 统一承接，本仓只保留 `CHAT_BACKEND_*` 接入参数。
 3. 当前 bridge 默认指向正式 `chat-backend`：`http://host.docker.internal:8200`。
+4. Portal / 使用指南页右下角的 Dify 智能客服现在通过 bridge 的 `/_dify/` 统一代理暴露，默认回源 `DIFY_CHATBOT_BASE_URL=http://host.docker.internal:80`；如果 Dify 实际在别的端口或 SSH 隧道后面，需要在 `.env` 中覆盖这个值。
 
 推荐启动方式：
 

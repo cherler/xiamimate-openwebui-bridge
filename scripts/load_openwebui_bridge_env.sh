@@ -45,6 +45,7 @@ set_default_if_missing "CHAT_BACKEND_TIMEOUT" "30"
 set_default_if_missing "CHAT_BACKEND_SERVICE_SECRET" "replace-with-a-long-random-string"
 set_default_if_missing "CHAT_BACKEND_TRUSTED_ADMIN_SERVICE_NAME" "openwebui-bridge-admin"
 set_default_if_missing "CHAT_BACKEND_SERVICE_NAME" "open-webui-pipeline"
+set_default_if_missing "DIFY_CHATBOT_BASE_URL" "http://host.docker.internal:80"
 set_default_if_missing "DIFY_REQUEST_TIMEOUT" "180"
 set_default_if_missing "AGENT_OPENAI_MODEL" "MiniMax-M2.7-highspeed"
 

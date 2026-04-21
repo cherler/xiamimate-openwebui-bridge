@@ -5,6 +5,7 @@ services:
     environment:
       CHAT_BACKEND_SERVICE_SECRET: ${CHAT_BACKEND_SERVICE_SECRET}
       CHAT_BACKEND_TRUSTED_ADMIN_SERVICE_NAME: ${CHAT_BACKEND_TRUSTED_ADMIN_SERVICE_NAME:-openwebui-bridge-admin}
+      DIFY_CHATBOT_BASE_URL: ${DIFY_CHATBOT_BASE_URL:-http://host.docker.internal:80}
     ports:
       - "${OPEN_WEBUI_PORT:-3002}:8080"
     volumes:
