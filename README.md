@@ -29,26 +29,38 @@
 
 1. 复制 `.env.example` 为本地 `.env`。
 2. 至少填写：
-	- `OPEN_WEBUI_SECRET_KEY`
-	- `PIPELINES_API_KEY`
-	- `CHAT_BACKEND_SERVICE_SECRET`
+   - `OPEN_WEBUI_SECRET_KEY`
+   - `PIPELINES_API_KEY`
+   - `CHAT_BACKEND_SERVICE_SECRET`
 3. 默认 Nginx 镜像已改为 `nginx:latest`，会优先复用本机已有镜像；如需切换，可在 `.env` 里覆盖 `OPEN_WEBUI_NGINX_IMAGE`。
 4. 预览解析后的参数：
-	- `bash scripts/manage_openwebui_bridge.sh preview`
+   - `bash scripts/manage_openwebui_bridge.sh preview`
 5. 执行 dry-run 校验：
-	- `bash scripts/dry_run_validate_openwebui_bridge.sh`
+   - `bash scripts/dry_run_validate_openwebui_bridge.sh`
 6. 如需影子启动：
-	- `bash scripts/manage_openwebui_bridge.sh up`
+   - `bash scripts/manage_openwebui_bridge.sh up`
 
 首次启动注意：
 
 1. 如果 `13002 /health` 长时间不变为 `200`，且日志显示默认 embedding 模型下载失败，可先执行：
-	- `bash scripts/seed_openwebui_embedding_cache.sh`
+   - `bash scripts/seed_openwebui_embedding_cache.sh`
 2. 然后重启：
-	- `bash scripts/manage_openwebui_bridge.sh restart`
+   - `bash scripts/manage_openwebui_bridge.sh restart`
 
 当前阶段不做：
 
 1. 不替换旧 Open WebUI 正式入口。
 2. 不迁移旧仓运行时生成的数据目录。
 3. 不在 phase 5 当前骨架验证中强制跑通真实用户登录与前端对话链路。
+
+Nginx 代理结构：
+
+1. `openwebui` 直代理：承接站点根路径、Open WebUI 自身后台、静态资源、WebSocket 与登录相关接口。
+2. `chatbackend` 直代理：承接 portal 页面、portal API、bridge 的会话鉴权子请求，以及 chat-backend 管理后台。
+3. `dify chatbot` 同域代理：统一挂在 `/_dify/` 下，对 Dify 的静态资源、API 前缀和重定向做子路径适配。
+4. `theme_api` 当前不走 Nginx 直代理，而是继续通过 pipelines / tools → `chat_backend` provider 间接访问。
+
+为了降低后续新增内部代理的接入成本，bridge 现在把常用代理头拆到了 `nginx/includes/` 共享片段里，避免每个 `location` 重复抄写一套 header 规则。完整拓扑与扩展建议见：
+
+- `docs/nginx-proxy-architecture.md`
+- `docs/dify-chatbot-same-origin-proxy.md`
