@@ -7,7 +7,8 @@
   var defaultContact = {
     contact_email: '',
     feedback_url: 'https://my.feishu.cn/share/base/form/shrcnQVnRPvEuOGjz9ojf05tD1d',
-    wechat_qr_base64: ''
+    wechat_qr_base64: '',
+    official_account_qr_base64: ''
   };
 
   function mailIcon() {
@@ -16,6 +17,10 @@
 
   function wechatIcon() {
     return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.2 5.5c-3.5 0-6.2 2.2-6.2 5.1 0 1.6.8 3 2.2 4l-.6 2.4 2.6-1.3c.6.1 1.3.2 2 .2 3.5 0 6.2-2.2 6.2-5.1S12.7 5.5 9.2 5.5Z"></path><path d="M15.5 10.2c3 0 5.5 1.9 5.5 4.5 0 1.3-.7 2.5-1.8 3.3l.5 2-2.2-1.1c-.6.1-1.2.2-1.9.2-3 0-5.5-1.9-5.5-4.5s2.5-4.4 5.4-4.4Z"></path><circle cx="7.2" cy="10.5" r=".8" fill="currentColor" stroke="none"></circle><circle cx="11.2" cy="10.5" r=".8" fill="currentColor" stroke="none"></circle><circle cx="13.8" cy="14.6" r=".8" fill="currentColor" stroke="none"></circle><circle cx="17.2" cy="14.6" r=".8" fill="currentColor" stroke="none"></circle></svg>';
+  }
+
+  function officialAccountIcon() {
+    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5.75 8.25A2.5 2.5 0 0 1 8.25 5.75h7.5a2.5 2.5 0 0 1 2.5 2.5v7.5a2.5 2.5 0 0 1-2.5 2.5h-7.5a2.5 2.5 0 0 1-2.5-2.5Z"></path><path d="M9 10.25h6"></path><path d="M9 13h3.75"></path><circle cx="16.5" cy="13.5" r="1.25"></circle></svg>';
   }
 
   function feedbackIcon() {
@@ -91,6 +96,7 @@
     '<div class="xm-right">' +
       '<a href="#" id="xm-email-link" class="xm-action-link" aria-label="\u90AE\u4EF6\u8054\u7CFB" title="\u90AE\u4EF6\u8054\u7CFB">' + mailIcon() + '<span class="xm-action-text">\u90AE\u4EF6</span></a>' +
       '<button type="button" class="xm-action-link xm-action-button" id="xm-wechat-trigger" aria-label="\u4F01\u5FAE\u8054\u7CFB" title="\u4F01\u5FAE\u8054\u7CFB">' + wechatIcon() + '<span class="xm-action-text">\u4F01\u5FAE</span></button>' +
+      '<button type="button" class="xm-action-link xm-action-button xm-official-account-link" id="xm-official-account-trigger" aria-label="\u516C\u4F17\u53F7" title="\u516C\u4F17\u53F7">' + officialAccountIcon() + '<span class="xm-action-text">\u516C\u4F17\u53F7</span></button>' +
       '<a href="' + defaultContact.feedback_url + '" id="xm-feedback-link" target="_blank" rel="noreferrer" class="xm-action-link" aria-label="\u610F\u89C1\u53CD\u9988" title="\u610F\u89C1\u53CD\u9988">' + feedbackIcon() + '<span class="xm-action-text">\u53CD\u9988</span></a>' +
       (logged ? '<button type="button" class="xm-btn" id="xm-signout">\u9000\u51FA\u767B\u5F55</button>' : '') +
     '</div>';
@@ -117,7 +123,29 @@
     '</div>';
   document.body.appendChild(modal);
 
-  function openWechatModal() {
+  var contactModes = {
+    wechat: {
+      key: 'wechat_qr_base64',
+      title: '\u4F01\u5FAE\u8054\u7CFB',
+      note: '\u626B\u7801\u5373\u53EF\u6DFB\u52A0\u4F01\u5FAE\uFF0C\u8BF7\u4F7F\u7528\u4E0B\u65B9\u4E8C\u7EF4\u7801\u8054\u7CFB。',
+      alt: '\u4F01\u5FAE\u4E8C\u7EF4\u7801',
+      empty: '\u5F53\u524D\u672A\u627E\u5230\u4F01\u5FAE\u4E8C\u7EF4\u7801\u56FE\u7247\uFF0C\u8BF7\u8054\u7CFB\u7BA1\u7406\u5458\u4E0A\u4F20。'
+    },
+    official_account: {
+      key: 'official_account_qr_base64',
+      title: '\u516C\u4F17\u53F7',
+      note: '\u626B\u7801\u5373\u53EF\u5173\u6CE8\u516C\u4F17\u53F7\uFF0C\u83B7\u53D6\u66F4\u65B0\u4E0E\u901A\u77E5。',
+      alt: '\u516C\u4F17\u53F7\u4E8C\u7EF4\u7801',
+      empty: '\u5F53\u524D\u672A\u627E\u5230\u516C\u4F17\u53F7\u4E8C\u7EF4\u7801\u56FE\u7247\uFF0C\u8BF7\u8054\u7CFB\u7BA1\u7406\u5458\u4E0A\u4F20。'
+    }
+  };
+  var currentContactMode = 'wechat';
+  var currentContactConfig = defaultContact;
+
+  function openContactModal(modeKey) {
+    currentContactMode = contactModes[modeKey] ? modeKey : 'wechat';
+    applyModalMeta();
+    renderContactQr(currentContactConfig, currentContactMode);
     modal.hidden = false;
     document.documentElement.classList.add('xm-contact-open');
     document.body.classList.add('xm-contact-open');
@@ -130,36 +158,60 @@
   }
 
   var wechatTrigger = document.getElementById('xm-wechat-trigger');
+  var officialAccountTrigger = document.getElementById('xm-official-account-trigger');
   var emailLink = document.getElementById('xm-email-link');
   var feedbackLink = document.getElementById('xm-feedback-link');
   var closeBtn = document.getElementById('xm-contact-close');
   var qrImg = document.getElementById('xm-contact-qr');
   var qrFallback = document.getElementById('xm-contact-qr-fallback');
+  var contactTitle = document.getElementById('xm-contact-title');
+  var contactNote = modal.querySelector('.xm-contact-note');
 
-  function renderWechatQr(contact) {
-    var qr = contact && contact.wechat_qr_base64 ? String(contact.wechat_qr_base64) : '';
+  function applyModalMeta() {
+    var mode = contactModes[currentContactMode] || contactModes.wechat;
+    if (contactTitle) {
+      contactTitle.textContent = mode.title;
+    }
+    if (contactNote) {
+      contactNote.textContent = mode.note;
+    }
+  }
+
+  function renderContactQr(contact, modeKey) {
+    var mode = contactModes[modeKey] || contactModes.wechat;
+    var qr = contact && contact[mode.key] ? String(contact[mode.key]) : '';
     if (!qrImg || !qrFallback) return;
     if (!qr) {
       qrImg.hidden = true;
       qrImg.removeAttribute('src');
+      qrFallback.textContent = mode.empty;
       qrFallback.hidden = false;
       return;
     }
     qrImg.src = qr;
-    qrImg.alt = '\u4F01\u5FAE\u4E8C\u7EF4\u7801';
+    qrImg.alt = mode.alt;
     qrImg.hidden = false;
     qrFallback.hidden = true;
   }
 
   function applyContactConfig(contact) {
     if (!contact) return;
+    currentContactConfig = {
+      contact_email: contact.contact_email ? String(contact.contact_email) : '',
+      feedback_url: contact.feedback_url ? String(contact.feedback_url) : defaultContact.feedback_url,
+      wechat_qr_base64: contact.wechat_qr_base64 ? String(contact.wechat_qr_base64) : '',
+      official_account_qr_base64: contact.official_account_qr_base64 ? String(contact.official_account_qr_base64) : ''
+    };
     if (emailLink) {
-      emailLink.href = contact.contact_email ? ('mailto:' + String(contact.contact_email)) : '#';
+      emailLink.href = currentContactConfig.contact_email ? ('mailto:' + currentContactConfig.contact_email) : '#';
     }
     if (feedbackLink) {
-      feedbackLink.href = contact.feedback_url ? String(contact.feedback_url) : defaultContact.feedback_url;
+      feedbackLink.href = currentContactConfig.feedback_url || defaultContact.feedback_url;
     }
-    renderWechatQr(contact);
+    if (!modal.hidden) {
+      applyModalMeta();
+      renderContactQr(currentContactConfig, currentContactMode);
+    }
   }
 
   async function refreshContactConfig() {
@@ -181,7 +233,13 @@
   if (wechatTrigger) {
     wechatTrigger.addEventListener('click', async function() {
       await refreshContactConfig();
-      openWechatModal();
+      openContactModal('wechat');
+    });
+  }
+  if (officialAccountTrigger) {
+    officialAccountTrigger.addEventListener('click', async function() {
+      await refreshContactConfig();
+      openContactModal('official_account');
     });
   }
   if (emailLink) {
@@ -220,6 +278,7 @@
   if (qrImg && qrFallback) {
     qrImg.addEventListener('error', function() {
       qrImg.hidden = true;
+      qrFallback.textContent = (contactModes[currentContactMode] || contactModes.wechat).empty;
       qrFallback.hidden = false;
     });
   }
