@@ -75,8 +75,15 @@
   if (!logged) {
     logged = !!readStoredToken();
   }
-    var storedToken = readStoredToken();
-    var portalLinkSuffix = storedToken ? ('?t=' + encodeURIComponent(storedToken)) : '';
+  var storedToken = readStoredToken();
+  var portalLinkSuffix = storedToken ? ('?t=' + encodeURIComponent(storedToken)) : '';
+
+  function authActionsHtml(isLoggedIn) {
+    return (
+      (!isLoggedIn ? '<a href="/portal/recover-password" class="xm-action-link" aria-label="忘记密码" title="忘记密码"><span class="xm-action-text">忘记密码</span></a>' : '') +
+      (isLoggedIn ? '<button type="button" class="xm-btn" id="xm-signout">退出登录</button>' : '')
+    );
+  }
 
   document.documentElement.classList.add('xm-nav-active');
   if (document.body) {
@@ -94,11 +101,11 @@
         '<a href="/portal/products' + portalLinkSuffix + '"' + cls('/portal/products') + '>\u8BA2\u9605\u4E0E\u5145\u503C</a>' +
     '</div>' +
     '<div class="xm-right">' +
+      '<span id="xm-auth-actions">' + authActionsHtml(logged) + '</span>' +
       '<a href="#" id="xm-email-link" class="xm-action-link" aria-label="\u90AE\u4EF6\u8054\u7CFB" title="\u90AE\u4EF6\u8054\u7CFB">' + mailIcon() + '<span class="xm-action-text">\u90AE\u4EF6</span></a>' +
       '<button type="button" class="xm-action-link xm-action-button" id="xm-wechat-trigger" aria-label="\u4F01\u5FAE\u8054\u7CFB" title="\u4F01\u5FAE\u8054\u7CFB">' + wechatIcon() + '<span class="xm-action-text">\u4F01\u5FAE</span></button>' +
       '<button type="button" class="xm-action-link xm-action-button xm-official-account-link" id="xm-official-account-trigger" aria-label="\u516C\u4F17\u53F7" title="\u516C\u4F17\u53F7">' + officialAccountIcon() + '<span class="xm-action-text">\u516C\u4F17\u53F7</span></button>' +
       '<a href="' + defaultContact.feedback_url + '" id="xm-feedback-link" target="_blank" rel="noreferrer" class="xm-action-link" aria-label="\u610F\u89C1\u53CD\u9988" title="\u610F\u89C1\u53CD\u9988">' + feedbackIcon() + '<span class="xm-action-text">\u53CD\u9988</span></a>' +
-      (logged ? '<button type="button" class="xm-btn" id="xm-signout">\u9000\u51FA\u767B\u5F55</button>' : '') +
     '</div>';
 
   document.body.prepend(el);
@@ -285,9 +292,42 @@
   applyContactConfig(defaultContact);
   refreshContactConfig();
 
-  // Signout handler
-  var btn = document.getElementById('xm-signout');
-  if (btn) {
+  var authActions = document.getElementById('xm-auth-actions');
+
+  function renderAuthActions(isLoggedIn) {
+    logged = !!isLoggedIn;
+    if (!authActions) {
+      return;
+    }
+    authActions.innerHTML = authActionsHtml(logged);
+    attachSignoutHandler();
+  }
+
+  async function detectOpenWebUISession() {
+    var headers = {};
+    var token = readStoredToken();
+    if (token) {
+      headers.Authorization = 'Bearer ' + token;
+    }
+    try {
+      var response = await fetch('/api/v1/auths/', {
+        method: 'GET',
+        credentials: 'same-origin',
+        cache: 'no-store',
+        headers: headers,
+      });
+      return response.ok;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function attachSignoutHandler() {
+    var btn = document.getElementById('xm-signout');
+    if (!btn || btn.dataset.xmBound === '1') {
+      return;
+    }
+    btn.dataset.xmBound = '1';
     btn.addEventListener('click', function() {
       fetch('/api/v1/auths/signout', {
         method: 'GET',
@@ -306,6 +346,7 @@
       });
     });
   }
+  attachSignoutHandler();
 
   // ── Verification gate redirect ──
   // If user is logged-in but unverified and on Open WebUI (not portal),
@@ -326,6 +367,20 @@
       .catch(function() {});
   }
 
+  function syncAuthState() {
+    detectOpenWebUISession().then(function(sessionLogged) {
+      if (sessionLogged) {
+        ensurePortalTokenCookie();
+      }
+      renderAuthActions(sessionLogged);
+      if (!isPortalPage && sessionLogged) {
+        xmCheckVerification();
+      }
+    }).catch(function() {});
+  }
+
+  syncAuthState();
+
   if (!isPortalPage) {
     if (logged) {
       // Already logged in on Open WebUI page — check verification now
@@ -337,9 +392,9 @@
         t = !!readStoredToken();
         if (t) {
           clearInterval(xmTokenPoll);
-          ensurePortalTokenCookie();
+          syncAuthState();
           // Small delay to let Open WebUI finish its post-login setup
-          setTimeout(xmCheckVerification, 600);
+          setTimeout(syncAuthState, 600);
         }
       }, 800);
       // Stop polling after 10 minutes
