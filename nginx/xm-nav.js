@@ -33,18 +33,45 @@
     return isActive(prefix) ? ' class="xm-active"' : '';
   }
 
-  // Detect login state from cookie or localStorage
-  var logged = false;
-  try {
-    logged = document.cookie.split(';').some(function(ck) {
-      var t = ck.trim();
-      return t.indexOf('token=') === 0 && t.length > 7 && t !== 'token=' && t !== 'token=""';
-    });
-    if (!logged) {
-      var stored = localStorage.getItem('token');
-      logged = !!stored && stored !== '' && stored !== '""';
+  function hasTokenCookie() {
+    try {
+      return document.cookie.split(';').some(function(ck) {
+        var t = ck.trim();
+        return t.indexOf('token=') === 0 && t.length > 7 && t !== 'token=' && t !== 'token=""';
+      });
+    } catch (e) {
+      return false;
     }
-  } catch(e) {}
+  }
+
+  function readStoredToken() {
+    try {
+      var stored = localStorage.getItem('token');
+      if (!stored || stored === '""') return '';
+      if (stored.charAt(0) === '"' && stored.charAt(stored.length - 1) === '"') {
+        stored = stored.slice(1, -1);
+      }
+      return stored || '';
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function ensurePortalTokenCookie() {
+    if (hasTokenCookie()) return true;
+    var storedToken = readStoredToken();
+    if (!storedToken) return false;
+    document.cookie = 'token=' + storedToken + '; path=/; SameSite=Lax';
+    return hasTokenCookie();
+  }
+
+  // Detect login state from cookie or localStorage, and sync a cookie for portal auth if needed.
+  var logged = ensurePortalTokenCookie();
+  if (!logged) {
+    logged = !!readStoredToken();
+  }
+    var storedToken = readStoredToken();
+    var portalLinkSuffix = storedToken ? ('?t=' + encodeURIComponent(storedToken)) : '';
 
   document.documentElement.classList.add('xm-nav-active');
   if (document.body) {
@@ -58,8 +85,8 @@
       '<a href="/" class="xm-brand">\uD83E\uDD90 \u867E\u5BC6\u5C0F\u52A9\u624B</a>' +
       '<a href="/"' + cls('/') + '>\u5BF9\u8BDD</a>' +
       '<a href="/portal/guide"' + cls('/portal/guide') + '>\u4F7F\u7528\u6307\u5357</a>' +
-      '<a href="/portal/account"' + cls('/portal/account') + '>\u8D26\u6237\u7BA1\u7406</a>' +
-      '<a href="/portal/products"' + cls('/portal/products') + '>\u8BA2\u9605\u4E0E\u5145\u503C</a>' +
+        '<a href="/portal/account' + portalLinkSuffix + '"' + cls('/portal/account') + '>\u8D26\u6237\u7BA1\u7406</a>' +
+        '<a href="/portal/products' + portalLinkSuffix + '"' + cls('/portal/products') + '>\u8BA2\u9605\u4E0E\u5145\u503C</a>' +
     '</div>' +
     '<div class="xm-right">' +
       '<a href="#" id="xm-email-link" class="xm-action-link" aria-label="\u90AE\u4EF6\u8054\u7CFB" title="\u90AE\u4EF6\u8054\u7CFB">' + mailIcon() + '<span class="xm-action-text">\u90AE\u4EF6</span></a>' +
@@ -248,12 +275,10 @@
       // Not logged in yet — watch for token to appear after login
       var xmTokenPoll = setInterval(function() {
         var t = false;
-        try {
-          var s = localStorage.getItem('token');
-          t = !!s && s !== '' && s !== '""';
-        } catch(e) {}
+        t = !!readStoredToken();
         if (t) {
           clearInterval(xmTokenPoll);
+          ensurePortalTokenCookie();
           // Small delay to let Open WebUI finish its post-login setup
           setTimeout(xmCheckVerification, 600);
         }
