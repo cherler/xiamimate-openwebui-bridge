@@ -70,6 +70,37 @@
     return hasTokenCookie();
   }
 
+  var deviceSessionBootstrapPromise = null;
+
+  function bootstrapDeviceSession() {
+    if (deviceSessionBootstrapPromise) {
+      return deviceSessionBootstrapPromise;
+    }
+    var headers = {};
+    var token = readStoredToken();
+    if (token) {
+      headers.Authorization = 'Bearer ' + token;
+    }
+    deviceSessionBootstrapPromise = fetch('/_xm/session/bootstrap', {
+      method: 'POST',
+      credentials: 'same-origin',
+      cache: 'no-store',
+      headers: headers
+    }).then(function(response) {
+      if (response.status === 409) {
+        window.location.href = '/portal/session-expired';
+        return null;
+      }
+      if (!response.ok) {
+        return null;
+      }
+      return response.json().catch(function() { return null; });
+    }).finally(function() {
+      deviceSessionBootstrapPromise = null;
+    });
+    return deviceSessionBootstrapPromise;
+  }
+
   // Detect login state from cookie or localStorage, and sync a cookie for portal auth if needed.
   var logged = ensurePortalTokenCookie();
   if (!logged) {
@@ -448,7 +479,7 @@
         return null;
       }).finally(function() {
         // Clear cookies
-        ['token', 'oui-session', 'oauth_id_token'].forEach(function(n) {
+        ['token', 'oui-session', 'oauth_id_token', 'xm_device_session'].forEach(function(n) {
           document.cookie = n + '=; Max-Age=0; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/; SameSite=Lax';
         });
         // Clear localStorage auth state (Open WebUI persists token here)
@@ -483,6 +514,7 @@
     detectOpenWebUISession().then(function(sessionLogged) {
       if (sessionLogged) {
         ensurePortalTokenCookie();
+        bootstrapDeviceSession();
         maybeAutoBindPendingInvite();
       }
       renderAuthActions(sessionLogged);

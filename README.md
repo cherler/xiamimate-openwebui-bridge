@@ -40,6 +40,19 @@
 6. 如需影子启动：
    - `bash scripts/manage_openwebui_bridge.sh up`
 
+Nginx 模板变更注意：
+
+1. 如果只是普通容器重启，挂载到 `/etc/nginx/templates/default.conf.template` 的模板改动不一定会重新渲染进运行中的 nginx 配置。
+2. 只要改了 `nginx/default.conf`，不要只执行普通 restart；应直接对 nginx 服务做 force recreate。
+3. 推荐命令：
+   - `cd /path/to/xiamimate-openwebui-bridge && docker compose up -d --force-recreate nginx`
+4. 适用场景包括但不限于：
+   - 新增或修改 `location` 路由
+   - 调整 `auth_request` / `error_page` 行为
+   - 修改 `sub_filter` 注入脚本版本
+   - 调整 `/_dify/`、`/portal`、`/admin`、`/` 等代理规则
+5. 如果 force recreate 后仍看到旧行为，再检查浏览器缓存与已注入的 `/_xm/nav.js` / `/_xm/nav.css` 版本号是否同步更新。
+
 首次启动注意：
 
 1. 如果 `13002 /health` 长时间不变为 `200`，且日志显示默认 embedding 模型下载失败，可先执行：
