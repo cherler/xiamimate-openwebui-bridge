@@ -85,6 +85,117 @@
     );
   }
 
+  var pendingInviteCodeKey = 'xm_pending_invite_code';
+  var pendingInviteBindingStateKey = 'xm_pending_invite_binding_state';
+  var pendingInviteBindingNoticeKey = 'xm_pending_invite_binding_notice';
+
+  function portalAuthHeaders() {
+    var headers = {};
+    var token = readStoredToken();
+    if (token) {
+      headers.Authorization = 'Bearer ' + token;
+    }
+    return headers;
+  }
+
+  function withInviteToken(path) {
+    var token = readStoredToken();
+    if (!token || !path || /[?&]t=/.test(path)) {
+      return path;
+    }
+    return path + (path.indexOf('?') === -1 ? '?' : '&') + 't=' + encodeURIComponent(token);
+  }
+
+  function maybeAutoBindPendingInvite() {
+    var inviteCode = '';
+    try {
+      inviteCode = (localStorage.getItem(pendingInviteCodeKey) || '').trim().toUpperCase();
+    } catch (e) {
+      inviteCode = '';
+    }
+    if (!inviteCode) {
+      return;
+    }
+    var token = readStoredToken();
+    if (!token) {
+      return;
+    }
+    try {
+      if (localStorage.getItem(pendingInviteBindingStateKey) === 'binding:' + inviteCode) {
+        return;
+      }
+      localStorage.setItem(pendingInviteBindingStateKey, 'binding:' + inviteCode);
+    } catch (e) {
+      return;
+    }
+
+    fetch(withInviteToken('/portal/api/account'), {
+      method: 'GET',
+      credentials: 'same-origin',
+      cache: 'no-store',
+      headers: portalAuthHeaders()
+    }).then(function(response) {
+      return response.json().catch(function() { return {}; }).then(function(body) {
+        if (!response.ok || !body || body.success !== true) {
+          throw new Error(body.detail || body.message || '账户状态读取失败');
+        }
+        return body.data || {};
+      });
+    }).then(function(data) {
+      var summary = data.identity_verification || {};
+      var invitedBy = summary.invited_by || null;
+      if (invitedBy) {
+        localStorage.removeItem(pendingInviteCodeKey);
+        localStorage.setItem(pendingInviteBindingStateKey, 'bound:' + inviteCode);
+        localStorage.setItem(pendingInviteBindingNoticeKey, JSON.stringify({
+          state: 'bound',
+          inviteCode: inviteCode,
+          inviterUserId: invitedBy.inviter_user_id || '',
+          inviterDisplayName: invitedBy.inviter_display_name || '',
+          createdAt: Date.now()
+        }));
+        return null;
+      }
+      if (summary.can_bind_invite_code !== true) {
+        localStorage.setItem(pendingInviteBindingStateKey, 'blocked:' + inviteCode);
+        return null;
+      }
+      return fetch(withInviteToken('/portal/api/account/referral/bind'), {
+        method: 'POST',
+        credentials: 'same-origin',
+        cache: 'no-store',
+        headers: Object.assign({'Content-Type': 'application/json'}, portalAuthHeaders()),
+        body: JSON.stringify({invite_code: inviteCode})
+      }).then(function(response) {
+        return response.json().catch(function() { return {}; }).then(function(body) {
+          if (!response.ok || !body || body.success !== true) {
+            throw new Error(body.detail || body.message || '邀请码自动绑定失败');
+          }
+          return body.data || {};
+        });
+      });
+    }).then(function(result) {
+      if (!result) {
+        return;
+      }
+      var boundSummary = result.identity_verification || {};
+      var boundInvitedBy = boundSummary.invited_by || {};
+      localStorage.removeItem(pendingInviteCodeKey);
+      localStorage.setItem(pendingInviteBindingStateKey, 'bound:' + inviteCode);
+      localStorage.setItem(pendingInviteBindingNoticeKey, JSON.stringify({
+        state: 'success',
+        inviteCode: inviteCode,
+        inviterUserId: boundInvitedBy.inviter_user_id || '',
+        inviterDisplayName: boundInvitedBy.inviter_display_name || '',
+        createdAt: Date.now()
+      }));
+    }).catch(function() {
+      try {
+        localStorage.removeItem(pendingInviteBindingStateKey);
+      } catch (e) {}
+    });
+  }
+
   document.documentElement.classList.add('xm-nav-active');
   if (document.body) {
     document.body.classList.add('xm-nav-active');
@@ -347,6 +458,7 @@
     });
   }
   attachSignoutHandler();
+  maybeAutoBindPendingInvite();
 
   // ── Verification gate redirect ──
   // If user is logged-in but unverified and on Open WebUI (not portal),
@@ -371,6 +483,7 @@
     detectOpenWebUISession().then(function(sessionLogged) {
       if (sessionLogged) {
         ensurePortalTokenCookie();
+        maybeAutoBindPendingInvite();
       }
       renderAuthActions(sessionLogged);
       if (!isPortalPage && sessionLogged) {
