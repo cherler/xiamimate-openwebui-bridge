@@ -3,3 +3,4 @@ data/
 __pycache__/
 pipelines/failed/
 pipelines/*/valves.json
+.DS_Store
