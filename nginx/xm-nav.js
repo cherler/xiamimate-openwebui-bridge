@@ -2,6 +2,7 @@
   if (document.getElementById('xm-nav')) return;
 
   var p = window.location.pathname;
+  var isAuthPage = p.indexOf('/auth') === 0;
   if (p.indexOf('/admin/backoffice') === 0) return;
   var siteContactUrl = '/portal/api/public/site-contact-config';
   var defaultContact = {
@@ -112,6 +113,7 @@
 
   function authActionsHtml(isLoggedIn) {
     return (
+      (!isLoggedIn && !isAuthPage ? '<a href="' + buildLoginUrl() + '" class="xm-btn" id="xm-signin-link" aria-label="登录" title="登录">登录</a>' : '') +
       (!isLoggedIn ? '<a href="/portal/recover-password" class="xm-action-link" aria-label="忘记密码" title="忘记密码"><span class="xm-action-text">忘记密码</span></a>' : '') +
       (isLoggedIn ? '<button type="button" class="xm-btn" id="xm-signout">退出登录</button>' : '')
     );
@@ -128,7 +130,7 @@
     return window.location.pathname + search + hash;
   }
 
-  function normalizePostLoginTarget(rawTarget) {
+  function normalizeDirectPostLoginTarget(rawTarget) {
     if (!rawTarget || typeof rawTarget !== 'string') {
       return '';
     }
@@ -137,6 +139,7 @@
       return '';
     }
     if (
+      target.indexOf('/auth') === 0 ||
       target.indexOf('/api/') === 0 ||
       target.indexOf('/_xm/') === 0 ||
       target.indexOf('/_dify/') === 0 ||
@@ -148,12 +151,48 @@
     return target;
   }
 
+  function normalizeAuthRedirectTarget(rawTarget) {
+    if (!rawTarget || typeof rawTarget !== 'string') {
+      return '';
+    }
+    var target = rawTarget.trim();
+    if (target.indexOf('/auth') !== 0) {
+      return '';
+    }
+    var queryIndex = target.indexOf('?');
+    if (queryIndex === -1) {
+      return '';
+    }
+    try {
+      var params = new URLSearchParams(target.slice(queryIndex + 1));
+      return normalizeDirectPostLoginTarget(params.get('redirect') || '');
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function normalizePostLoginTarget(rawTarget) {
+    return normalizeAuthRedirectTarget(rawTarget) || normalizeDirectPostLoginTarget(rawTarget);
+  }
+
+  function preferredPostLoginTarget() {
+    return readPostLoginTarget() || normalizePostLoginTarget(currentLocationTarget()) || '/';
+  }
+
+  function buildLoginUrl() {
+    return '/auth?redirect=' + encodeURIComponent(preferredPostLoginTarget());
+  }
+
   function rememberPostLoginTarget(target) {
     var normalized = normalizePostLoginTarget(target || currentLocationTarget());
     if (!normalized) {
       return;
     }
     try {
+      var existing = readPostLoginTarget();
+      if (isAuthPage && existing && normalized === '/' && existing !== '/') {
+        return;
+      }
       localStorage.setItem(pendingPostLoginTargetKey, normalized);
     } catch (e) {}
   }
@@ -505,6 +544,7 @@
       return;
     }
     authActions.innerHTML = authActionsHtml(logged);
+    attachSigninHandler();
     attachSignoutHandler();
   }
 
@@ -534,7 +574,8 @@
     }
     btn.dataset.xmBound = '1';
     btn.addEventListener('click', function() {
-      clearPostLoginTarget();
+      var signedOutTarget = normalizeDirectPostLoginTarget(currentLocationTarget()) || readPostLoginTarget() || '/';
+      rememberPostLoginTarget(signedOutTarget);
       fetch('/api/v1/auths/signout', {
         method: 'GET',
         credentials: 'same-origin',
@@ -548,8 +589,24 @@
         });
         // Clear localStorage auth state (Open WebUI persists token here)
         try { localStorage.removeItem('token'); } catch(e) {}
-        window.location.href = '/';
+        window.location.href = '/auth?redirect=' + encodeURIComponent(signedOutTarget);
       });
+    });
+  }
+
+  function attachSigninHandler() {
+    var link = document.getElementById('xm-signin-link');
+    if (!link) {
+      return;
+    }
+    link.href = buildLoginUrl();
+    if (link.dataset.xmBound === '1') {
+      return;
+    }
+    link.dataset.xmBound = '1';
+    link.addEventListener('click', function() {
+      rememberPostLoginTarget();
+      link.href = buildLoginUrl();
     });
   }
   attachSignoutHandler();
