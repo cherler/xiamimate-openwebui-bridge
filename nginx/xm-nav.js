@@ -88,6 +88,7 @@
       headers: headers
     }).then(function(response) {
       if (response.status === 409) {
+        rememberPostLoginTarget();
         window.location.href = '/portal/session-expired';
         return null;
       }
@@ -119,6 +120,63 @@
   var pendingInviteCodeKey = 'xm_pending_invite_code';
   var pendingInviteBindingStateKey = 'xm_pending_invite_binding_state';
   var pendingInviteBindingNoticeKey = 'xm_pending_invite_binding_notice';
+  var pendingPostLoginTargetKey = 'xm_pending_post_login_target';
+
+  function currentLocationTarget() {
+    var search = window.location.search || '';
+    var hash = window.location.hash || '';
+    return window.location.pathname + search + hash;
+  }
+
+  function normalizePostLoginTarget(rawTarget) {
+    if (!rawTarget || typeof rawTarget !== 'string') {
+      return '';
+    }
+    var target = rawTarget.trim();
+    if (!target || target.charAt(0) !== '/') {
+      return '';
+    }
+    if (
+      target.indexOf('/api/') === 0 ||
+      target.indexOf('/_xm/') === 0 ||
+      target.indexOf('/_dify/') === 0 ||
+      target.indexOf('/admin/backoffice') === 0 ||
+      target.indexOf('/portal/session-expired') === 0
+    ) {
+      return '';
+    }
+    return target;
+  }
+
+  function rememberPostLoginTarget(target) {
+    var normalized = normalizePostLoginTarget(target || currentLocationTarget());
+    if (!normalized) {
+      return;
+    }
+    try {
+      localStorage.setItem(pendingPostLoginTargetKey, normalized);
+    } catch (e) {}
+  }
+
+  function readPostLoginTarget() {
+    try {
+      return normalizePostLoginTarget(localStorage.getItem(pendingPostLoginTargetKey) || '');
+    } catch (e) {
+      return '';
+    }
+  }
+
+  function clearPostLoginTarget() {
+    try {
+      localStorage.removeItem(pendingPostLoginTargetKey);
+    } catch (e) {}
+  }
+
+  function consumePostLoginTarget(fallbackTarget) {
+    var target = readPostLoginTarget() || normalizePostLoginTarget(fallbackTarget || '') || '/';
+    clearPostLoginTarget();
+    return target;
+  }
 
   function portalAuthHeaders() {
     var headers = {};
@@ -435,6 +493,11 @@
   refreshContactConfig();
 
   var authActions = document.getElementById('xm-auth-actions');
+  var handledLoginTransitionRedirect = false;
+
+  if (!logged) {
+    rememberPostLoginTarget();
+  }
 
   function renderAuthActions(isLoggedIn) {
     logged = !!isLoggedIn;
@@ -471,6 +534,7 @@
     }
     btn.dataset.xmBound = '1';
     btn.addEventListener('click', function() {
+      clearPostLoginTarget();
       fetch('/api/v1/auths/signout', {
         method: 'GET',
         credentials: 'same-origin',
@@ -511,15 +575,27 @@
   }
 
   function syncAuthState() {
+    var wasLogged = logged;
     detectOpenWebUISession().then(function(sessionLogged) {
+      var bootstrapPromise = Promise.resolve(null);
+      if (!sessionLogged) {
+        rememberPostLoginTarget();
+      }
       if (sessionLogged) {
         ensurePortalTokenCookie();
-        bootstrapDeviceSession();
+        bootstrapPromise = bootstrapDeviceSession();
         maybeAutoBindPendingInvite();
       }
       renderAuthActions(sessionLogged);
       if (!isPortalPage && sessionLogged) {
         xmCheckVerification();
+      }
+      if (!wasLogged && sessionLogged && !handledLoginTransitionRedirect) {
+        var redirectTarget = consumePostLoginTarget(currentLocationTarget());
+        handledLoginTransitionRedirect = true;
+        bootstrapPromise.finally(function() {
+          window.location.href = redirectTarget;
+        });
       }
     }).catch(function() {});
   }
