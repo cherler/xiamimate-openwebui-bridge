@@ -3,7 +3,7 @@ title: XiaMimate Bridge Manifold
 author: GitHub Copilot
 date: 2026-04-14
 version: 0.2.0
-description: Open WebUI manifold that exposes the single XiaMimate agent model with /workflow routing.
+description: Open WebUI manifold that exposes the single XiaMimate agent model with /report and /workflow routing.
 requirements: requests
 """
 
@@ -101,6 +101,7 @@ ALLOWED_AGENT_TOOLS = {
 
 COMMAND_TO_MODE = {
     "/agent": "agent",
+    "/report": "report",
     "/web": "web",
     "/wf": "workflow",
     "/tool": "tool",
@@ -125,10 +126,31 @@ IDEMPOTENCY_KEY_HEADER_NAME = "Idempotency-Key"
 POINT_COST_BY_EVENT = {
     "llm_request": 1,
     "workflow_run": 8,
+    "report_quick_run": 8,
+    "report_standard_run": 16,
+    "report_deep_run": 24,
+    "report_research_run": 32,
     "kb_retrieve": 2,
     "product_api_call": 2,
     "web_search": 2,
 }
+
+REPORT_PROFILE_EVENT_TYPES = {
+    "quick": "report_quick_run",
+    "standard": "report_standard_run",
+    "deep": "report_deep_run",
+    "research": "report_research_run",
+}
+
+REPORT_PROFILE_LABELS = {
+    "quick": "快速报告",
+    "standard": "标准报告",
+    "deep": "深度报告",
+    "research": "研究报告",
+}
+
+STRUCTURED_PAYLOAD_START = "<!-- XM_PAYLOAD_START"
+STRUCTURED_PAYLOAD_END = "XM_PAYLOAD_END -->"
 
 TOOL_BILLING_EVENT = {
     "search_knowledge_base": "kb_retrieve",
@@ -144,8 +166,8 @@ TOOL_BILLING_EVENT = {
 
 WORKFLOW_SUGGESTION_PROMPTS = [
     {
-        "title": ["/workflow 示例", "宠物自动喂食器在 TikTok 美国市场的前景"],
-        "content": "/workflow 帮我调研一下宠物自动喂食器在 TikTok 美国市场的前景",
+        "title": ["/report 示例", "宠物自动喂食器在 TikTok 美国市场的前景"],
+        "content": "/report standard 帮我调研一下宠物自动喂食器在 TikTok 美国市场的前景",
     },
     {
         "title": ["/web 示例", "TikTok Shop 美国站最新政策"],
@@ -222,7 +244,7 @@ class Pipeline:
                 "name": "Agent",
                 "info": {
                     "meta": {
-                        "description": "虾米选品的智能体模式，支持 /workflow 调用 Dify Chatflow，并在长流程中显示进度。",
+                        "description": "虾米选品的智能体模式，支持 /report 报告编排，并兼容 /workflow 旧入口。",
                         "capabilities": {
                             "status_updates": True,
                         },
@@ -290,6 +312,8 @@ class Pipeline:
 
         if mode == "workflow":
             return self._run_workflow(query=normalized_user_message, body=body, model=response_model)
+        if mode == "report":
+            return self._run_report(query=normalized_user_message, body=body, model=response_model)
         if mode == "web":
             return self._run_web_search(query=normalized_user_message, body=body, model=response_model)
         if mode in {"agent", "tool"}:
@@ -298,19 +322,54 @@ class Pipeline:
         return self._chat_response(content="未识别的 XiaMimate 模式。请使用 Agent。", model=response_model)
 
     def _run_workflow(self, query: str, body: dict, model: str) -> Union[dict, Iterator[bytes]]:
+        return self._run_report_profile(
+            query=query,
+            body=body,
+            model=model,
+            profile="standard",
+            mode_tag="workflow",
+            guidance=(
+                "请在 /workflow 后直接写出调研需求。当前 /workflow 会兼容走标准报告，例如：\n"
+                "/workflow 帮我调研一下宠物自动喂食器在 TikTok 美国市场的前景"
+            ),
+        )
+
+    def _run_report(self, query: str, body: dict, model: str) -> Union[dict, Iterator[bytes]]:
+        profile, normalized_query = self._parse_report_profile(query)
+        return self._run_report_profile(
+            query=normalized_query,
+            body=body,
+            model=model,
+            profile=profile,
+            mode_tag="report",
+            guidance=(
+                "请在 /report 后直接写出调研需求，可选档位为 quick / standard / deep / research，例如：\n"
+                "/report standard 帮我调研一下宠物自动喂食器在 TikTok 美国市场的前景"
+            ),
+        )
+
+    def _run_report_profile(
+        self,
+        query: str,
+        body: dict,
+        model: str,
+        *,
+        profile: str,
+        mode_tag: str,
+        guidance: str,
+    ) -> Union[dict, Iterator[bytes]]:
+        report_label = REPORT_PROFILE_LABELS[profile]
         return self._run_dify_chatflow(
             query=query,
             body=body,
             model=model,
-            event_type="workflow_run",
-            charge_description="Workflow 请求",
-            run_path="/internal/provider/dify-workflow/run",
-            run_stream_path="/internal/provider/dify-workflow/run-stream",
-            mode_tag="workflow",
-            guidance=(
-                "请在 /workflow 后直接写出调研需求，例如：\n"
-                "/workflow 帮我调研一下宠物自动喂食器在 TikTok 美国市场的前景"
-            ),
+            event_type=REPORT_PROFILE_EVENT_TYPES[profile],
+            charge_description=report_label,
+            run_path="/internal/provider/report/run",
+            run_stream_path="/internal/provider/report/run-stream",
+            mode_tag=mode_tag,
+            guidance=guidance,
+            request_payload={"profile": profile},
         )
 
     def _run_web_search(self, query: str, body: dict, model: str) -> Union[dict, Iterator[bytes]]:
@@ -341,6 +400,7 @@ class Pipeline:
         run_stream_path: str,
         mode_tag: str,
         guidance: str,
+        request_payload: Optional[dict] = None,
     ) -> Union[dict, Iterator[bytes]]:
         query = (query or "").strip()
         if not query:
@@ -362,6 +422,7 @@ class Pipeline:
                 description=charge_description,
                 meta={
                     "mode": mode_tag,
+                    "report_profile": (request_payload or {}).get("profile"),
                     "stream": bool(body.get("stream")),
                     "query_preview": query[:200],
                 },
@@ -382,6 +443,7 @@ class Pipeline:
                 run_stream_path=run_stream_path,
                 mode_tag=mode_tag,
                 refund_description="%s失败，已退款" % charge_description,
+                request_payload=request_payload,
             )
 
         try:
@@ -391,6 +453,7 @@ class Pipeline:
                 body={
                     "query": query,
                     "user": billing_context["user_id"],
+                    **(request_payload or {}),
                 },
                 internal=True,
                 timeout=self.valves.DIFY_REQUEST_TIMEOUT,
@@ -406,7 +469,7 @@ class Pipeline:
 
         answer = self._extract_workflow_answer(response)
         if answer:
-            return self._chat_response(content=answer, model=model)
+            return self._chat_response(content=self._prepare_workflow_answer(answer), model=model)
 
         return self._chat_response(content=json.dumps(response, ensure_ascii=False, indent=2), model=model)
 
@@ -610,9 +673,20 @@ class Pipeline:
         effective_model = str(body.get("model", model_id) or model_id or "")
         model_mode = effective_model.split(".")[-1].lower() if effective_model else ""
 
-        mode = requested_mode or command_mode or (model_mode if model_mode in {"agent", "tool", "workflow"} else "agent")
+        mode = requested_mode or command_mode or (model_mode if model_mode in {"agent", "tool", "workflow", "report"} else "agent")
         query = (command_query if command_mode else (user_message or last_user_text or "")).strip()
         return mode, query, command_mode is not None
+
+    def _parse_report_profile(self, text: str) -> Tuple[str, str]:
+        stripped = (text or "").strip()
+        if not stripped:
+            return "standard", ""
+
+        first_token, _, remainder = stripped.partition(" ")
+        normalized = first_token.lower().strip()
+        if normalized in REPORT_PROFILE_EVENT_TYPES:
+            return normalized, remainder.strip()
+        return "standard", stripped
 
     def _parse_mode_command(self, text: str) -> Tuple[Optional[str], str]:
         stripped = (text or "").lstrip()
@@ -718,7 +792,7 @@ class Pipeline:
             lines.append("")
             lines.append("- 扣减规则：%s" % self._consumption_policy_text(balance_breakdown))
             lines.append("- 扣减顺序：%s" % self._consumption_priority_text(balance_breakdown))
-            lines.append("- 计费提示：一次 Workflow 固定按 8 积分计费，内部检索和工具调用会保留记录，但当前不会重复额外收费。")
+            lines.append("- 计费提示：/report 按档位计费；/workflow 当前兼容走标准报告语义，内部检索和工具调用会保留记录，但不会重复额外收费。")
             if recent_ledger:
                 lines.append("")
                 lines.append("🧾 **最近账本**")
@@ -759,7 +833,7 @@ class Pipeline:
             )
             lines.append("")
             lines.append("- 说明：这里按计费单位统计使用量，不直接等于人民币金额。实际扣费优先消耗月包积分，月包不足时再扣充值包积分。")
-            lines.append("- 常见计价：LLM 请求 1 积分/次，知识库检索 2 积分/次，商品 API 检索 2 积分/次，网络搜索 2 积分/次，Workflow 8 积分/次。")
+            lines.append("- 常见计价：快速报告 8 积分/次，标准报告 16 积分/次，深度报告 24 积分/次，研究报告 32 积分/次，知识库检索 2 积分/次，商品 API 检索 2 积分/次，网络搜索 2 积分/次。")
             if usage_by_type:
                 lines.append("")
                 lines.append("- 30 天内按事件类型：")
@@ -854,7 +928,11 @@ class Pipeline:
         alias_mapping = {
             "llm_request": "LLM 请求",
             "minimax_request": "LLM 请求",
-            "workflow_run": "Workflow 请求",
+            "workflow_run": "Workflow 兼容入口",
+            "report_quick_run": "快速报告",
+            "report_standard_run": "标准报告",
+            "report_deep_run": "深度报告",
+            "report_research_run": "研究报告",
             "kb_retrieve": "知识库检索",
             "dify_knowledge_retrieve": "知识库检索",
             "product_api_call": "商品 API 检索",
@@ -937,7 +1015,11 @@ class Pipeline:
         known_descriptions = {
             "MiniMax agent request": "按 LLM 请求次数计费。",
             "MiniMax agent request failed": "LLM 请求失败，系统已自动退款。",
-            "Dify workflow run": "一次 Workflow 固定计费 8 积分，内部步骤只保留审计记录，不重复收费。",
+            "快速报告": "一次快速报告计费，内部步骤只保留审计记录，不重复收费。",
+            "标准报告": "一次标准报告计费，内部步骤只保留审计记录，不重复收费。",
+            "深度报告": "一次深度报告计费，内部步骤只保留审计记录，不重复收费。",
+            "研究报告": "一次研究报告计费，内部步骤只保留审计记录，不重复收费。",
+            "Dify workflow run": "兼容旧入口 /workflow 当前按标准报告语义执行，内部步骤只保留审计记录，不重复收费。",
             "Dify workflow request failed": "Workflow 请求失败，系统已自动退款。",
             "网络搜索": "按网络搜索次数计费。",
             "网络搜索失败，已退款": "网络搜索失败，系统已自动退款。",
@@ -958,7 +1040,11 @@ class Pipeline:
             return description
         if entry_type == "consume":
             usage_mapping = {
-                "workflow_run": "一次 Workflow 固定计费 8 积分，内部检索和工具调用只保留记录，不重复收费。",
+                "workflow_run": "兼容旧入口 /workflow 的历史计费记录。",
+                "report_quick_run": "一次快速报告计费，内部检索和工具调用只保留记录，不重复收费。",
+                "report_standard_run": "一次标准报告计费，内部检索和工具调用只保留记录，不重复收费。",
+                "report_deep_run": "一次深度报告计费，内部检索和工具调用只保留记录，不重复收费。",
+                "report_research_run": "一次研究报告计费，内部检索和工具调用只保留记录，不重复收费。",
                 "llm_request": "按 LLM 请求次数计费。",
                 "kb_retrieve": "按知识库检索次数计费。",
                 "dify_knowledge_retrieve": "按知识库检索次数计费。",
@@ -1052,6 +1138,7 @@ class Pipeline:
         run_stream_path: str,
         mode_tag: str,
         refund_description: str,
+        request_payload: Optional[dict] = None,
     ) -> Iterator[bytes]:
         response_id = "%s-%s" % (model, uuid.uuid4())
         created = int(time.time())
@@ -1060,6 +1147,7 @@ class Pipeline:
         answer_chunks: List[str] = []
         emitted_progress = set()
         reasoning_open = False
+        buffered_answer_mode = mode_tag == "workflow"
 
         def emit_text_chunk(content: str) -> bytes:
             return self._stream_content_chunk(
@@ -1111,6 +1199,7 @@ class Pipeline:
                 body={
                     "query": query,
                     "user": billing_context["user_id"],
+                    **(request_payload or {}),
                 },
             ) as response:
                 response.raise_for_status()
@@ -1150,6 +1239,9 @@ class Pipeline:
                         answer_text = self._extract_workflow_answer(event)
                         if not answer_text:
                             continue
+                        if buffered_answer_mode:
+                            answer_chunks.append(answer_text)
+                            continue
                         if not answer_started:
                             answer_started = True
                             final_stage = self._format_dify_progress(mode_tag, 100, "执行完成，正在整理最终结果")
@@ -1166,6 +1258,24 @@ class Pipeline:
 
                     if event_type == "workflow_finished":
                         final_answer = self._extract_workflow_answer(event)
+                        if buffered_answer_mode:
+                            buffered_answer = final_answer or "".join(answer_chunks).strip()
+                            prepared_answer, _payload_comment = self._prepare_workflow_answer_parts(buffered_answer) if buffered_answer else ("", None)
+                            if prepared_answer and not answer_started:
+                                answer_started = True
+                                final_stage = self._format_dify_progress(mode_tag, 100, "执行完成，正在整理最终结果")
+                                if final_stage not in emitted_progress:
+                                    emitted_progress.add(final_stage)
+                                    for rc in emit_reasoning_chunks(final_stage):
+                                        yield rc
+                                close_chunk = close_reasoning_chunk()
+                                if close_chunk is not None:
+                                    yield close_chunk
+                                if prepared_answer:
+                                    for text_chunk in self._split_text(prepared_answer):
+                                        answer_chunks.append(text_chunk)
+                                        yield emit_text_chunk(text_chunk)
+                            continue
                         if final_answer and not answer_started:
                             answer_started = True
                             final_stage = self._format_dify_progress(mode_tag, 100, "执行完成，正在整理最终结果")
@@ -1186,7 +1296,8 @@ class Pipeline:
                         raise RuntimeError(error_text or "Dify Chatflow 返回错误事件。")
 
                 if not answer_started:
-                    final_answer = "".join(answer_chunks).strip() or "执行已完成，但未返回可展示的结果。"
+                    raw_answer = "".join(answer_chunks).strip() or "执行已完成，但未返回可展示的结果。"
+                    final_answer, _payload_comment = self._prepare_workflow_answer_parts(raw_answer) if buffered_answer_mode else (raw_answer, None)
                     final_stage = self._format_dify_progress(mode_tag, 100, "执行完成，正在整理最终结果")
                     if final_stage not in emitted_progress:
                         emitted_progress.add(final_stage)
@@ -1327,6 +1438,386 @@ class Pipeline:
                 return value
 
         return ""
+
+    def _prepare_workflow_answer(self, answer_text: str) -> str:
+        rendered, _payload_comment = self._prepare_workflow_answer_parts(answer_text)
+        return rendered
+
+    def _prepare_workflow_answer_parts(self, answer_text: str) -> Tuple[str, Optional[str]]:
+        visible_text, payload = self._extract_structured_workflow_payload(answer_text)
+        if not payload:
+            return answer_text, None
+
+        rendered = self._render_structured_workflow_payload(payload, fallback_summary=visible_text)
+        payload_comment = self._build_structured_payload_comment(payload)
+        if rendered:
+            return rendered.rstrip(), payload_comment
+        if visible_text:
+            return visible_text.rstrip(), payload_comment
+        return "", payload_comment
+
+    def _extract_structured_workflow_payload(self, answer_text: str) -> Tuple[str, Optional[dict]]:
+        text = str(answer_text or "")
+        start = text.find(STRUCTURED_PAYLOAD_START)
+        if start == -1:
+            return text, None
+
+        end = text.find(STRUCTURED_PAYLOAD_END, start)
+        if end == -1:
+            return text, None
+
+        block_start = text.find("\n", start)
+        if block_start == -1:
+            return text, None
+
+        payload_text = text[block_start:end].strip()
+        visible_text = (text[:start] + text[end + len(STRUCTURED_PAYLOAD_END) :]).strip()
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError:
+            return visible_text or text, None
+        if not isinstance(payload, dict):
+            return visible_text or text, None
+        return visible_text or text[:start].strip(), payload
+
+    def _build_structured_payload_comment(self, payload: dict) -> str:
+        return "%s\n%s\n%s" % (
+            STRUCTURED_PAYLOAD_START,
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            STRUCTURED_PAYLOAD_END,
+        )
+
+    def _render_structured_workflow_payload(self, payload: dict, fallback_summary: str = "") -> str:
+        rendered_markdown = payload.get("rendered_markdown")
+        if isinstance(rendered_markdown, str) and rendered_markdown.strip():
+            return rendered_markdown.strip()
+
+        sections: List[str] = []
+
+        summary_markdown = payload.get("summary_markdown")
+        if isinstance(summary_markdown, str) and summary_markdown.strip():
+            sections.append(summary_markdown.strip())
+        elif fallback_summary.strip():
+            sections.append(fallback_summary.strip())
+
+        coverage_status = payload.get("coverage_status")
+        coverage_section = self._render_structured_coverage_status(coverage_status)
+        if coverage_section:
+            sections.append(coverage_section)
+
+        data_tables = payload.get("data_tables")
+        if isinstance(data_tables, list):
+            for table in data_tables:
+                table_markdown = self._render_structured_data_table(table)
+                if table_markdown:
+                    sections.append(table_markdown)
+
+        chart_specs = payload.get("chart_specs")
+        rendered_chart_ids = set()
+        if isinstance(chart_specs, list):
+            for chart_spec in chart_specs:
+                chart_markdown = self._render_structured_chart_spec(chart_spec)
+                if chart_markdown:
+                    sections.append(chart_markdown)
+                chart_id = chart_spec.get("chart_id") if isinstance(chart_spec, dict) else None
+                if isinstance(chart_id, str) and chart_id.strip():
+                    rendered_chart_ids.add(chart_id.strip())
+
+        for chart_spec in self._synthesize_structured_chart_specs(payload, rendered_chart_ids):
+            chart_markdown = self._render_structured_chart_spec(chart_spec)
+            if chart_markdown:
+                sections.append(chart_markdown)
+
+        return "\n\n".join(section for section in sections if section).strip()
+
+    def _render_structured_coverage_status(self, coverage_status: Any) -> str:
+        if not isinstance(coverage_status, dict):
+            return ""
+
+        lines: List[str] = ["## 结构化状态"]
+        candidate_pool_status = coverage_status.get("candidate_pool")
+        if candidate_pool_status:
+            lines.append("- 候选池预测覆盖: %s" % candidate_pool_status)
+        top_asin_status = coverage_status.get("top_asin")
+        if top_asin_status:
+            lines.append("- Top ASIN 预测覆盖: %s" % top_asin_status)
+        covered_domains = coverage_status.get("covered_domains")
+        if isinstance(covered_domains, list) and covered_domains:
+            lines.append("- 已覆盖 domain: %s" % ", ".join(str(item) for item in covered_domains))
+        missing_domains = coverage_status.get("missing_domains")
+        if isinstance(missing_domains, list) and missing_domains:
+            lines.append("- 未覆盖 domain: %s" % ", ".join(str(item) for item in missing_domains))
+
+        return "\n".join(lines) if len(lines) > 1 else ""
+
+    def _render_structured_data_table(self, table: Any) -> str:
+        if not isinstance(table, dict):
+            return ""
+
+        columns = table.get("columns")
+        rows = table.get("rows")
+        if not isinstance(columns, list) or not columns:
+            return ""
+        if not isinstance(rows, list) or not rows:
+            return ""
+
+        def normalize_cell(value: Any) -> str:
+            if value is None:
+                return ""
+            if isinstance(value, (dict, list)):
+                return json.dumps(value, ensure_ascii=False)
+            return str(value)
+
+        title = str(table.get("title") or table.get("table_id") or "数据表").strip()
+        header = "| %s |" % " | ".join(normalize_cell(column) for column in columns)
+        separator = "| %s |" % " | ".join("---" for _ in columns)
+        body = []
+        for row in rows:
+            if isinstance(row, dict):
+                padded = [row.get(str(column), "") for column in columns]
+            elif isinstance(row, list):
+                padded = list(row[: len(columns)])
+                if len(padded) < len(columns):
+                    padded.extend([""] * (len(columns) - len(padded)))
+            else:
+                continue
+            body.append("| %s |" % " | ".join(normalize_cell(cell) for cell in padded))
+        if not body:
+            return ""
+        return "## %s\n%s\n%s\n%s" % (title, header, separator, "\n".join(body))
+
+    def _structured_table_rows_as_dicts(self, table: Any) -> List[dict]:
+        if not isinstance(table, dict):
+            return []
+
+        columns = table.get("columns")
+        rows = table.get("rows")
+        if not isinstance(columns, list) or not isinstance(rows, list):
+            return []
+
+        normalized_rows: List[dict] = []
+        for row in rows:
+            if isinstance(row, dict):
+                normalized_rows.append({str(key): value for key, value in row.items()})
+                continue
+            if isinstance(row, list):
+                normalized_rows.append(
+                    {
+                        str(column): row[index] if index < len(row) else ""
+                        for index, column in enumerate(columns)
+                    }
+                )
+        return normalized_rows
+
+    def _safe_structured_number(self, value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            value = stripped
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _structured_chart_domain_max(self, values: List[dict], field_names: List[str]) -> float:
+        max_value = 0.0
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            for field_name in field_names:
+                number = self._safe_structured_number(item.get(field_name))
+                if number is None:
+                    continue
+                if number > max_value:
+                    max_value = number
+        if max_value <= 0:
+            return 1.0
+        return round(max_value * 1.15, 2)
+
+    def _build_structured_bar_chart_spec(
+        self,
+        values: List[dict],
+        y_field: str,
+        y_title: str,
+        tooltip: List[dict],
+        color_field: Optional[str] = None,
+    ) -> str:
+        encoding: Dict[str, Any] = {
+            "x": {"field": "asin", "type": "nominal", "sort": "-y", "axis": {"labelAngle": -20}},
+            "y": {
+                "field": y_field,
+                "type": "quantitative",
+                "title": y_title,
+                "scale": {"domain": [0, self._structured_chart_domain_max(values, [y_field])]},
+            },
+            "tooltip": tooltip,
+        }
+        if color_field:
+            encoding["color"] = {"field": color_field, "type": "nominal", "title": "方向"}
+
+        return json.dumps(
+            {
+                "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+                "mark": {"type": "bar", "cornerRadiusTopLeft": 4, "cornerRadiusTopRight": 4},
+                "data": {"values": values},
+                "encoding": encoding,
+            },
+            ensure_ascii=False,
+        )
+
+    def _build_supplemental_growth_chart(self, rows: List[dict]) -> Optional[dict]:
+        values = []
+        for row in rows:
+            asin = str(row.get("ASIN") or row.get("asin") or "").strip()
+            if not asin:
+                continue
+            values.append(
+                {
+                    "asin": asin,
+                    "growth_delta": self._safe_structured_number(row.get("W4-W1 增量")) or 0,
+                    "predicted_weekly_sales_w4": self._safe_structured_number(row.get("预测周销量W4")) or 0,
+                    "direction": str(row.get("方向") or "").strip(),
+                }
+            )
+        if not values:
+            return None
+
+        return {
+            "chart_id": "forecast_top_asins_growth_chart",
+            "renderer": "vega-lite",
+            "title": "候选池预测 Top ASIN 增量图",
+            "spec": self._build_structured_bar_chart_spec(
+                values=values,
+                y_field="growth_delta",
+                y_title="W4-W1 增量",
+                tooltip=[
+                    {"field": "asin", "type": "nominal"},
+                    {"field": "growth_delta", "type": "quantitative", "title": "W4-W1 增量"},
+                    {"field": "predicted_weekly_sales_w4", "type": "quantitative", "title": "预测周销量W4"},
+                    {"field": "direction", "type": "nominal", "title": "方向"},
+                ],
+                color_field="direction",
+            ),
+        }
+
+    def _build_supplemental_drilldown_chart(self, rows: List[dict]) -> Optional[dict]:
+        values = []
+        for row in rows:
+            asin = str(row.get("ASIN") or row.get("asin") or "").strip()
+            if not asin:
+                continue
+            values.append(
+                {
+                    "asin": asin,
+                    "predicted_weekly_sales_w1": self._safe_structured_number(row.get("预测周销量W1")) or 0,
+                    "predicted_weekly_sales_w4": self._safe_structured_number(row.get("预测周销量W4")) or 0,
+                }
+            )
+        if not values:
+            return None
+
+        return {
+            "chart_id": "top_asin_drilldown_chart",
+            "renderer": "vega-lite",
+            "title": "Top ASIN 预测下钻图",
+            "spec": json.dumps(
+                {
+                    "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+                    "data": {"values": values},
+                    "transform": [
+                        {"fold": ["predicted_weekly_sales_w1", "predicted_weekly_sales_w4"], "as": ["week", "sales"]},
+                        {"calculate": "datum.week === 'predicted_weekly_sales_w1' ? 'W1' : 'W4'", "as": "week_label"},
+                    ],
+                    "mark": {"type": "bar", "cornerRadiusTopLeft": 4, "cornerRadiusTopRight": 4},
+                    "encoding": {
+                        "x": {"field": "asin", "type": "nominal", "axis": {"labelAngle": -20}},
+                        "xOffset": {"field": "week_label"},
+                        "y": {
+                            "field": "sales",
+                            "type": "quantitative",
+                            "title": "预测周销量",
+                            "scale": {
+                                "domain": [
+                                    0,
+                                    self._structured_chart_domain_max(
+                                        values,
+                                        ["predicted_weekly_sales_w1", "predicted_weekly_sales_w4"],
+                                    ),
+                                ]
+                            },
+                        },
+                        "color": {"field": "week_label", "type": "nominal", "title": "预测周期"},
+                        "tooltip": [
+                            {"field": "asin", "type": "nominal"},
+                            {"field": "week_label", "type": "nominal", "title": "预测周期"},
+                            {"field": "sales", "type": "quantitative", "title": "预测周销量"},
+                        ],
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        }
+
+    def _synthesize_structured_chart_specs(self, payload: dict, existing_chart_ids: set) -> List[dict]:
+        if not isinstance(payload, dict):
+            return []
+
+        data_tables = payload.get("data_tables")
+        if not isinstance(data_tables, list):
+            return []
+
+        forecast_rows: List[dict] = []
+        drilldown_rows: List[dict] = []
+        for table in data_tables:
+            if not isinstance(table, dict):
+                continue
+            table_id = str(table.get("table_id") or "").strip()
+            title = str(table.get("title") or "").strip()
+            rows = self._structured_table_rows_as_dicts(table)
+            if not rows:
+                continue
+            if table_id == "forecast_top_asins" or "候选池预测 Top ASIN" in title:
+                forecast_rows = rows
+            elif table_id == "top_asin_drilldown_forecast" or "Top ASIN 预测下钻" in title:
+                drilldown_rows = rows
+
+        charts: List[dict] = []
+        if forecast_rows and "forecast_top_asins_growth_chart" not in existing_chart_ids:
+            growth_chart = self._build_supplemental_growth_chart(forecast_rows)
+            if growth_chart:
+                charts.append(growth_chart)
+
+        if drilldown_rows and "top_asin_drilldown_chart" not in existing_chart_ids:
+            drilldown_chart = self._build_supplemental_drilldown_chart(drilldown_rows)
+            if drilldown_chart:
+                charts.append(drilldown_chart)
+
+        return charts
+
+    def _render_structured_chart_spec(self, chart_spec: Any) -> str:
+        if not isinstance(chart_spec, dict):
+            return ""
+
+        renderer = str(chart_spec.get("renderer") or "").strip()
+        spec = chart_spec.get("spec")
+        if not renderer or spec is None:
+            return ""
+
+        title = str(chart_spec.get("title") or chart_spec.get("chart_id") or "图表").strip()
+        if renderer not in {"vega", "vega-lite", "mermaid"}:
+            return ""
+
+        if isinstance(spec, str):
+            spec_text = spec.strip()
+        else:
+            spec_text = json.dumps(spec, ensure_ascii=False, indent=2)
+        if not spec_text:
+            return ""
+
+        return "## %s\n```%s\n%s\n```" % (title, renderer, spec_text)
 
     def _prepare_agent_payload(self, messages: List[dict], body: dict, mode: str = "agent") -> dict:
         provider = self._get_provider()

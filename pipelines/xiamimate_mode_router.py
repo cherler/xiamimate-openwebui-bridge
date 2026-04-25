@@ -3,7 +3,7 @@ title: XiaMimate Slash Router
 author: GitHub Copilot
 date: 2026-04-14
 version: 0.1.0
-description: Filter pipeline that routes /agent /wf /workflow onto the single XiaMimate agent model.
+description: Filter pipeline that routes /agent /report /wf /workflow onto the single XiaMimate agent model.
 """
 
 import os
@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 COMMAND_TO_MODE = {
     "/agent": "agent",
+    "/report": "report",
     "/tool": "tool",
     "/web": "web",
     "/wf": "workflow",
