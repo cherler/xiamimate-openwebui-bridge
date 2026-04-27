@@ -155,6 +155,48 @@ REPORT_PROFILE_LABELS = {
 STRUCTURED_PAYLOAD_START = "<!-- XM_PAYLOAD_START"
 STRUCTURED_PAYLOAD_END = "XM_PAYLOAD_END -->"
 
+CHART_PANEL_GROUP_LABELS = {
+    "overview": "机会总览",
+    "internal_evidence": "站内证据",
+    "market_trend": "市场趋势",
+    "risk_exclusion": "风险排除",
+    "supplier": "供应承接",
+    "diagnostic": "诊断补证",
+}
+
+CHART_PANEL_GROUP_ORDER = [
+    "overview",
+    "internal_evidence",
+    "market_trend",
+    "risk_exclusion",
+    "supplier",
+    "diagnostic",
+]
+
+CHART_PANEL_TIER_LABELS = {
+    "primary": "关键图表",
+    "supporting": "支撑图表",
+    "diagnostic": "诊断图表",
+}
+
+DEFAULT_CHART_PANEL_META = {
+    "forecast_top_asins_sales": {"panel_group": "overview", "panel_tier": "primary", "display_priority": 10, "evidence_layer": "internal"},
+    "forecast_top_asins_chart": {"panel_group": "overview", "panel_tier": "primary", "display_priority": 10, "evidence_layer": "internal"},
+    "top_asin_w1_w4_compare": {"panel_group": "overview", "panel_tier": "primary", "display_priority": 20, "evidence_layer": "internal"},
+    "candidate_vs_benchmark_compare": {"panel_group": "overview", "panel_tier": "supporting", "display_priority": 30, "evidence_layer": "internal"},
+    "forecast_top_asins_growth": {"panel_group": "overview", "panel_tier": "supporting", "display_priority": 35, "evidence_layer": "internal"},
+    "forecast_top_asins_growth_chart": {"panel_group": "overview", "panel_tier": "supporting", "display_priority": 36, "evidence_layer": "internal"},
+    "top_asin_drilldown_chart": {"panel_group": "internal_evidence", "panel_tier": "supporting", "display_priority": 45, "evidence_layer": "internal"},
+    "forecast_driver_distribution": {"panel_group": "internal_evidence", "panel_tier": "supporting", "display_priority": 50, "evidence_layer": "internal"},
+    "asin_sales_trend_line": {"panel_group": "internal_evidence", "panel_tier": "supporting", "display_priority": 60, "evidence_layer": "internal"},
+    "asin_price_trend_line": {"panel_group": "internal_evidence", "panel_tier": "supporting", "display_priority": 61, "evidence_layer": "internal"},
+    "asin_bsr_trend_line": {"panel_group": "internal_evidence", "panel_tier": "supporting", "display_priority": 62, "evidence_layer": "internal"},
+    "asin_review_growth_trend_line": {"panel_group": "internal_evidence", "panel_tier": "supporting", "display_priority": 63, "evidence_layer": "internal"},
+    "asin_stability_scorecard": {"panel_group": "diagnostic", "panel_tier": "diagnostic", "display_priority": 80, "evidence_layer": "internal"},
+    "weak_signal_score_rank": {"panel_group": "diagnostic", "panel_tier": "diagnostic", "display_priority": 81, "evidence_layer": "internal"},
+    "weak_signal_momentum_compare": {"panel_group": "diagnostic", "panel_tier": "diagnostic", "display_priority": 82, "evidence_layer": "internal"},
+}
+
 TOOL_BILLING_EVENT = {
     "search_knowledge_base": "kb_retrieve",
     "web_search": "web_search",
@@ -1152,7 +1194,7 @@ class Pipeline:
         answer_chunks: List[str] = []
         emitted_progress = set()
         reasoning_open = False
-        buffered_answer_mode = mode_tag == "workflow"
+        buffered_answer_mode = mode_tag in {"workflow", "report"}
 
         def emit_text_chunk(content: str) -> bytes:
             return self._stream_content_chunk(
@@ -1497,6 +1539,8 @@ class Pipeline:
     def _augment_selection_report_payload(self, payload: dict, fallback_summary: str = "") -> dict:
         if not isinstance(payload, dict):
             return payload
+        if self._is_standard_report_payload(payload):
+            return payload
         if not self._is_selection_report_payload(payload):
             return payload
 
@@ -1587,6 +1631,16 @@ class Pipeline:
             key in (coverage_status or {})
             for key in ["overall_status", "forecast_status", "coverage_ratio", "forecast_type", "candidate_asin_count"]
         )
+
+    def _is_standard_report_payload(self, payload: dict) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        source_context = self._ensure_structured_dict(payload.get("source_context"))
+        report_profile = str(source_context.get("report_profile") or payload.get("report_profile") or "").strip().lower()
+        if report_profile != "standard":
+            return False
+        channel = str(source_context.get("channel") or payload.get("channel") or payload.get("producer") or "").strip().lower()
+        return channel in {"", "workflow", "report"}
 
     def _build_selection_report_bundle(self, payload: dict, fallback_summary: str = "") -> Optional[dict]:
         features = self._extract_selection_report_features(payload)
@@ -1928,9 +1982,11 @@ class Pipeline:
         min_rows: int = 1,
     ) -> bool:
         intent = self._selection_intent_by_id(chart_intents, intent_id)
-        if intent:
-            return str(intent.get("status") or "").strip() == "ready"
+        if intent and str(intent.get("status") or "").strip() != "ready":
+            return False
         rows = fallback_rows or []
+        if intent and not rows and not value_fields:
+            return True
         if len(rows) < min_rows:
             return False
         if not value_fields:
@@ -1956,6 +2012,18 @@ class Pipeline:
                     count += 1
                     break
         return count
+
+    def _selection_count_distinct_non_zero(self, rows: List[dict], field_names: List[str]) -> int:
+        values = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for field_name in field_names:
+                number = self._safe_structured_number(row.get(field_name))
+                if number is not None and abs(number) > 1e-9:
+                    values.add(round(number, 4))
+                    break
+        return len(values)
 
     def _selection_pick_metric_gap(self, rows: List[dict], metric_name: str) -> Optional[float]:
         for row in rows:
@@ -2801,6 +2869,9 @@ class Pipeline:
         if isinstance(rendered_markdown, str) and rendered_markdown.strip():
             return rendered_markdown.strip()
 
+        if self._is_standard_report_payload(payload):
+            return self._render_standard_report_payload(payload, fallback_summary=fallback_summary)
+
         sections: List[str] = []
 
         selection_decision_markdown = payload.get("selection_decision_markdown")
@@ -2823,6 +2894,10 @@ class Pipeline:
         if coverage_section:
             sections.append(coverage_section)
 
+        chart_panels_section = self._render_structured_chart_panels(payload)
+        if chart_panels_section:
+            sections.append(chart_panels_section)
+
         data_tables = payload.get("data_tables")
         if isinstance(data_tables, list):
             for table in data_tables:
@@ -2830,23 +2905,265 @@ class Pipeline:
                 if table_markdown:
                     sections.append(table_markdown)
 
-        chart_specs = payload.get("chart_specs")
-        rendered_chart_ids = set()
-        if isinstance(chart_specs, list):
-            for chart_spec in chart_specs:
-                chart_markdown = self._render_structured_chart_spec(chart_spec)
-                if chart_markdown:
-                    sections.append(chart_markdown)
-                chart_id = chart_spec.get("chart_id") if isinstance(chart_spec, dict) else None
-                if isinstance(chart_id, str) and chart_id.strip():
-                    rendered_chart_ids.add(chart_id.strip())
+        return "\n\n".join(section for section in sections if section).strip()
 
-        for chart_spec in self._synthesize_structured_chart_specs(payload, rendered_chart_ids):
-            chart_markdown = self._render_structured_chart_spec(chart_spec)
-            if chart_markdown:
-                sections.append(chart_markdown)
+    def _render_standard_report_payload(self, payload: dict, fallback_summary: str = "") -> str:
+        sections: List[str] = []
+
+        summary_markdown = payload.get("summary_markdown")
+        if isinstance(summary_markdown, str) and summary_markdown.strip():
+            sections.append(summary_markdown.strip())
+        elif fallback_summary.strip():
+            sections.append(fallback_summary.strip())
+
+        chart_panels_section = self._render_structured_chart_panels(payload, include_suppressed=False)
+        if chart_panels_section:
+            sections.append(chart_panels_section)
 
         return "\n\n".join(section for section in sections if section).strip()
+
+    def _render_structured_chart_panels(self, payload: dict, *, include_suppressed: bool = True) -> str:
+        chart_specs = self._collect_structured_chart_specs(payload)
+        suppressed_charts = self._build_selection_suppressed_charts(payload) if include_suppressed else []
+        if not chart_specs and not suppressed_charts:
+            return ""
+
+        chart_intents = payload.get("chart_intents") if isinstance(payload.get("chart_intents"), list) else []
+        intent_by_id = {
+            str(intent.get("intent_id") or "").strip(): intent
+            for intent in chart_intents
+            if isinstance(intent, dict) and str(intent.get("intent_id") or "").strip()
+        }
+
+        entries = [
+            self._build_chart_panel_entry(chart_spec, intent_by_id)
+            for chart_spec in chart_specs
+        ]
+        entries = [entry for entry in entries if entry]
+        entries.sort(
+            key=lambda item: (
+                0 if item["panel_tier"] == "primary" else 1 if item["panel_tier"] == "supporting" else 2,
+                item["display_priority"],
+                item["title"],
+            )
+        )
+
+        primary_entries = [entry for entry in entries if entry["panel_tier"] == "primary"]
+        supporting_entries = [entry for entry in entries if entry["panel_tier"] == "supporting"]
+        diagnostic_entries = [entry for entry in entries if entry["panel_tier"] == "diagnostic"]
+
+        if len(primary_entries) > 2:
+            supporting_entries = primary_entries[2:] + supporting_entries
+            primary_entries = primary_entries[:2]
+
+        sections: List[str] = []
+        primary_section = self._render_chart_panel_tier_section(
+            title=CHART_PANEL_TIER_LABELS["primary"],
+            entries=primary_entries,
+            collapsed=False,
+        )
+        if primary_section:
+            sections.append(primary_section)
+
+        supporting_section = self._render_chart_panel_tier_section(
+            title=CHART_PANEL_TIER_LABELS["supporting"],
+            entries=supporting_entries,
+            collapsed=False,
+        )
+        if supporting_section:
+            sections.append(supporting_section)
+
+        diagnostic_notes = self._render_suppressed_chart_notes(suppressed_charts)
+        diagnostic_section = self._render_chart_panel_tier_section(
+            title=CHART_PANEL_TIER_LABELS["diagnostic"],
+            entries=diagnostic_entries,
+            collapsed=True,
+            notes=diagnostic_notes,
+        )
+        if diagnostic_section:
+            sections.append(diagnostic_section)
+
+        return "\n\n".join(section for section in sections if section).strip()
+
+    def _collect_structured_chart_specs(self, payload: dict) -> List[dict]:
+        if not isinstance(payload, dict):
+            return []
+
+        collected: List[dict] = []
+        rendered_chart_ids: set = set()
+        chart_specs = payload.get("chart_specs") if isinstance(payload.get("chart_specs"), list) else []
+        for chart_spec in chart_specs:
+            if not isinstance(chart_spec, dict):
+                continue
+            if not self._structured_chart_spec_has_signal(chart_spec):
+                continue
+            chart_id = str(chart_spec.get("chart_id") or "").strip()
+            if chart_id:
+                rendered_chart_ids.add(chart_id)
+            collected.append(chart_spec)
+
+        collected.extend(self._synthesize_structured_chart_specs(payload, rendered_chart_ids))
+        return collected
+
+    def _structured_chart_spec_values(self, chart_spec: dict) -> List[dict]:
+        spec = chart_spec.get("spec") if isinstance(chart_spec, dict) else None
+        if isinstance(spec, str):
+            try:
+                spec = json.loads(spec)
+            except Exception:
+                return []
+        if not isinstance(spec, dict):
+            return []
+        data = spec.get("data")
+        if not isinstance(data, dict):
+            return []
+        values = data.get("values")
+        if not isinstance(values, list):
+            return []
+        return [item for item in values if isinstance(item, dict)]
+
+    def _structured_chart_spec_has_signal(self, chart_spec: dict) -> bool:
+        chart_id = str(chart_spec.get("chart_id") or "").strip()
+        if chart_id not in {
+            "forecast_top_asins_sales",
+            "forecast_top_asins_chart",
+            "forecast_top_asins_growth",
+            "forecast_top_asins_growth_chart",
+            "top_asin_w1_w4_compare",
+            "top_asin_drilldown_chart",
+        }:
+            return True
+
+        values = self._structured_chart_spec_values(chart_spec)
+        if not values:
+            return False
+        if chart_id in {"forecast_top_asins_sales", "forecast_top_asins_chart"}:
+            return (
+                self._selection_count_non_zero(values, ["predicted_weekly_sales_w4", "预测周销量W4"]) >= 2
+                and self._selection_count_distinct_non_zero(values, ["predicted_weekly_sales_w4", "预测周销量W4"]) >= 2
+            )
+        if chart_id in {"forecast_top_asins_growth", "forecast_top_asins_growth_chart"}:
+            return (
+                self._selection_count_non_zero(values, ["growth_delta", "predicted_growth_delta_w4_minus_w1", "W4-W1 增量"]) >= 2
+                and self._selection_count_distinct_non_zero(values, ["growth_delta", "predicted_growth_delta_w4_minus_w1", "W4-W1 增量"]) >= 2
+            )
+        return self._selection_count_non_zero(
+            values,
+            ["predicted_weekly_sales_w1", "predicted_weekly_sales_w4", "预测周销量W1", "预测周销量W4"],
+        ) >= 2
+
+    def _build_chart_panel_entry(self, chart_spec: dict, intent_by_id: Dict[str, dict]) -> Optional[dict]:
+        if not isinstance(chart_spec, dict):
+            return None
+
+        chart_id = str(chart_spec.get("chart_id") or "").strip()
+        intent = intent_by_id.get(chart_id, {})
+        default_meta = DEFAULT_CHART_PANEL_META.get(chart_id, {})
+        panel_group = str(
+            chart_spec.get("panel_group")
+            or intent.get("panel_group")
+            or default_meta.get("panel_group")
+            or ("diagnostic" if "weak_signal" in chart_id else "overview")
+        ).strip() or "overview"
+        panel_tier = str(
+            chart_spec.get("panel_tier")
+            or intent.get("panel_tier")
+            or default_meta.get("panel_tier")
+            or ("diagnostic" if panel_group == "diagnostic" else "supporting")
+        ).strip() or "supporting"
+        display_priority = int(
+            self._safe_structured_number(
+                chart_spec.get("display_priority")
+                or intent.get("display_priority")
+                or chart_spec.get("priority")
+                or intent.get("priority")
+                or default_meta.get("display_priority")
+                or 999
+            )
+            or 999
+        )
+        evidence_layer = str(
+            chart_spec.get("evidence_layer")
+            or intent.get("evidence_layer")
+            or default_meta.get("evidence_layer")
+            or "internal"
+        ).strip() or "internal"
+        chart_markdown = self._render_structured_chart_spec(chart_spec, heading_level=4, evidence_layer=evidence_layer)
+        if not chart_markdown:
+            return None
+        return {
+            "chart_id": chart_id,
+            "title": str(chart_spec.get("title") or chart_id or "图表").strip(),
+            "panel_group": panel_group,
+            "panel_tier": panel_tier,
+            "display_priority": display_priority,
+            "evidence_layer": evidence_layer,
+            "markdown": chart_markdown,
+        }
+
+    def _render_chart_panel_tier_section(
+        self,
+        *,
+        title: str,
+        entries: List[dict],
+        collapsed: bool,
+        notes: str = "",
+    ) -> str:
+        parts: List[str] = []
+        if notes:
+            parts.append(notes)
+        if entries:
+            grouped_entries = self._group_chart_panel_entries(entries)
+            for group_key in CHART_PANEL_GROUP_ORDER:
+                group_entries = grouped_entries.get(group_key) or []
+                if not group_entries:
+                    continue
+                parts.append(self._render_chart_panel_group(group_key, group_entries))
+        if not parts:
+            return ""
+
+        body = "\n\n".join(part for part in parts if part).strip()
+        if not body:
+            return ""
+        if not collapsed:
+            return "## %s\n\n%s" % (title, body)
+        return "## %s\n\n<details>\n<summary>展开查看诊断图表与抑制说明</summary>\n\n%s\n\n</details>" % (title, body)
+
+    def _group_chart_panel_entries(self, entries: List[dict]) -> Dict[str, List[dict]]:
+        grouped: Dict[str, List[dict]] = {}
+        for entry in entries:
+            group_key = str(entry.get("panel_group") or "overview").strip() or "overview"
+            grouped.setdefault(group_key, []).append(entry)
+        for group_entries in grouped.values():
+            group_entries.sort(key=lambda item: (item.get("display_priority") or 999, item.get("title") or ""))
+        return grouped
+
+    def _render_chart_panel_group(self, group_key: str, entries: List[dict]) -> str:
+        if not entries:
+            return ""
+        label = CHART_PANEL_GROUP_LABELS.get(group_key, group_key)
+        visible_entries = entries[:4]
+        overflow_entries = entries[4:]
+        lines = ["### %s" % label]
+        lines.extend(entry.get("markdown") or "" for entry in visible_entries if entry.get("markdown"))
+        if overflow_entries:
+            overflow_body = "\n\n".join(entry.get("markdown") or "" for entry in overflow_entries if entry.get("markdown")).strip()
+            if overflow_body:
+                lines.append(
+                    "<details>\n<summary>展开查看更多 %s 图表（%d 张）</summary>\n\n%s\n\n</details>"
+                    % (label, len(overflow_entries), overflow_body)
+                )
+        return "\n\n".join(part for part in lines if part).strip()
+
+    def _render_suppressed_chart_notes(self, suppressed_charts: List[dict]) -> str:
+        if not suppressed_charts:
+            return ""
+        lines = ["### 主图抑制与补证说明"]
+        for item in suppressed_charts[:8]:
+            title = str(item.get("title") or item.get("intent_id") or "图表").strip()
+            reason = str(item.get("reason") or "未返回抑制原因").strip()
+            lines.append("- %s：%s" % (title, reason))
+        return "\n".join(lines).strip()
 
     def _render_selection_report_payload(self, report_payload: Any) -> str:
         if not isinstance(report_payload, dict):
@@ -3196,27 +3513,232 @@ class Pipeline:
             ensure_ascii=False,
         )
 
+    def _build_forecast_top_asins_sales_chart(self, rows: List[dict]) -> Optional[dict]:
+        values = []
+        for row in rows:
+            asin = str(row.get("ASIN") or row.get("asin") or "").strip()
+            if not asin:
+                continue
+            sales_w4 = self._safe_structured_number(row.get("预测周销量W4") or row.get("predicted_weekly_sales_w4"))
+            if sales_w4 is None or abs(sales_w4) <= 1e-9:
+                continue
+            values.append(
+                {
+                    "asin": asin,
+                    "predicted_weekly_sales_w4": sales_w4,
+                    "growth_delta": self._safe_structured_number(row.get("W4-W1 增量") or row.get("predicted_growth_delta_w4_minus_w1")) or 0,
+                    "direction": str(row.get("方向") or row.get("direction") or "").strip(),
+                }
+            )
+        if len(values) < 2:
+            return None
+        if self._selection_count_distinct_non_zero(values, ["predicted_weekly_sales_w4"]) < 2:
+            return None
+        return {
+            "chart_id": "forecast_top_asins_sales",
+            "renderer": "vega-lite",
+            "title": "候选池 Top ASIN 预测周销量对比",
+            "spec": self._build_structured_bar_chart_spec(
+                values=values,
+                y_field="predicted_weekly_sales_w4",
+                y_title="预测周销量W4",
+                tooltip=[
+                    {"field": "asin", "type": "nominal"},
+                    {"field": "predicted_weekly_sales_w4", "type": "quantitative", "title": "预测周销量W4"},
+                    {"field": "growth_delta", "type": "quantitative", "title": "W4-W1 增量"},
+                    {"field": "direction", "type": "nominal", "title": "方向"},
+                ],
+                color_field="direction" if any(item.get("direction") for item in values) else None,
+            ),
+        }
+
+    def _build_top_asin_compare_chart(self, rows: List[dict]) -> Optional[dict]:
+        values = []
+        for row in rows:
+            asin = str(row.get("ASIN") or row.get("asin") or "").strip()
+            if not asin:
+                continue
+            status = str(row.get("状态") or row.get("status") or "").strip()
+            if status in {"missing_domain_model", "missing_asin_prediction"}:
+                continue
+            sales_w1 = self._safe_structured_number(row.get("预测周销量W1") or row.get("predicted_weekly_sales_w1"))
+            sales_w4 = self._safe_structured_number(row.get("预测周销量W4") or row.get("predicted_weekly_sales_w4"))
+            if sales_w1 is None and sales_w4 is None:
+                continue
+            if abs(sales_w1 or 0) <= 1e-9 and abs(sales_w4 or 0) <= 1e-9:
+                continue
+            values.append(
+                {
+                    "asin": asin,
+                    "predicted_weekly_sales_w1": sales_w1 or 0,
+                    "predicted_weekly_sales_w4": sales_w4 or 0,
+                }
+            )
+        if len(values) < 2:
+            return None
+        return {
+            "chart_id": "top_asin_w1_w4_compare",
+            "renderer": "vega-lite",
+            "title": "Top ASIN 下钻预测 W1 vs W4 对比",
+            "spec": json.dumps(
+                {
+                    "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+                    "data": {"values": values},
+                    "transform": [
+                        {"fold": ["predicted_weekly_sales_w1", "predicted_weekly_sales_w4"], "as": ["week", "sales"]},
+                        {"calculate": "datum.week === 'predicted_weekly_sales_w1' ? 'W1' : 'W4'", "as": "week_label"},
+                    ],
+                    "mark": {"type": "bar", "cornerRadiusTopLeft": 4, "cornerRadiusTopRight": 4},
+                    "encoding": {
+                        "x": {"field": "asin", "type": "nominal", "axis": {"labelAngle": -20}},
+                        "xOffset": {"field": "week_label"},
+                        "y": {
+                            "field": "sales",
+                            "type": "quantitative",
+                            "title": "预测周销量",
+                            "scale": {"domain": [0, self._structured_chart_domain_max(values, ["predicted_weekly_sales_w1", "predicted_weekly_sales_w4"])]},
+                        },
+                        "color": {"field": "week_label", "type": "nominal", "title": "预测周期"},
+                        "tooltip": [
+                            {"field": "asin", "type": "nominal"},
+                            {"field": "week_label", "type": "nominal", "title": "预测周期"},
+                            {"field": "sales", "type": "quantitative", "title": "预测周销量"},
+                        ],
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        }
+
+    def _build_candidate_vs_benchmark_compare_chart(self, rows: List[dict]) -> Optional[dict]:
+        pair_values = []
+        gap_values = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            metric = str(row.get("指标") or row.get("metric") or row.get("asin") or "").strip()
+            if not metric:
+                continue
+            candidate_value = self._safe_structured_number(row.get("候选池") or row.get("candidate_value"))
+            benchmark_value = self._safe_structured_number(row.get("类目整体") or row.get("benchmark_value"))
+            gap_value = self._safe_structured_number(row.get("gap_pct") or row.get("差距比例") or row.get("gap"))
+            if candidate_value is not None and benchmark_value is not None:
+                pair_values.append({"metric": metric, "candidate": candidate_value, "benchmark": benchmark_value})
+            elif gap_value is not None:
+                gap_values.append({"metric": metric, "gap_pct": gap_value})
+        if pair_values:
+            return {
+                "chart_id": "candidate_vs_benchmark_compare",
+                "renderer": "vega-lite",
+                "title": "候选池 vs 类目基准对比图",
+                "spec": json.dumps(
+                    {
+                        "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+                        "data": {"values": pair_values},
+                        "transform": [
+                            {"fold": ["candidate", "benchmark"], "as": ["series", "value"]},
+                            {"calculate": "datum.series === 'candidate' ? '候选池' : '类目整体'", "as": "series_label"},
+                        ],
+                        "mark": {"type": "bar", "cornerRadiusTopLeft": 4, "cornerRadiusTopRight": 4},
+                        "encoding": {
+                            "x": {"field": "metric", "type": "nominal", "axis": {"labelAngle": -20}, "title": "指标"},
+                            "xOffset": {"field": "series_label"},
+                            "y": {"field": "value", "type": "quantitative", "title": "指标值"},
+                            "color": {"field": "series_label", "type": "nominal", "title": "对比对象"},
+                            "tooltip": [
+                                {"field": "metric", "type": "nominal", "title": "指标"},
+                                {"field": "series_label", "type": "nominal", "title": "对比对象"},
+                                {"field": "value", "type": "quantitative", "title": "指标值"},
+                            ],
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        if gap_values:
+            return {
+                "chart_id": "candidate_vs_benchmark_compare",
+                "renderer": "vega-lite",
+                "title": "候选池 vs 类目基准差距图",
+                "spec": json.dumps(
+                    {
+                        "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+                        "data": {"values": gap_values},
+                        "mark": {"type": "bar", "cornerRadiusTopLeft": 4, "cornerRadiusTopRight": 4},
+                        "encoding": {
+                            "x": {"field": "metric", "type": "nominal", "axis": {"labelAngle": -20}, "title": "指标"},
+                            "y": {"field": "gap_pct", "type": "quantitative", "title": "差距比例"},
+                            "tooltip": [
+                                {"field": "metric", "type": "nominal", "title": "指标"},
+                                {"field": "gap_pct", "type": "quantitative", "title": "差距比例"},
+                            ],
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+            }
+        return None
+
+    def _build_forecast_driver_distribution_chart(self, rows: List[dict]) -> Optional[dict]:
+        values = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            label = str(row.get("driver_label") or row.get("主驱动") or row.get("feature") or row.get("driver") or "").strip()
+            share = self._safe_structured_number(row.get("driver_share") or row.get("share_pct") or row.get("占比"))
+            if not label or share is None:
+                continue
+            values.append({"driver": label, "driver_share": share})
+        if len(values) < 2:
+            return None
+        return {
+            "chart_id": "forecast_driver_distribution",
+            "renderer": "vega-lite",
+            "title": "机会驱动分布图",
+            "spec": json.dumps(
+                {
+                    "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+                    "data": {"values": values},
+                    "mark": {"type": "bar", "cornerRadiusTopLeft": 4, "cornerRadiusTopRight": 4},
+                    "encoding": {
+                        "x": {"field": "driver", "type": "nominal", "axis": {"labelAngle": -20}, "title": "驱动项"},
+                        "y": {"field": "driver_share", "type": "quantitative", "title": "贡献占比"},
+                        "tooltip": [
+                            {"field": "driver", "type": "nominal", "title": "驱动项"},
+                            {"field": "driver_share", "type": "quantitative", "title": "贡献占比"},
+                        ],
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        }
+
     def _build_supplemental_growth_chart(self, rows: List[dict]) -> Optional[dict]:
         values = []
         for row in rows:
             asin = str(row.get("ASIN") or row.get("asin") or "").strip()
             if not asin:
                 continue
+            growth_delta = self._safe_structured_number(row.get("W4-W1 增量") or row.get("predicted_growth_delta_w4_minus_w1"))
+            if growth_delta is None or abs(growth_delta) <= 1e-9:
+                continue
             values.append(
                 {
                     "asin": asin,
-                    "growth_delta": self._safe_structured_number(row.get("W4-W1 增量")) or 0,
-                    "predicted_weekly_sales_w4": self._safe_structured_number(row.get("预测周销量W4")) or 0,
-                    "direction": str(row.get("方向") or "").strip(),
+                    "growth_delta": growth_delta,
+                    "predicted_weekly_sales_w4": self._safe_structured_number(row.get("预测周销量W4") or row.get("predicted_weekly_sales_w4")) or 0,
+                    "direction": str(row.get("方向") or row.get("direction") or "").strip(),
                 }
             )
-        if not values:
+        if len(values) < 2:
+            return None
+        if self._selection_count_distinct_non_zero(values, ["growth_delta"]) < 2:
             return None
 
         return {
             "chart_id": "forecast_top_asins_growth_chart",
             "renderer": "vega-lite",
-            "title": "候选池预测 Top ASIN 增量图",
+            "title": "候选池 Top ASIN 预测增量分化",
             "spec": self._build_structured_bar_chart_spec(
                 values=values,
                 y_field="growth_delta",
@@ -3237,20 +3759,27 @@ class Pipeline:
             asin = str(row.get("ASIN") or row.get("asin") or "").strip()
             if not asin:
                 continue
+            status = str(row.get("状态") or row.get("status") or "").strip()
+            if status in {"missing_domain_model", "missing_asin_prediction"}:
+                continue
+            sales_w1 = self._safe_structured_number(row.get("预测周销量W1") or row.get("predicted_weekly_sales_w1"))
+            sales_w4 = self._safe_structured_number(row.get("预测周销量W4") or row.get("predicted_weekly_sales_w4"))
+            if abs(sales_w1 or 0) <= 1e-9 and abs(sales_w4 or 0) <= 1e-9:
+                continue
             values.append(
                 {
                     "asin": asin,
-                    "predicted_weekly_sales_w1": self._safe_structured_number(row.get("预测周销量W1")) or 0,
-                    "predicted_weekly_sales_w4": self._safe_structured_number(row.get("预测周销量W4")) or 0,
+                    "predicted_weekly_sales_w1": sales_w1 or 0,
+                    "predicted_weekly_sales_w4": sales_w4 or 0,
                 }
             )
-        if not values:
+        if len(values) < 2:
             return None
 
         return {
             "chart_id": "top_asin_drilldown_chart",
             "renderer": "vega-lite",
-            "title": "Top ASIN 预测下钻图",
+            "title": "Top ASIN 下钻预测 W1 vs W4 对比",
             "spec": json.dumps(
                 {
                     "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
@@ -3349,9 +3878,16 @@ class Pipeline:
             return []
 
         chart_intents = payload.get("chart_intents") if isinstance(payload.get("chart_intents"), list) else []
+        ready_intent_ids = {
+            str(intent.get("intent_id") or "").strip()
+            for intent in chart_intents
+            if isinstance(intent, dict) and str(intent.get("status") or "").strip() == "ready"
+        }
 
         forecast_rows: List[dict] = []
         drilldown_rows: List[dict] = []
+        candidate_benchmark_rows: List[dict] = []
+        forecast_driver_rows: List[dict] = []
         table_rows_by_id: Dict[str, List[dict]] = {}
         for table in data_tables:
             if not isinstance(table, dict):
@@ -3367,8 +3903,32 @@ class Pipeline:
                 forecast_rows = rows
             elif table_id == "top_asin_drilldown_forecast" or "Top ASIN 预测下钻" in title:
                 drilldown_rows = rows
+            elif table_id in {"candidate_vs_benchmark", "candidate_pool_vs_l3"} or "候选池 vs" in title:
+                candidate_benchmark_rows = rows
+            elif table_id == "forecast_driver_distribution":
+                forecast_driver_rows = rows
 
         charts: List[dict] = []
+        if forecast_rows and not ({"forecast_top_asins_sales", "forecast_top_asins_chart"} & existing_chart_ids) and "forecast_top_asins_sales" in ready_intent_ids:
+            primary_chart = self._build_forecast_top_asins_sales_chart(forecast_rows)
+            if primary_chart:
+                charts.append(primary_chart)
+
+        if drilldown_rows and "top_asin_w1_w4_compare" not in existing_chart_ids and "top_asin_w1_w4_compare" in ready_intent_ids:
+            compare_chart = self._build_top_asin_compare_chart(drilldown_rows)
+            if compare_chart:
+                charts.append(compare_chart)
+
+        if candidate_benchmark_rows and "candidate_vs_benchmark_compare" not in existing_chart_ids and "candidate_vs_benchmark_compare" in ready_intent_ids:
+            benchmark_chart = self._build_candidate_vs_benchmark_compare_chart(candidate_benchmark_rows)
+            if benchmark_chart:
+                charts.append(benchmark_chart)
+
+        if forecast_driver_rows and "forecast_driver_distribution" not in existing_chart_ids and "forecast_driver_distribution" in ready_intent_ids:
+            driver_chart = self._build_forecast_driver_distribution_chart(forecast_driver_rows)
+            if driver_chart:
+                charts.append(driver_chart)
+
         if forecast_rows and "forecast_top_asins_growth_chart" not in existing_chart_ids:
             growth_chart = self._build_supplemental_growth_chart(forecast_rows)
             if growth_chart:
@@ -3397,7 +3957,13 @@ class Pipeline:
 
         return charts
 
-    def _render_structured_chart_spec(self, chart_spec: Any) -> str:
+    def _render_structured_chart_spec(
+        self,
+        chart_spec: Any,
+        *,
+        heading_level: int = 2,
+        evidence_layer: str = "",
+    ) -> str:
         if not isinstance(chart_spec, dict):
             return ""
 
@@ -3407,6 +3973,8 @@ class Pipeline:
             return ""
 
         title = str(chart_spec.get("title") or chart_spec.get("chart_id") or "图表").strip()
+        if evidence_layer == "external_paid_signal" and not title.startswith("外部付费信号 · "):
+            title = "外部付费信号 · %s" % title
         if renderer not in {"vega", "vega-lite", "mermaid"}:
             return ""
 
@@ -3417,7 +3985,8 @@ class Pipeline:
         if not spec_text:
             return ""
 
-        return "## %s\n```%s\n%s\n```" % (title, renderer, spec_text)
+        level = max(1, int(heading_level or 2))
+        return "%s %s\n```%s\n%s\n```" % ("#" * level, title, renderer, spec_text)
 
     def _prepare_agent_payload(self, messages: List[dict], body: dict, mode: str = "agent") -> dict:
         provider = self._get_provider()
