@@ -231,6 +231,46 @@ class Tools:
             payload["top_n"] = top_n
         return self._request("/api/product-theme/top-asin-drilldown", payload)
 
+    def asin_history_timeseries(
+        self,
+        asins: str = "",
+        marketplace: str = "US",
+        window_days: int = 90,
+        interval: str = "day",
+        metrics: str = "",
+        product_query: str = "",
+    ) -> str:
+        """Get ASIN-level historical time series from the local theme store, with optional Keepa latest-snapshot fallback.
+
+        Use this tool when you already have one or more specific ASINs and need daily or weekly history for sales, price, BSR, or review trends.
+
+        :param asins: CSV string of ASINs. If omitted, product_query can be used to resolve a candidate pool first.
+        :param marketplace: Marketplace code such as US, UK, DE, or JP.
+        :param window_days: Lookback window for history extraction. Current online limit is 90 days.
+        :param interval: day or week.
+        :param metrics: Optional CSV string such as estimated_daily_sales,effective_price,bsr,review_count.
+        :param product_query: Optional product query fallback when asins is not yet available.
+        :return: JSON response from theme_api.
+        """
+        resolved_asins = self._ensure_candidate_asins(
+            candidate_asins=asins,
+            marketplace=marketplace,
+            product_query=product_query,
+        )
+        if isinstance(resolved_asins, str):
+            return resolved_asins
+
+        return self._request(
+            "/api/product-theme/asin-history-timeseries",
+            {
+                "asins": resolved_asins,
+                "marketplace": marketplace,
+                "window_days": window_days,
+                "interval": interval,
+                "metrics": self._normalize_csv(metrics),
+            },
+        )
+
     def category_benchmark(
         self,
         candidate_asins: str = "",

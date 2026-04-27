@@ -45,11 +45,12 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 1. 需要数据时优先调用已挂载的工具，不要凭空编造指标。
 2. 需要平台规则、运营方法、合规要求等知识时，先调用 search_knowledge_base 工具检索知识库，不要依赖自身训练数据。
 3. 需要最新外部动态、站外情报、近期政策变化或实时市场讨论时，调用 web_search 工具，不要把旧知识当成最新事实。
-3. 需要商品数据时，先调用 resolve_candidates 拿到 candidate_asins，再调用 candidate_pool_stats / candidate_pool_trends / candidate_pool_weak_forecast / top_asin_drilldown / category_benchmark。
-4. 当 top_asin_drilldown 返回空结果或用户提供了本地数据库可能没有的 ASIN 时，使用 keepa_asin_lookup 直连 Keepa API 查询实时数据。
-4. 如果工具尚未返回数据，只能给出分析框架、验证路径和风险提醒，明确标注为待验证。
-5. 输出尽量围绕结论、证据、风险、下一步动作。
-6. 每个结论标注数据来源类型：知识库 / 推理 / 工具数据。
+3. 需要商品数据时，先调用 resolve_candidates 拿到 candidate_asins，再调用 candidate_pool_stats / candidate_pool_trends / candidate_pool_weak_forecast / top_asin_drilldown / asin_history_timeseries / category_benchmark。
+4. 当你已经有明确 ASIN，且需要看近 7 到 90 天的销量、价格、BSR 或评论变化时，优先调用 asin_history_timeseries。
+5. 当 top_asin_drilldown 返回空结果或用户提供了本地数据库可能没有的 ASIN 时，使用 keepa_asin_lookup 直连 Keepa API 查询实时数据。
+6. 如果工具尚未返回数据，只能给出分析框架、验证路径和风险提醒，明确标注为待验证。
+7. 输出尽量围绕结论、证据、风险、下一步动作。
+8. 每个结论标注数据来源类型：知识库 / 推理 / 工具数据。
 
 工具调用规则：
 - 当你决定调用工具时，直接输出工具调用指令，不要在工具调用之前添加任何文字（如"好的，我来帮你…"等）。
@@ -65,6 +66,7 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 - candidate_pool_trends: 候选池趋势诊断
 - candidate_pool_weak_forecast: 弱信号预测标记
 - top_asin_drilldown: 头部 ASIN 下钻
+- asin_history_timeseries: 指定 ASIN 的历史时序
 - category_benchmark: 类目基准对比
 - keepa_asin_lookup: 直连 Keepa API 查询 ASIN 商品详情（当本地数据库没有相关 ASIN 时使用）
 """
@@ -95,6 +97,7 @@ ALLOWED_AGENT_TOOLS = {
     "candidate_pool_trends",
     "candidate_pool_weak_forecast",
     "top_asin_drilldown",
+    "asin_history_timeseries",
     "category_benchmark",
     "keepa_asin_lookup",
 }
@@ -160,6 +163,7 @@ TOOL_BILLING_EVENT = {
     "candidate_pool_trends": "product_api_call",
     "candidate_pool_weak_forecast": "product_api_call",
     "top_asin_drilldown": "product_api_call",
+    "asin_history_timeseries": "product_api_call",
     "category_benchmark": "product_api_call",
     "keepa_asin_lookup": "product_api_call",
 }
@@ -1066,6 +1070,7 @@ class Pipeline:
             "candidate_pool_trends": "候选池趋势",
             "candidate_pool_weak_forecast": "弱信号预测",
             "top_asin_drilldown": "头部 ASIN 深挖",
+            "asin_history_timeseries": "ASIN 历史时序",
             "category_benchmark": "类目基准对比",
             "keepa_asin_lookup": "Keepa ASIN 查询",
         }
@@ -1448,6 +1453,8 @@ class Pipeline:
         if not payload:
             return answer_text, None
 
+        payload = self._augment_asin_history_payload(payload)
+        payload = self._augment_selection_report_payload(payload, fallback_summary=visible_text)
         rendered = self._render_structured_workflow_payload(payload, fallback_summary=visible_text)
         payload_comment = self._build_structured_payload_comment(payload)
         if rendered:
@@ -1487,12 +1494,1323 @@ class Pipeline:
             STRUCTURED_PAYLOAD_END,
         )
 
+    def _augment_selection_report_payload(self, payload: dict, fallback_summary: str = "") -> dict:
+        if not isinstance(payload, dict):
+            return payload
+        if not self._is_selection_report_payload(payload):
+            return payload
+
+        augmented = deepcopy(payload)
+        bundle = self._build_selection_report_bundle(augmented, fallback_summary=fallback_summary)
+        if not bundle:
+            return augmented
+
+        decision_markdown = str(bundle.get("decision_markdown") or "").strip()
+        report_payload = bundle.get("report_payload") or {}
+        augmented["schema_version"] = str(report_payload.get("schema_version") or "xm.selection-report.v1")
+        augmented["decision_debug"] = bundle.get("decision_debug") or {}
+        augmented["report_payload"] = report_payload
+        augmented["render_profiles"] = ["full_report", "executive_brief", "chat_compact", "dashboard_cards"]
+        augmented["section_registry"] = {
+            "overview": report_payload.get("overview") or {},
+            "decision": report_payload.get("decision") or {},
+            "market_attractiveness": report_payload.get("market_attractiveness") or {},
+            "competition_structure": report_payload.get("competition_structure") or {},
+            "opportunity_drivers": report_payload.get("opportunity_drivers") or {},
+            "asin_case_evidence": report_payload.get("asin_case_evidence") or {},
+            "risks_and_counterevidence": report_payload.get("risks_and_counterevidence") or {},
+            "recommended_actions": report_payload.get("recommended_actions") or {},
+            "data_boundary": report_payload.get("data_boundary") or {},
+        }
+        if decision_markdown:
+            augmented["selection_decision_markdown"] = decision_markdown
+        return augmented
+
+    def _augment_asin_history_payload(self, payload: dict) -> dict:
+        if not isinstance(payload, dict):
+            return payload
+
+        raw = self._ensure_structured_dict(payload.get("raw_endpoint_results"))
+        asin_history_payload = self._ensure_structured_dict(raw.get("asin_history_timeseries"))
+        if not asin_history_payload:
+            return payload
+
+        augmented = deepcopy(payload)
+        data_tables = augmented.get("data_tables") if isinstance(augmented.get("data_tables"), list) else []
+        chart_intents = augmented.get("chart_intents") if isinstance(augmented.get("chart_intents"), list) else []
+
+        asin_history_tables = self._build_asin_history_data_tables(asin_history_payload)
+        asin_history_intents = self._build_asin_history_chart_intents(asin_history_tables)
+        augmented["data_tables"] = self._merge_structured_tables(data_tables, asin_history_tables)
+        augmented["chart_intents"] = self._merge_chart_intents(chart_intents, asin_history_intents)
+        return augmented
+
+    def _is_selection_report_payload(self, payload: dict) -> bool:
+        coverage_status = payload.get("coverage_status")
+        data_tables = payload.get("data_tables")
+        if not isinstance(coverage_status, dict) and not isinstance(data_tables, list):
+            return False
+
+        table_ids = set()
+        for table in data_tables or []:
+            if not isinstance(table, dict):
+                continue
+            table_id = str(table.get("table_id") or "").strip()
+            if table_id:
+                table_ids.add(table_id)
+
+        expected_table_ids = {
+            "forecast_top_asins",
+            "top_asin_forecast_compare",
+            "top_asin_drilldown_forecast",
+            "candidate_vs_benchmark",
+            "forecast_driver_distribution",
+            "weak_signal_top_asins",
+        }
+        if table_ids & expected_table_ids:
+            return True
+
+        chart_intents = payload.get("chart_intents")
+        if isinstance(chart_intents, list):
+            for intent in chart_intents:
+                if not isinstance(intent, dict):
+                    continue
+                intent_id = str(intent.get("intent_id") or "").strip()
+                if intent_id in {
+                    "forecast_top_asins_sales",
+                    "top_asin_w1_w4_compare",
+                    "candidate_vs_benchmark_compare",
+                }:
+                    return True
+
+        return any(
+            key in (coverage_status or {})
+            for key in ["overall_status", "forecast_status", "coverage_ratio", "forecast_type", "candidate_asin_count"]
+        )
+
+    def _build_selection_report_bundle(self, payload: dict, fallback_summary: str = "") -> Optional[dict]:
+        features = self._extract_selection_report_features(payload)
+        if not self._selection_features_have_signal(features):
+            return None
+
+        scores = {
+            "demand_strength_score": self._score_selection_demand_strength(features),
+            "competition_headroom_score": self._score_selection_competition_headroom(features),
+            "opportunity_driver_score": self._score_selection_opportunity_driver(features),
+            "risk_severity_score": self._score_selection_risk_severity(features),
+            "evidence_completeness_score": self._score_selection_evidence_completeness(features),
+        }
+        scores["cross_endpoint_consistency_score"] = self._score_selection_cross_endpoint_consistency(features)
+        scores["coverage_quality_score"] = self._score_selection_coverage_quality(features)
+        scores["chart_support_ratio_score"] = self._score_selection_chart_support_ratio(features)
+
+        recommendation_level, recommendation_score, gates = self._compute_selection_recommendation(scores, features)
+        confidence_level, confidence_score = self._compute_selection_confidence(scores)
+        primary_chart_intent_id = self._pick_selection_primary_chart_intent_id(features)
+        core_reasons = self._build_selection_core_reasons(
+            features,
+            scores,
+            recommendation_level,
+            confidence_level,
+        )
+        decision_basis = list(core_reasons)
+        blocking_risk = self._build_selection_blocking_risk(features, scores, gates)
+        validation_focus = self._build_selection_validation_focus(features, scores)
+        next_actions = self._build_selection_next_actions(recommendation_level, features, scores)
+        summary_markdown = str(payload.get("summary_markdown") or fallback_summary or "").strip()
+
+        report_payload = {
+            "schema_version": "xm.selection-report.v1",
+            "report_meta": self._build_selection_report_meta(payload),
+            "overview": {
+                "recommendation_level": recommendation_level,
+                "confidence_level": confidence_level,
+                "core_reasons": core_reasons,
+                "summary_markdown": summary_markdown,
+            },
+            "decision": {
+                "judgement_summary": "当前建议：%s；信心：%s。" % (recommendation_level, confidence_level),
+                "decision_basis": decision_basis,
+                "blocking_risk": blocking_risk,
+                "primary_chart_intent_id": primary_chart_intent_id,
+            },
+            "market_attractiveness": {
+                "predicted_sales_w4_total": features.get("predicted_sales_w4_total"),
+                "top20_predicted_sales_w4_share": features.get("top20_predicted_sales_w4_share"),
+                "top_asin_count_with_forecast": features.get("covered_asin_count"),
+                "trend_stage": features.get("trend_stage"),
+                "trend_wow": features.get("trend_wow"),
+                "keyword_coverage_ratio": features.get("keyword_coverage_ratio"),
+            },
+            "competition_structure": {
+                "candidate_vs_benchmark_rows": features.get("candidate_vs_benchmark_rows") or [],
+                "avg_price_gap": features.get("avg_price_gap"),
+                "avg_review_gap": features.get("avg_review_gap"),
+                "avg_monthly_sold_gap": features.get("avg_monthly_sold_gap"),
+                "median_offer_gap": features.get("median_offer_gap"),
+            },
+            "opportunity_drivers": {
+                "forecast_type": features.get("forecast_type"),
+                "driver_distribution_rows": features.get("forecast_driver_rows") or [],
+                "weak_signal_rows": features.get("weak_signal_rows") or [],
+            },
+            "asin_case_evidence": self._build_selection_asin_case_evidence(payload),
+            "risks_and_counterevidence": {
+                "coverage_status": payload.get("coverage_status") or {},
+                "risk_flags": features.get("risk_flags") or [],
+                "missing_asin_count": features.get("missing_asin_count"),
+                "sales_forecast_meta_status": features.get("top_asin_status"),
+                "suppressed_chart_ids": self._collect_selection_suppressed_chart_ids(payload),
+                "suppression_reasons": self._collect_selection_suppression_reasons(payload),
+                "summary_paragraph": blocking_risk,
+            },
+            "recommended_actions": {
+                "validation_focus": validation_focus,
+                "next_actions": next_actions,
+                "stop_condition": self._build_selection_stop_condition(recommendation_level, features, scores),
+                "revisit_condition": self._build_selection_revisit_condition(features),
+            },
+            "data_boundary": {
+                "data_sources": self._build_selection_data_sources(payload),
+                "forecast_type": features.get("forecast_type"),
+                "coverage_ratio": features.get("coverage_ratio"),
+                "window_days": self._build_selection_window_days(payload),
+                "suppressed_charts": self._build_selection_suppressed_charts(payload),
+                "data_notes": self._build_selection_data_notes(payload, features),
+            },
+            "support_matrix": {
+                "overview": self._selection_support_level(recommendation_score),
+                "decision": self._selection_support_level(confidence_score),
+                "market_attractiveness": self._selection_support_level(scores["demand_strength_score"]),
+                "competition_structure": self._selection_support_level(scores["competition_headroom_score"]),
+                "opportunity_drivers": self._selection_support_level(scores["opportunity_driver_score"]),
+                "risks_and_counterevidence": self._selection_support_level(100.0 - scores["risk_severity_score"]),
+                "recommended_actions": self._selection_support_level(scores["evidence_completeness_score"]),
+                "data_boundary": self._selection_support_level(scores["coverage_quality_score"]),
+            },
+            "notes": [],
+        }
+        decision_debug = {
+            "scores": scores,
+            "recommendation_score": recommendation_score,
+            "confidence_score": confidence_score,
+            "gates": gates,
+            "features": self._build_selection_debug_features(features),
+        }
+        return {
+            "decision_debug": decision_debug,
+            "report_payload": report_payload,
+            "decision_markdown": self._render_selection_decision_markdown(
+                recommendation_level=recommendation_level,
+                recommendation_score=recommendation_score,
+                confidence_level=confidence_level,
+                confidence_score=confidence_score,
+                core_reasons=core_reasons,
+                validation_focus=validation_focus,
+                next_actions=next_actions,
+                blocking_risk=blocking_risk,
+            ),
+        }
+
+    def _selection_features_have_signal(self, features: dict) -> bool:
+        return any(
+            [
+                features.get("forecast_top_asins_rows"),
+                features.get("top_asin_forecast_compare_rows"),
+                features.get("candidate_vs_benchmark_rows"),
+                features.get("forecast_driver_rows"),
+                features.get("weak_signal_rows"),
+                features.get("overall_status"),
+                features.get("coverage_ratio"),
+            ]
+        )
+
+    def _extract_selection_report_features(self, payload: dict) -> dict:
+        raw = self._ensure_structured_dict(payload.get("raw_endpoint_results"))
+        coverage = self._ensure_structured_dict(payload.get("coverage_status"))
+        data_tables = payload.get("data_tables") if isinstance(payload.get("data_tables"), list) else []
+        chart_intents = payload.get("chart_intents") if isinstance(payload.get("chart_intents"), list) else []
+
+        candidate_pool_stats = self._ensure_structured_dict(raw.get("candidate_pool_stats"))
+        sales_forecast = self._ensure_structured_dict(candidate_pool_stats.get("sales_forecast"))
+        trends = self._ensure_structured_dict(raw.get("candidate_pool_trends"))
+        weak_forecast = self._ensure_structured_dict(raw.get("candidate_pool_weak_forecast"))
+        drilldown = self._ensure_structured_dict(raw.get("top_asin_drilldown"))
+        drilldown_meta = self._ensure_structured_dict(drilldown.get("sales_forecast_meta"))
+
+        forecast_top_asins_rows = self._selection_table_rows(data_tables, "forecast_top_asins")
+        top_asin_forecast_compare_rows = self._selection_table_rows(data_tables, "top_asin_forecast_compare")
+        if not top_asin_forecast_compare_rows:
+            top_asin_forecast_compare_rows = self._selection_table_rows(data_tables, "top_asin_drilldown_forecast")
+        candidate_vs_benchmark_rows = self._selection_table_rows(data_tables, "candidate_vs_benchmark")
+        forecast_driver_rows = self._selection_table_rows(data_tables, "forecast_driver_distribution")
+        weak_signal_rows = self._selection_table_rows(data_tables, "weak_signal_top_asins")
+
+        predicted_sales_w4_total = self._selection_first_number(
+            coverage.get("predicted_sales_w4_total"),
+            sales_forecast.get("predicted_sales_w4_total"),
+            self._selection_sum_field(forecast_top_asins_rows, ["predicted_weekly_sales_w4", "预测周销量W4"]),
+        )
+        top20_predicted_sales_w4_share = self._selection_first_number(
+            coverage.get("top20_predicted_sales_w4_share"),
+            sales_forecast.get("top20_predicted_sales_w4_share"),
+        )
+        trend_stage = str(
+            coverage.get("trend_stage")
+            or trends.get("trend_stage")
+            or ""
+        ).strip()
+        trend_wow = self._selection_first_number(coverage.get("trend_wow"), trends.get("trend_wow"))
+        keyword_coverage_ratio = self._selection_first_number(
+            coverage.get("keyword_coverage_ratio"),
+            trends.get("keyword_coverage_ratio"),
+        )
+        covered_asin_count = int(
+            self._selection_first_number(
+                coverage.get("covered_asin_count"),
+                sales_forecast.get("covered_asin_count"),
+                len(forecast_top_asins_rows) or None,
+            )
+            or 0
+        )
+        candidate_asin_count = int(
+            self._selection_first_number(
+                coverage.get("candidate_asin_count"),
+                sales_forecast.get("candidate_asin_count"),
+                covered_asin_count or None,
+            )
+            or 0
+        )
+        missing_asin_count = int(
+            self._selection_first_number(
+                coverage.get("missing_asin_count"),
+                sales_forecast.get("missing_asin_count"),
+                max(candidate_asin_count - covered_asin_count, 0) if candidate_asin_count else None,
+            )
+            or 0
+        )
+
+        return {
+            "forecast_type": str(coverage.get("forecast_type") or weak_forecast.get("forecast_type") or "none").strip(),
+            "overall_status": str(coverage.get("overall_status") or coverage.get("candidate_pool") or coverage.get("forecast_status") or "").strip(),
+            "forecast_status": str(coverage.get("forecast_status") or coverage.get("candidate_pool") or sales_forecast.get("status") or "").strip(),
+            "top_asin_status": str(coverage.get("top_asin_status") or coverage.get("top_asin") or drilldown_meta.get("status") or "").strip(),
+            "coverage_ratio": self._selection_first_number(coverage.get("coverage_ratio"), sales_forecast.get("coverage_ratio")) or 0.0,
+            "candidate_asin_count": candidate_asin_count,
+            "covered_asin_count": covered_asin_count,
+            "missing_asin_count": missing_asin_count,
+            "predicted_sales_w4_total": predicted_sales_w4_total,
+            "top20_predicted_sales_w4_share": top20_predicted_sales_w4_share,
+            "trend_stage": trend_stage,
+            "trend_wow": trend_wow,
+            "keyword_coverage_ratio": keyword_coverage_ratio,
+            "risk_flags": self._ensure_structured_list(weak_forecast.get("risk_flags") or coverage.get("risk_flags")),
+            "forecast_top_asins_rows": forecast_top_asins_rows,
+            "top_asin_forecast_compare_rows": top_asin_forecast_compare_rows,
+            "candidate_vs_benchmark_rows": candidate_vs_benchmark_rows,
+            "forecast_driver_rows": forecast_driver_rows,
+            "weak_signal_rows": weak_signal_rows,
+            "has_forecast_top_asins_sales": self._selection_intent_ready(
+                chart_intents,
+                "forecast_top_asins_sales",
+                fallback_rows=forecast_top_asins_rows,
+                value_fields=["predicted_weekly_sales_w4", "预测周销量W4"],
+                min_rows=3,
+            ),
+            "has_top_asin_w1_w4_compare": self._selection_intent_ready(
+                chart_intents,
+                "top_asin_w1_w4_compare",
+                fallback_rows=top_asin_forecast_compare_rows,
+                value_fields=["predicted_weekly_sales_w1", "predicted_weekly_sales_w4", "预测周销量W1", "预测周销量W4"],
+                min_rows=2,
+            ),
+            "has_candidate_vs_benchmark_compare": self._selection_intent_ready(
+                chart_intents,
+                "candidate_vs_benchmark_compare",
+                fallback_rows=candidate_vs_benchmark_rows,
+                value_fields=["gap_pct"],
+                min_rows=3,
+            ),
+            "has_forecast_top_asins_growth": self._selection_intent_ready(
+                chart_intents,
+                "forecast_top_asins_growth",
+                fallback_rows=forecast_top_asins_rows,
+                value_fields=["predicted_growth_delta_w4_minus_w1", "W4-W1 增量"],
+                min_rows=2,
+            ),
+            "has_forecast_driver_distribution": self._selection_intent_ready(
+                chart_intents,
+                "forecast_driver_distribution",
+                fallback_rows=forecast_driver_rows,
+                value_fields=["driver_share", "share_pct", "占比"],
+                min_rows=2,
+            ),
+            "has_weak_signal_score_rank": self._selection_intent_ready(
+                chart_intents,
+                "weak_signal_score_rank",
+                fallback_rows=weak_signal_rows,
+                value_fields=["weak_signal_score", "score", "弱信号分数"],
+                min_rows=2,
+            ),
+            "has_weak_signal_momentum_compare": self._selection_intent_ready(
+                chart_intents,
+                "weak_signal_momentum_compare",
+                fallback_rows=weak_signal_rows,
+                value_fields=["momentum", "momentum_score", "动量"],
+                min_rows=2,
+            ),
+            "suppressed_primary_chart": self._selection_intent_suppressed(chart_intents, "forecast_top_asins_sales")
+            and self._selection_intent_suppressed(chart_intents, "top_asin_w1_w4_compare")
+            and self._selection_intent_suppressed(chart_intents, "candidate_vs_benchmark_compare"),
+            "primary_chart_suppression_reason": self._selection_intent_suppression_reason(chart_intents, "forecast_top_asins_sales")
+            or self._selection_intent_suppression_reason(chart_intents, "top_asin_w1_w4_compare")
+            or self._selection_intent_suppression_reason(chart_intents, "candidate_vs_benchmark_compare"),
+            "avg_price_gap": self._selection_pick_metric_gap(candidate_vs_benchmark_rows, "avg_price"),
+            "avg_review_gap": self._selection_pick_metric_gap(candidate_vs_benchmark_rows, "avg_review_count"),
+            "avg_monthly_sold_gap": self._selection_pick_metric_gap(candidate_vs_benchmark_rows, "avg_monthly_sold"),
+            "median_offer_gap": self._selection_pick_metric_gap(candidate_vs_benchmark_rows, "median_offer_count"),
+        }
+
+    def _ensure_structured_dict(self, value: Any) -> dict:
+        return value if isinstance(value, dict) else {}
+
+    def _ensure_structured_list(self, value: Any) -> list:
+        return value if isinstance(value, list) else []
+
+    def _selection_table_rows(self, data_tables: list, table_id: str) -> List[dict]:
+        for table in data_tables:
+            if not isinstance(table, dict):
+                continue
+            if str(table.get("table_id") or "").strip() != table_id:
+                continue
+            return self._structured_table_rows_as_dicts(table)
+        return []
+
+    def _selection_first_number(self, *values: Any) -> Optional[float]:
+        for value in values:
+            number = self._safe_structured_number(value)
+            if number is not None:
+                return number
+        return None
+
+    def _selection_sum_field(self, rows: List[dict], field_names: List[str]) -> Optional[float]:
+        total = 0.0
+        found = False
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for field_name in field_names:
+                number = self._safe_structured_number(row.get(field_name))
+                if number is None:
+                    continue
+                total += number
+                found = True
+                break
+        if not found:
+            return None
+        return round(total, 2)
+
+    def _selection_intent_by_id(self, chart_intents: list, intent_id: str) -> dict:
+        for intent in chart_intents:
+            if not isinstance(intent, dict):
+                continue
+            if str(intent.get("intent_id") or "").strip() == intent_id:
+                return intent
+        return {}
+
+    def _selection_intent_ready(
+        self,
+        chart_intents: list,
+        intent_id: str,
+        *,
+        fallback_rows: Optional[List[dict]] = None,
+        value_fields: Optional[List[str]] = None,
+        min_rows: int = 1,
+    ) -> bool:
+        intent = self._selection_intent_by_id(chart_intents, intent_id)
+        if intent:
+            return str(intent.get("status") or "").strip() == "ready"
+        rows = fallback_rows or []
+        if len(rows) < min_rows:
+            return False
+        if not value_fields:
+            return True
+        return self._selection_count_non_zero(rows, value_fields) >= min_rows
+
+    def _selection_intent_suppressed(self, chart_intents: list, intent_id: str) -> bool:
+        intent = self._selection_intent_by_id(chart_intents, intent_id)
+        return str(intent.get("status") or "").strip() == "suppressed"
+
+    def _selection_intent_suppression_reason(self, chart_intents: list, intent_id: str) -> str:
+        intent = self._selection_intent_by_id(chart_intents, intent_id)
+        return str(intent.get("suppression_reason") or "").strip()
+
+    def _selection_count_non_zero(self, rows: List[dict], field_names: List[str]) -> int:
+        count = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for field_name in field_names:
+                number = self._safe_structured_number(row.get(field_name))
+                if number is not None and abs(number) > 1e-9:
+                    count += 1
+                    break
+        return count
+
+    def _selection_pick_metric_gap(self, rows: List[dict], metric_name: str) -> Optional[float]:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("metric") or "").strip() != metric_name:
+                continue
+            return self._safe_structured_number(row.get("gap_pct"))
+        return None
+
+    def _selection_clamp(self, number: float, low: float = 0.0, high: float = 100.0) -> float:
+        if number < low:
+            return low
+        if number > high:
+            return high
+        return number
+
+    def _score_selection_demand_strength(self, features: dict) -> float:
+        score = 50.0
+        if not features.get("has_forecast_top_asins_sales"):
+            score = min(score, 45.0)
+        else:
+            score += 15.0
+
+        covered_asin_count = int(features.get("covered_asin_count") or 0)
+        if covered_asin_count >= 5:
+            score += 10.0
+        elif covered_asin_count < 3:
+            score -= 15.0
+
+        if features.get("has_top_asin_w1_w4_compare"):
+            score += 10.0
+
+        top_share = features.get("top20_predicted_sales_w4_share")
+        if top_share is not None:
+            if top_share >= 0.85:
+                score -= 10.0
+            elif top_share <= 0.55:
+                score += 5.0
+
+        trend_stage = str(features.get("trend_stage") or "")
+        if trend_stage == "rising":
+            score += 5.0
+        elif trend_stage == "cooling":
+            score -= 5.0
+        return round(self._selection_clamp(score), 2)
+
+    def _score_selection_competition_headroom(self, features: dict) -> float:
+        score = 50.0
+        if not features.get("has_candidate_vs_benchmark_compare"):
+            return 45.0
+
+        review_gap = features.get("avg_review_gap")
+        offer_gap = features.get("median_offer_gap")
+        price_gap = features.get("avg_price_gap")
+
+        if review_gap is not None and review_gap > 0.35:
+            score -= 12.0
+        elif review_gap is not None and review_gap < -0.15:
+            score += 8.0
+
+        if offer_gap is not None and offer_gap > 0.25:
+            score -= 12.0
+        elif offer_gap is not None and offer_gap < -0.1:
+            score += 6.0
+
+        if price_gap is not None and -0.12 <= price_gap <= 0.18:
+            score += 4.0
+        elif price_gap is not None and price_gap > 0.4:
+            score -= 6.0
+        return round(self._selection_clamp(score), 2)
+
+    def _score_selection_opportunity_driver(self, features: dict) -> float:
+        score = 45.0
+        forecast_type = str(features.get("forecast_type") or "none")
+        if features.get("has_forecast_top_asins_growth"):
+            score += 18.0
+        if features.get("has_forecast_driver_distribution"):
+            score += 15.0
+        if features.get("has_weak_signal_score_rank"):
+            score += 8.0
+        if features.get("has_weak_signal_momentum_compare"):
+            score += 6.0
+        if forecast_type.startswith("heuristic") and not features.get("has_forecast_top_asins_growth"):
+            score = min(score, 55.0)
+        if len(self._ensure_structured_list(features.get("forecast_driver_rows"))) >= 2:
+            score += 5.0
+        return round(self._selection_clamp(score), 2)
+
+    def _score_selection_risk_severity(self, features: dict) -> float:
+        score = 30.0
+        overall_status = str(features.get("overall_status") or "")
+        forecast_status = str(features.get("forecast_status") or "")
+        top_asin_status = str(features.get("top_asin_status") or "")
+
+        if overall_status == "missing_domain_model" or forecast_status == "missing_domain_model" or top_asin_status == "missing_domain_model":
+            score = max(score, 75.0)
+        if overall_status == "unavailable" or forecast_status == "unavailable":
+            score = max(score, 80.0)
+        if forecast_status == "partial_coverage":
+            score += min(20.0, float(features.get("missing_asin_count") or 0) * 2.0)
+        if features.get("suppressed_primary_chart"):
+            score += 10.0
+        if features.get("forecast_type") == "heuristic_v1":
+            score += 12.0
+        risk_flags = self._ensure_structured_list(features.get("risk_flags"))
+        score += min(12.0, float(len(risk_flags)) * 4.0)
+        return round(self._selection_clamp(score), 2)
+
+    def _score_selection_evidence_completeness(self, features: dict) -> float:
+        score = 20.0
+        if features.get("has_forecast_top_asins_sales"):
+            score += 25.0
+        if features.get("has_candidate_vs_benchmark_compare"):
+            score += 20.0
+        if features.get("has_top_asin_w1_w4_compare"):
+            score += 20.0
+        if float(features.get("coverage_ratio") or 0.0) >= 0.7:
+            score += 10.0
+        if features.get("overall_status") in {"ready", "partial_coverage"}:
+            score += 10.0
+        if features.get("forecast_type") == "heuristic_v1" and not features.get("has_forecast_top_asins_sales"):
+            score = min(score, 45.0)
+        return round(self._selection_clamp(score), 2)
+
+    def _score_selection_cross_endpoint_consistency(self, features: dict) -> float:
+        score = 60.0
+        trend_stage = str(features.get("trend_stage") or "")
+        if features.get("has_forecast_top_asins_sales") and features.get("has_top_asin_w1_w4_compare"):
+            score += 15.0
+        if features.get("has_candidate_vs_benchmark_compare") and (
+            features.get("avg_review_gap") is not None or features.get("avg_monthly_sold_gap") is not None
+        ):
+            score += 10.0
+        if trend_stage == "rising" and features.get("has_forecast_top_asins_sales"):
+            score += 8.0
+        elif trend_stage == "cooling" and features.get("has_forecast_top_asins_sales"):
+            score -= 8.0
+        if features.get("forecast_type") == "heuristic_v1" and features.get("has_forecast_top_asins_sales"):
+            score -= 10.0
+        return round(self._selection_clamp(score), 2)
+
+    def _score_selection_coverage_quality(self, features: dict) -> float:
+        score = 50.0
+        overall_status = str(features.get("overall_status") or "")
+        coverage_ratio = float(features.get("coverage_ratio") or 0.0)
+        if overall_status == "ready":
+            score = 80.0
+        elif overall_status == "partial_coverage":
+            score = 65.0
+        elif overall_status in {"missing_domain_model", "unavailable"}:
+            score = 35.0
+        score += min(10.0, coverage_ratio * 10.0)
+        return round(self._selection_clamp(score), 2)
+
+    def _score_selection_chart_support_ratio(self, features: dict) -> float:
+        ready_count = 0
+        for key in [
+            "has_forecast_top_asins_sales",
+            "has_candidate_vs_benchmark_compare",
+            "has_forecast_driver_distribution",
+        ]:
+            if features.get(key):
+                ready_count += 1
+        if ready_count == 3:
+            return 90.0
+        if ready_count == 2:
+            return 70.0
+        if ready_count == 1:
+            return 50.0
+        if features.get("has_weak_signal_score_rank") or features.get("has_weak_signal_momentum_compare"):
+            return 35.0
+        return 20.0
+
+    def _compute_selection_recommendation(self, scores: dict, features: dict) -> Tuple[str, float, dict]:
+        gates = {
+            "block_enter_by_low_evidence": scores["evidence_completeness_score"] < 50.0,
+            "block_enter_by_heuristic_only": features.get("forecast_type") == "heuristic_v1" and not features.get("has_forecast_top_asins_sales"),
+            "block_enter_by_high_risk": scores["risk_severity_score"] >= 75.0,
+            "block_enter_by_low_headroom": scores["competition_headroom_score"] < 40.0,
+            "block_enter_by_status": features.get("overall_status") in {"missing_domain_model", "unavailable"},
+            "force_pause_by_extreme_risk": scores["risk_severity_score"] >= 85.0,
+            "force_pause_by_weak_demand_and_driver": scores["demand_strength_score"] < 40.0 and scores["opportunity_driver_score"] < 45.0,
+            "force_pause_by_market_lock": scores["competition_headroom_score"] < 35.0 and scores["risk_severity_score"] >= 70.0,
+            "force_pause_by_no_real_evidence": features.get("forecast_type") == "heuristic_v1"
+            and not features.get("has_candidate_vs_benchmark_compare")
+            and features.get("suppressed_primary_chart"),
+        }
+        if any(
+            [
+                gates["force_pause_by_extreme_risk"],
+                gates["force_pause_by_weak_demand_and_driver"],
+                gates["force_pause_by_market_lock"],
+                gates["force_pause_by_no_real_evidence"],
+            ]
+        ):
+            return "暂缓进入", 0.0, gates
+
+        recommendation_score = (
+            0.30 * scores["demand_strength_score"]
+            + 0.20 * scores["competition_headroom_score"]
+            + 0.20 * scores["opportunity_driver_score"]
+            + 0.15 * scores["evidence_completeness_score"]
+            + 0.15 * (100.0 - scores["risk_severity_score"])
+        )
+        recommendation_score = round(self._selection_clamp(recommendation_score), 2)
+
+        if recommendation_score >= 72.0 and not any(
+            [
+                gates["block_enter_by_low_evidence"],
+                gates["block_enter_by_heuristic_only"],
+                gates["block_enter_by_high_risk"],
+                gates["block_enter_by_low_headroom"],
+                gates["block_enter_by_status"],
+            ]
+        ):
+            return "建议进入", recommendation_score, gates
+        if recommendation_score >= 50.0:
+            return "谨慎验证", recommendation_score, gates
+        return "暂缓进入", recommendation_score, gates
+
+    def _compute_selection_confidence(self, scores: dict) -> Tuple[str, float]:
+        confidence_score = (
+            0.35 * scores["evidence_completeness_score"]
+            + 0.25 * scores["cross_endpoint_consistency_score"]
+            + 0.25 * scores["coverage_quality_score"]
+            + 0.15 * scores["chart_support_ratio_score"]
+        )
+        confidence_score = round(self._selection_clamp(confidence_score), 2)
+        if confidence_score >= 75.0:
+            return "高", confidence_score
+        if confidence_score >= 55.0:
+            return "中", confidence_score
+        return "低", confidence_score
+
+    def _pick_selection_primary_chart_intent_id(self, features: dict) -> str:
+        if features.get("has_forecast_top_asins_sales"):
+            return "forecast_top_asins_sales"
+        if features.get("has_top_asin_w1_w4_compare"):
+            return "top_asin_w1_w4_compare"
+        if features.get("has_candidate_vs_benchmark_compare"):
+            return "candidate_vs_benchmark_compare"
+        return ""
+
+    def _build_selection_core_reasons(
+        self,
+        features: dict,
+        scores: dict,
+        recommendation_level: str,
+        confidence_level: str,
+    ) -> List[str]:
+        reasons: List[str] = []
+        if features.get("has_forecast_top_asins_sales"):
+            if scores["demand_strength_score"] >= 65.0:
+                reasons.append("候选池已形成可比较的 Top ASIN 预测销量分化，需求侧信号偏强。")
+            else:
+                reasons.append("候选池已有预测销量证据，但需求强度仍未达到强进入阈值。")
+        else:
+            reasons.append("当前缺少稳定的 Top ASIN 预测销量主图，需求判断需要保持保守。")
+
+        if features.get("has_candidate_vs_benchmark_compare"):
+            review_gap = features.get("avg_review_gap")
+            offer_gap = features.get("median_offer_gap")
+            if (review_gap is not None and review_gap < -0.15) or (offer_gap is not None and offer_gap < -0.1):
+                reasons.append("候选池在评论量或供给压力上未明显高于类目基准，仍有一定切入空间。")
+            elif (review_gap is not None and review_gap > 0.35) or (offer_gap is not None and offer_gap > 0.25):
+                reasons.append("候选池相对类目基准已经偏拥挤，竞争空间明显收窄。")
+            else:
+                reasons.append("候选池与类目基准处于可比区间，竞争结构需要结合更多证据判断。")
+        else:
+            reasons.append("当前缺少候选池与类目 benchmark 的对照图，竞争空间判断仍偏保守。")
+
+        if recommendation_level == "暂缓进入":
+            reasons.append("风险或证据完整度尚未过线，现阶段更适合先补证而不是直接进入。")
+        elif confidence_level == "低":
+            reasons.append("当前信心水位偏低，结论更适合作为方向筛选而不是直接立项。")
+        else:
+            reasons.append("覆盖率、图表支持度和多源一致性达到第一轮选品判断的可用水位。")
+        return reasons[:3]
+
+    def _build_selection_blocking_risk(self, features: dict, scores: dict, gates: dict) -> str:
+        if gates.get("force_pause_by_extreme_risk"):
+            return "当前风险分数过高，建议先暂停进入并排查数据覆盖与异常风险信号。"
+        if gates.get("block_enter_by_status"):
+            return "当前 domain 或预测状态不可用，结论不应当被当作进入依据。"
+        if gates.get("block_enter_by_low_evidence"):
+            return "证据完整度不足，当前更适合先补齐主图和关键样本后再判断。"
+        if features.get("primary_chart_suppression_reason"):
+            return "关键主图被抑制：%s" % features.get("primary_chart_suppression_reason")
+        if scores.get("risk_severity_score", 0.0) >= 70.0:
+            return "风险分数偏高，需要优先排查覆盖缺口、弱信号风险和启发式预测限制。"
+        return "当前没有单一极端阻断项，但仍需按验证优先级逐步补证。"
+
+    def _build_selection_validation_focus(self, features: dict, scores: dict) -> str:
+        weakest = min(
+            [
+                ("需求强度", scores.get("demand_strength_score", 0.0)),
+                ("竞争空间", scores.get("competition_headroom_score", 0.0)),
+                ("机会驱动", scores.get("opportunity_driver_score", 0.0)),
+                ("证据完整度", scores.get("evidence_completeness_score", 0.0)),
+            ],
+            key=lambda item: item[1],
+        )[0]
+        if weakest == "需求强度":
+            return "优先验证头部 ASIN 的预测销量分化和趋势是否真实存在。"
+        if weakest == "竞争空间":
+            return "优先验证候选池相对类目基准的评论、供给和价格差距。"
+        if weakest == "机会驱动":
+            return "优先验证增长驱动和弱信号是否能形成可复制的切入点。"
+        if float(features.get("coverage_ratio") or 0.0) < 0.7:
+            return "优先补齐缺失 ASIN 和覆盖不足样本，再做更强结论。"
+        return "优先补强主图支持和关键对照证据，再决定是否进入执行。"
+
+    def _build_selection_next_actions(self, recommendation_level: str, features: dict, scores: dict) -> List[str]:
+        if recommendation_level == "建议进入":
+            return [
+                "优先复核头部 ASIN 的增长驱动是否可复制到目标切口。",
+                "继续验证评论和供给压力较低的细分方向，避免直接追头部同质化款。",
+                "补充知识库或 /web 的规则与合规核验，降低执行阶段的不确定性。",
+            ]
+        if recommendation_level == "谨慎验证":
+            return [
+                "先补齐缺失样本或缺失主图，再重新评估 recommendation 和 confidence。",
+                "重点复核类目 benchmark 差距以及 Top ASIN 的 W1/W4 变化。",
+                "把当前结果视为筛选线索，不要直接进入重投入执行。",
+            ]
+        return [
+            "先不要进入执行阶段，先定位阻断风险来自 coverage、竞争还是风险信号。",
+            "如果当前主要依赖 heuristic 或缺少 benchmark 对照，先补证后再复评。",
+            "若风险分数和竞争压力持续偏高，考虑切换商品方向。",
+        ]
+
+    def _build_selection_stop_condition(self, recommendation_level: str, features: dict, scores: dict) -> str:
+        if recommendation_level == "建议进入":
+            return "如果后续 benchmark 对照显示评论/供给压力显著高于类目，或风险分数升至 75 以上，则停止推进。"
+        if recommendation_level == "谨慎验证":
+            return "如果补证后 evidence 仍低于 50，或风险分数继续升高，则停止当前方向。"
+        return "在 coverage、主图支持和 benchmark 对照仍未改善前，不进入执行阶段。"
+
+    def _build_selection_revisit_condition(self, features: dict) -> str:
+        if float(features.get("coverage_ratio") or 0.0) < 0.7:
+            return "当 coverage_ratio 提升到 0.7 以上，并补齐主图证据后再复评。"
+        if features.get("forecast_type") == "heuristic_v1":
+            return "当可用 trained forecast 或真实 benchmark 对照补齐后再复评。"
+        return "当趋势、benchmark 对照和头部 ASIN 下钻证据同时稳定后再复评。"
+
+    def _build_selection_report_meta(self, payload: dict) -> dict:
+        raw = self._ensure_structured_dict(payload.get("raw_endpoint_results"))
+        source_context = self._ensure_structured_dict(payload.get("source_context"))
+        product_query = (
+            source_context.get("product_query")
+            or payload.get("product_query")
+            or payload.get("normalized_product_query")
+            or ""
+        )
+        marketplace = source_context.get("marketplace") or payload.get("marketplace") or ""
+        domain = source_context.get("domain") or payload.get("domain")
+        candidate_asins = source_context.get("candidate_asins") or payload.get("candidate_asins") or []
+        source_tools = [key for key, value in raw.items() if value]
+        return {
+            "product_query": product_query,
+            "marketplace": marketplace,
+            "domain": domain,
+            "candidate_asins": candidate_asins if isinstance(candidate_asins, list) else [],
+            "source_channel": source_context.get("channel") or payload.get("producer") or "report",
+            "source_tools": sorted(source_tools),
+        }
+
+    def _build_selection_data_sources(self, payload: dict) -> List[str]:
+        raw = self._ensure_structured_dict(payload.get("raw_endpoint_results"))
+        sources = [key for key, value in raw.items() if value]
+        if not sources and payload.get("data_tables"):
+            sources.append("standardized_data_tables")
+        return sorted(set(str(item) for item in sources if item))
+
+    def _build_selection_window_days(self, payload: dict) -> Optional[int]:
+        for key in ["window_days", "analysis_window_days"]:
+            number = self._safe_structured_number(payload.get(key))
+            if number is not None:
+                return int(number)
+        raw = self._ensure_structured_dict(payload.get("raw_endpoint_results"))
+        for result in raw.values():
+            if not isinstance(result, dict):
+                continue
+            number = self._safe_structured_number(result.get("window_days"))
+            if number is not None:
+                return int(number)
+        return None
+
+    def _collect_selection_suppressed_chart_ids(self, payload: dict) -> List[str]:
+        chart_intents = payload.get("chart_intents") if isinstance(payload.get("chart_intents"), list) else []
+        return [
+            str(intent.get("intent_id") or "").strip()
+            for intent in chart_intents
+            if isinstance(intent, dict) and str(intent.get("status") or "").strip() == "suppressed"
+        ]
+
+    def _collect_selection_suppression_reasons(self, payload: dict) -> List[str]:
+        chart_intents = payload.get("chart_intents") if isinstance(payload.get("chart_intents"), list) else []
+        reasons: List[str] = []
+        for intent in chart_intents:
+            if not isinstance(intent, dict):
+                continue
+            if str(intent.get("status") or "").strip() != "suppressed":
+                continue
+            reason = str(intent.get("suppression_reason") or "").strip()
+            if reason:
+                reasons.append(reason)
+        return reasons
+
+    def _build_selection_suppressed_charts(self, payload: dict) -> List[dict]:
+        chart_intents = payload.get("chart_intents") if isinstance(payload.get("chart_intents"), list) else []
+        suppressed = []
+        for intent in chart_intents:
+            if not isinstance(intent, dict):
+                continue
+            if str(intent.get("status") or "").strip() != "suppressed":
+                continue
+            suppressed.append(
+                {
+                    "intent_id": str(intent.get("intent_id") or "").strip(),
+                    "title": str(intent.get("title") or "").strip(),
+                    "reason": str(intent.get("suppression_reason") or "").strip(),
+                }
+            )
+        return suppressed
+
+    def _build_selection_data_notes(self, payload: dict, features: dict) -> List[str]:
+        notes: List[str] = []
+        coverage = self._ensure_structured_dict(payload.get("coverage_status"))
+        raw_notes = coverage.get("notes")
+        if isinstance(raw_notes, list):
+            notes.extend(str(item) for item in raw_notes if str(item).strip())
+        if features.get("forecast_type") == "heuristic_v1":
+            notes.append("当前结果包含 heuristic 预测成分，建议降低进入性结论的强度。")
+        if float(features.get("coverage_ratio") or 0.0) < 0.7:
+            notes.append("当前样本覆盖率不足 0.7，结论更适合做方向筛选而不是直接立项。")
+        return notes
+
+    def _build_selection_debug_features(self, features: dict) -> dict:
+        keys = [
+            "forecast_type",
+            "overall_status",
+            "forecast_status",
+            "top_asin_status",
+            "coverage_ratio",
+            "candidate_asin_count",
+            "covered_asin_count",
+            "missing_asin_count",
+            "predicted_sales_w4_total",
+            "top20_predicted_sales_w4_share",
+            "trend_stage",
+            "trend_wow",
+            "keyword_coverage_ratio",
+            "avg_price_gap",
+            "avg_review_gap",
+            "avg_monthly_sold_gap",
+            "median_offer_gap",
+            "has_forecast_top_asins_sales",
+            "has_top_asin_w1_w4_compare",
+            "has_candidate_vs_benchmark_compare",
+            "has_forecast_top_asins_growth",
+            "has_forecast_driver_distribution",
+            "has_weak_signal_score_rank",
+            "has_weak_signal_momentum_compare",
+            "suppressed_primary_chart",
+            "primary_chart_suppression_reason",
+        ]
+        debug = {key: features.get(key) for key in keys}
+        debug["forecast_top_asins_row_count"] = len(self._ensure_structured_list(features.get("forecast_top_asins_rows")))
+        debug["top_asin_forecast_compare_row_count"] = len(self._ensure_structured_list(features.get("top_asin_forecast_compare_rows")))
+        debug["candidate_vs_benchmark_row_count"] = len(self._ensure_structured_list(features.get("candidate_vs_benchmark_rows")))
+        debug["forecast_driver_row_count"] = len(self._ensure_structured_list(features.get("forecast_driver_rows")))
+        debug["weak_signal_row_count"] = len(self._ensure_structured_list(features.get("weak_signal_rows")))
+        debug["risk_flags"] = self._ensure_structured_list(features.get("risk_flags"))
+        return debug
+
+    def _selection_support_level(self, score: float) -> str:
+        if score >= 75.0:
+            return "strong"
+        if score >= 55.0:
+            return "partial"
+        return "weak"
+
+    def _merge_structured_tables(self, existing_tables: List[dict], new_tables: List[dict]) -> List[dict]:
+        merged: List[dict] = []
+        new_table_ids = {
+            str(table.get("table_id") or "").strip()
+            for table in new_tables
+            if isinstance(table, dict) and str(table.get("table_id") or "").strip()
+        }
+        for table in existing_tables:
+            if not isinstance(table, dict):
+                continue
+            table_id = str(table.get("table_id") or "").strip()
+            if table_id and table_id in new_table_ids:
+                continue
+            merged.append(table)
+        merged.extend(table for table in new_tables if isinstance(table, dict))
+        return merged
+
+    def _merge_chart_intents(self, existing_intents: List[dict], new_intents: List[dict]) -> List[dict]:
+        merged: List[dict] = []
+        new_intent_ids = {
+            str(intent.get("intent_id") or "").strip()
+            for intent in new_intents
+            if isinstance(intent, dict) and str(intent.get("intent_id") or "").strip()
+        }
+        for intent in existing_intents:
+            if not isinstance(intent, dict):
+                continue
+            intent_id = str(intent.get("intent_id") or "").strip()
+            if intent_id and intent_id in new_intent_ids:
+                continue
+            merged.append(intent)
+        merged.extend(intent for intent in new_intents if isinstance(intent, dict))
+        return merged
+
+    def _build_asin_history_data_tables(self, history_payload: dict) -> List[dict]:
+        sales_rows: List[dict] = []
+        price_rows: List[dict] = []
+        bsr_rows: List[dict] = []
+        review_rows: List[dict] = []
+        summary_rows: List[dict] = []
+
+        for item in self._ensure_structured_list(history_payload.get("items")):
+            if not isinstance(item, dict):
+                continue
+            asin = str(item.get("asin") or "").strip()
+            if not asin:
+                continue
+            series = self._ensure_structured_list(item.get("series"))
+            summary = self._ensure_structured_dict(item.get("window_summary"))
+            history_status = str(item.get("history_status") or "").strip()
+
+            for row in series:
+                if not isinstance(row, dict):
+                    continue
+                date = row.get("date")
+                base_row = {"asin": asin, "date": date}
+                if row.get("iso_year_week"):
+                    base_row["iso_year_week"] = row.get("iso_year_week")
+                sales_rows.append({**base_row, "estimated_daily_sales": row.get("estimated_daily_sales")})
+                price_rows.append({**base_row, "effective_price": row.get("effective_price")})
+                bsr_rows.append({**base_row, "bsr": row.get("bsr")})
+                review_rows.append({**base_row, "review_count": row.get("review_count")})
+
+            summary_rows.append(
+                {
+                    "asin": asin,
+                    "sales_trend_direction": self._compute_asin_sales_trend_direction(series),
+                    "price_stability_score": self._compute_asin_price_stability_score(series),
+                    "review_growth_delta": summary.get("review_growth_window"),
+                    "bsr_improvement_ratio": self._compute_asin_bsr_improvement_ratio(series),
+                    "history_status": history_status,
+                }
+            )
+
+        return [
+            self._make_structured_table(
+                "asin_history_sales_series",
+                "ASIN 历史销量时序",
+                ["asin", "date", "estimated_daily_sales"],
+                sales_rows,
+                semantic_type="trend_summary",
+                grain="asin_date",
+            ),
+            self._make_structured_table(
+                "asin_history_price_series",
+                "ASIN 历史价格时序",
+                ["asin", "date", "effective_price"],
+                price_rows,
+                semantic_type="trend_summary",
+                grain="asin_date",
+            ),
+            self._make_structured_table(
+                "asin_history_bsr_series",
+                "ASIN 历史 BSR 时序",
+                ["asin", "date", "bsr"],
+                bsr_rows,
+                semantic_type="trend_summary",
+                grain="asin_date",
+            ),
+            self._make_structured_table(
+                "asin_history_review_series",
+                "ASIN 历史评论时序",
+                ["asin", "date", "review_count"],
+                review_rows,
+                semantic_type="trend_summary",
+                grain="asin_date",
+            ),
+            self._make_structured_table(
+                "asin_history_stability_summary",
+                "ASIN 历史稳定性摘要",
+                ["asin", "sales_trend_direction", "price_stability_score", "review_growth_delta", "bsr_improvement_ratio", "history_status"],
+                summary_rows,
+                semantic_type="diagnostic_metrics",
+                grain="asin",
+            ),
+        ]
+
+    def _make_structured_table(
+        self,
+        table_id: str,
+        title: str,
+        columns: List[str],
+        rows: List[dict],
+        *,
+        semantic_type: str,
+        grain: str,
+    ) -> dict:
+        return {
+            "table_id": table_id,
+            "title": title,
+            "semantic_type": semantic_type,
+            "grain": grain,
+            "columns": columns,
+            "rows": rows,
+        }
+
+    def _build_asin_history_chart_intents(self, data_tables: List[dict]) -> List[dict]:
+        sales_rows = self._selection_table_rows(data_tables, "asin_history_sales_series")
+        price_rows = self._selection_table_rows(data_tables, "asin_history_price_series")
+        bsr_rows = self._selection_table_rows(data_tables, "asin_history_bsr_series")
+        review_rows = self._selection_table_rows(data_tables, "asin_history_review_series")
+        summary_rows = self._selection_table_rows(data_tables, "asin_history_stability_summary")
+
+        return [
+            self._build_asin_history_line_intent(
+                intent_id="asin_sales_trend_line",
+                title="单 ASIN 历史销量趋势",
+                dataset_ref="asin_history_sales_series",
+                rows=sales_rows,
+                value_field="estimated_daily_sales",
+                value_title="估算日销量",
+            ),
+            self._build_asin_history_line_intent(
+                intent_id="asin_price_trend_line",
+                title="单 ASIN 历史价格趋势",
+                dataset_ref="asin_history_price_series",
+                rows=price_rows,
+                value_field="effective_price",
+                value_title="价格",
+            ),
+            self._build_asin_history_line_intent(
+                intent_id="asin_bsr_trend_line",
+                title="单 ASIN 历史 BSR 趋势",
+                dataset_ref="asin_history_bsr_series",
+                rows=bsr_rows,
+                value_field="bsr",
+                value_title="BSR",
+            ),
+            self._build_asin_history_line_intent(
+                intent_id="asin_review_growth_trend_line",
+                title="单 ASIN 历史评论趋势",
+                dataset_ref="asin_history_review_series",
+                rows=review_rows,
+                value_field="review_count",
+                value_title="评论数",
+            ),
+            self._build_asin_history_scorecard_intent(summary_rows),
+        ]
+
+    def _build_asin_history_line_intent(
+        self,
+        *,
+        intent_id: str,
+        title: str,
+        dataset_ref: str,
+        rows: List[dict],
+        value_field: str,
+        value_title: str,
+    ) -> dict:
+        non_null_count = sum(1 for row in rows if isinstance(row, dict) and row.get(value_field) not in (None, ""))
+        status = "ready" if len(rows) >= 8 and non_null_count >= 5 else "suppressed"
+        suppression_reason = None if status == "ready" else "history points are insufficient for a stable line chart"
+        return {
+            "intent_id": intent_id,
+            "status": status,
+            "priority": 70,
+            "title": title,
+            "question": title,
+            "chart_family": "line_trend",
+            "dataset_ref": dataset_ref,
+            "roles": {
+                "x_field": "date",
+                "series_field": "asin",
+                "value_field": value_field,
+            },
+            "semantics": {
+                "value_semantic": value_title,
+                "comparison_mode": "trend",
+            },
+            "guardrails": {
+                "min_rows": 8,
+                "min_non_null_points": 5,
+                "prefer_single_asin": True,
+            },
+            "suppression_reason": suppression_reason,
+        }
+
+    def _build_asin_history_scorecard_intent(self, rows: List[dict]) -> dict:
+        ready_rows = [row for row in rows if isinstance(row, dict) and str(row.get("history_status") or "") == "ready"]
+        return {
+            "intent_id": "asin_stability_scorecard",
+            "status": "ready" if ready_rows else "suppressed",
+            "priority": 60,
+            "title": "单 ASIN 历史稳定性摘要",
+            "question": "哪些 ASIN 的历史表现更稳定？",
+            "chart_family": "scorecard_only",
+            "dataset_ref": "asin_history_stability_summary",
+            "roles": {"label_field": "asin"},
+            "semantics": {"comparison_mode": "scorecard"},
+            "guardrails": {"min_rows": 1},
+            "suppression_reason": None if ready_rows else "no ASIN has ready local history summary",
+        }
+
+    def _compute_asin_sales_trend_direction(self, series: List[dict]) -> str:
+        first_value, last_value = self._first_last_numeric(series, "estimated_daily_sales")
+        if first_value is None or last_value is None:
+            return "unknown"
+        if last_value > first_value * 1.08:
+            return "rising"
+        if last_value < first_value * 0.92:
+            return "cooling"
+        return "stable"
+
+    def _compute_asin_price_stability_score(self, series: List[dict]) -> Optional[float]:
+        values = [self._safe_structured_number(row.get("effective_price")) for row in series if isinstance(row, dict)]
+        values = [value for value in values if value is not None and value > 0]
+        if len(values) < 2:
+            return None
+        avg_value = sum(values) / len(values)
+        if avg_value <= 0:
+            return None
+        variation = (max(values) - min(values)) / avg_value
+        score = 100.0 - min(100.0, variation * 100.0)
+        return round(score, 2)
+
+    def _compute_asin_bsr_improvement_ratio(self, series: List[dict]) -> Optional[float]:
+        first_value, last_value = self._first_last_numeric(series, "bsr")
+        if first_value is None or last_value is None or first_value <= 0:
+            return None
+        return round((first_value - last_value) / first_value, 4)
+
+    def _first_last_numeric(self, series: List[dict], field_name: str) -> Tuple[Optional[float], Optional[float]]:
+        first_value: Optional[float] = None
+        last_value: Optional[float] = None
+        for row in series:
+            if not isinstance(row, dict):
+                continue
+            value = self._safe_structured_number(row.get(field_name))
+            if value is None:
+                continue
+            if first_value is None:
+                first_value = value
+            last_value = value
+        return first_value, last_value
+
+    def _build_selection_asin_case_evidence(self, payload: dict) -> dict:
+        data_tables = payload.get("data_tables") if isinstance(payload.get("data_tables"), list) else []
+        chart_intents = payload.get("chart_intents") if isinstance(payload.get("chart_intents"), list) else []
+        summary_rows = self._selection_table_rows(data_tables, "asin_history_stability_summary")
+        sales_rows = self._selection_table_rows(data_tables, "asin_history_sales_series")
+        if not summary_rows and not sales_rows:
+            return {}
+
+        focus_asins: List[str] = []
+        for row in summary_rows or sales_rows:
+            if not isinstance(row, dict):
+                continue
+            asin = str(row.get("asin") or "").strip()
+            if asin and asin not in focus_asins:
+                focus_asins.append(asin)
+            if len(focus_asins) >= 3:
+                break
+
+        chart_ids = {
+            "asin_sales_trend_line",
+            "asin_price_trend_line",
+            "asin_bsr_trend_line",
+            "asin_review_growth_trend_line",
+            "asin_stability_scorecard",
+        }
+        ready_chart_intents = [
+            str(intent.get("intent_id") or "").strip()
+            for intent in chart_intents
+            if isinstance(intent, dict)
+            and str(intent.get("intent_id") or "").strip() in chart_ids
+            and str(intent.get("status") or "").strip() == "ready"
+        ]
+
+        return {
+            "focus_asins": focus_asins,
+            "data_tables": [
+                table_id
+                for table_id in [
+                    "asin_history_sales_series",
+                    "asin_history_price_series",
+                    "asin_history_bsr_series",
+                    "asin_history_review_series",
+                    "asin_history_stability_summary",
+                ]
+                if self._selection_table_rows(data_tables, table_id)
+            ],
+            "chart_intents": ready_chart_intents,
+            "summary_paragraph": "已补充 ASIN 级历史时序证据，可用来解释单点机会是否具备持续性、价格是否稳定以及评论是否仍在增长。",
+        }
+
+    def _render_selection_decision_markdown(
+        self,
+        *,
+        recommendation_level: str,
+        recommendation_score: float,
+        confidence_level: str,
+        confidence_score: float,
+        core_reasons: List[str],
+        validation_focus: str,
+        next_actions: List[str],
+        blocking_risk: str,
+    ) -> str:
+        lines = [
+            "## 决策摘要",
+            "- Recommendation: %s（%.1f/100）" % (recommendation_level, recommendation_score),
+            "- Confidence: %s（%.1f/100）" % (confidence_level, confidence_score),
+            "- 当前最大阻断项: %s" % blocking_risk,
+            "- 当前优先验证点: %s" % validation_focus,
+        ]
+        if core_reasons:
+            lines.append("")
+            lines.append("### 核心依据")
+            for reason in core_reasons:
+                lines.append("- %s" % reason)
+        if next_actions:
+            lines.append("")
+            lines.append("### 下一步动作")
+            for action in next_actions[:3]:
+                lines.append("- %s" % action)
+        return "\n".join(lines).strip()
+
     def _render_structured_workflow_payload(self, payload: dict, fallback_summary: str = "") -> str:
         rendered_markdown = payload.get("rendered_markdown")
         if isinstance(rendered_markdown, str) and rendered_markdown.strip():
             return rendered_markdown.strip()
 
         sections: List[str] = []
+
+        selection_decision_markdown = payload.get("selection_decision_markdown")
+        if isinstance(selection_decision_markdown, str) and selection_decision_markdown.strip():
+            sections.append(selection_decision_markdown.strip())
+
+        report_payload = payload.get("report_payload")
+        report_section = self._render_selection_report_payload(report_payload)
+        if report_section:
+            sections.append(report_section)
 
         summary_markdown = payload.get("summary_markdown")
         if isinstance(summary_markdown, str) and summary_markdown.strip():
@@ -1527,6 +2845,184 @@ class Pipeline:
             chart_markdown = self._render_structured_chart_spec(chart_spec)
             if chart_markdown:
                 sections.append(chart_markdown)
+
+        return "\n\n".join(section for section in sections if section).strip()
+
+    def _render_selection_report_payload(self, report_payload: Any) -> str:
+        if not isinstance(report_payload, dict):
+            return ""
+        if str(report_payload.get("schema_version") or "").strip() != "xm.selection-report.v1":
+            return ""
+
+        sections: List[str] = []
+
+        overview = report_payload.get("overview")
+        if isinstance(overview, dict):
+            lines = ["## 结论总览"]
+            recommendation_level = str(overview.get("recommendation_level") or "").strip()
+            confidence_level = str(overview.get("confidence_level") or "").strip()
+            if recommendation_level:
+                lines.append("- 当前建议: %s" % recommendation_level)
+            if confidence_level:
+                lines.append("- 当前信心: %s" % confidence_level)
+            core_reasons = overview.get("core_reasons")
+            if isinstance(core_reasons, list):
+                for reason in core_reasons[:3]:
+                    text = str(reason or "").strip()
+                    if text:
+                        lines.append("- %s" % text)
+            if len(lines) > 1:
+                sections.append("\n".join(lines))
+
+        decision = report_payload.get("decision")
+        if isinstance(decision, dict):
+            lines = ["## 决策判断"]
+            judgement_summary = str(decision.get("judgement_summary") or "").strip()
+            if judgement_summary:
+                lines.append(judgement_summary)
+            decision_basis = decision.get("decision_basis")
+            if isinstance(decision_basis, list):
+                for reason in decision_basis[:3]:
+                    text = str(reason or "").strip()
+                    if text:
+                        lines.append("- %s" % text)
+            blocking_risk = str(decision.get("blocking_risk") or "").strip()
+            if blocking_risk:
+                lines.append("- 最大阻断项: %s" % blocking_risk)
+            if len(lines) > 1:
+                sections.append("\n".join(lines))
+
+        market_attractiveness = report_payload.get("market_attractiveness")
+        if isinstance(market_attractiveness, dict):
+            lines = ["## 市场吸引力"]
+            metric_labels = [
+                ("predicted_sales_w4_total", "预测 W4 总销量"),
+                ("top20_predicted_sales_w4_share", "Top20 集中度"),
+                ("top_asin_count_with_forecast", "有效预测样本数"),
+                ("trend_stage", "趋势阶段"),
+                ("trend_wow", "趋势周环比"),
+                ("keyword_coverage_ratio", "趋势覆盖率"),
+            ]
+            for key, label in metric_labels:
+                value = market_attractiveness.get(key)
+                if value in (None, "", [], {}):
+                    continue
+                lines.append("- %s: %s" % (label, value))
+            if len(lines) > 1:
+                sections.append("\n".join(lines))
+
+        competition_structure = report_payload.get("competition_structure")
+        if isinstance(competition_structure, dict):
+            lines = ["## 竞争结构"]
+            metric_labels = [
+                ("avg_price_gap", "平均价格差异"),
+                ("avg_review_gap", "平均评论差异"),
+                ("avg_monthly_sold_gap", "平均月销差异"),
+                ("median_offer_gap", "中位供给差异"),
+            ]
+            for key, label in metric_labels:
+                value = competition_structure.get(key)
+                if value in (None, "", [], {}):
+                    continue
+                lines.append("- %s: %s" % (label, value))
+            if len(lines) > 1:
+                sections.append("\n".join(lines))
+
+        opportunity_drivers = report_payload.get("opportunity_drivers")
+        if isinstance(opportunity_drivers, dict):
+            lines = ["## 机会驱动"]
+            forecast_type = str(opportunity_drivers.get("forecast_type") or "").strip()
+            if forecast_type:
+                lines.append("- 预测类型: %s" % forecast_type)
+            driver_rows = opportunity_drivers.get("driver_distribution_rows")
+            if isinstance(driver_rows, list) and driver_rows:
+                lines.append("- 驱动分布证据: %s 行" % len(driver_rows))
+            weak_signal_rows = opportunity_drivers.get("weak_signal_rows")
+            if isinstance(weak_signal_rows, list) and weak_signal_rows:
+                lines.append("- 弱信号证据: %s 行" % len(weak_signal_rows))
+            if len(lines) > 1:
+                sections.append("\n".join(lines))
+
+        asin_case_evidence = report_payload.get("asin_case_evidence")
+        if isinstance(asin_case_evidence, dict) and asin_case_evidence:
+            lines = ["## ASIN 案例证据"]
+            focus_asins = asin_case_evidence.get("focus_asins")
+            if isinstance(focus_asins, list) and focus_asins:
+                lines.append("- 聚焦 ASIN: %s" % ", ".join(str(item) for item in focus_asins if str(item).strip()))
+            chart_intents = asin_case_evidence.get("chart_intents")
+            if isinstance(chart_intents, list) and chart_intents:
+                lines.append("- 已挂接图表意图: %s" % ", ".join(str(item) for item in chart_intents if str(item).strip()))
+            summary_paragraph = str(asin_case_evidence.get("summary_paragraph") or "").strip()
+            if summary_paragraph:
+                lines.append(summary_paragraph)
+            if len(lines) > 1:
+                sections.append("\n".join(lines))
+
+        risks = report_payload.get("risks_and_counterevidence")
+        if isinstance(risks, dict):
+            lines = ["## 风险与反证"]
+            risk_flags = risks.get("risk_flags")
+            if isinstance(risk_flags, list):
+                for flag in risk_flags[:5]:
+                    text = str(flag or "").strip()
+                    if text:
+                        lines.append("- 风险标记: %s" % text)
+            suppression_reasons = risks.get("suppression_reasons")
+            if isinstance(suppression_reasons, list):
+                for reason in suppression_reasons[:3]:
+                    text = str(reason or "").strip()
+                    if text:
+                        lines.append("- 图表抑制原因: %s" % text)
+            summary_paragraph = str(risks.get("summary_paragraph") or "").strip()
+            if summary_paragraph:
+                lines.append(summary_paragraph)
+            if len(lines) > 1:
+                sections.append("\n".join(lines))
+
+        recommended_actions = report_payload.get("recommended_actions")
+        if isinstance(recommended_actions, dict):
+            lines = ["## 推荐动作"]
+            validation_focus = str(recommended_actions.get("validation_focus") or "").strip()
+            if validation_focus:
+                lines.append("- 优先验证点: %s" % validation_focus)
+            next_actions = recommended_actions.get("next_actions")
+            if isinstance(next_actions, list):
+                for action in next_actions[:3]:
+                    text = str(action or "").strip()
+                    if text:
+                        lines.append("- %s" % text)
+            stop_condition = str(recommended_actions.get("stop_condition") or "").strip()
+            if stop_condition:
+                lines.append("- 停止条件: %s" % stop_condition)
+            revisit_condition = str(recommended_actions.get("revisit_condition") or "").strip()
+            if revisit_condition:
+                lines.append("- 复评条件: %s" % revisit_condition)
+            if len(lines) > 1:
+                sections.append("\n".join(lines))
+
+        data_boundary = report_payload.get("data_boundary")
+        if isinstance(data_boundary, dict):
+            lines = ["## 数据边界"]
+            data_sources = data_boundary.get("data_sources")
+            if isinstance(data_sources, list) and data_sources:
+                lines.append("- 数据来源: %s" % ", ".join(str(item) for item in data_sources if str(item).strip()))
+            forecast_type = str(data_boundary.get("forecast_type") or "").strip()
+            if forecast_type:
+                lines.append("- 预测类型: %s" % forecast_type)
+            coverage_ratio = data_boundary.get("coverage_ratio")
+            if coverage_ratio not in (None, "", [], {}):
+                lines.append("- 覆盖率: %s" % coverage_ratio)
+            window_days = data_boundary.get("window_days")
+            if window_days not in (None, "", [], {}):
+                lines.append("- 分析窗口: %s 天" % window_days)
+            data_notes = data_boundary.get("data_notes")
+            if isinstance(data_notes, list):
+                for note in data_notes[:3]:
+                    text = str(note or "").strip()
+                    if text:
+                        lines.append("- %s" % text)
+            if len(lines) > 1:
+                sections.append("\n".join(lines))
 
         return "\n\n".join(section for section in sections if section).strip()
 
@@ -1668,6 +3164,38 @@ class Pipeline:
             ensure_ascii=False,
         )
 
+    def _build_structured_line_chart_spec(
+        self,
+        values: List[dict],
+        x_field: str,
+        y_field: str,
+        y_title: str,
+        tooltip: List[dict],
+        color_field: Optional[str] = None,
+        x_type: str = "temporal",
+    ) -> str:
+        encoding: Dict[str, Any] = {
+            "x": {"field": x_field, "type": x_type, "title": "日期" if x_field == "date" else x_field},
+            "y": {
+                "field": y_field,
+                "type": "quantitative",
+                "title": y_title,
+            },
+            "tooltip": tooltip,
+        }
+        if color_field:
+            encoding["color"] = {"field": color_field, "type": "nominal", "title": "ASIN"}
+
+        return json.dumps(
+            {
+                "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
+                "data": {"values": values},
+                "mark": {"type": "line", "point": True},
+                "encoding": encoding,
+            },
+            ensure_ascii=False,
+        )
+
     def _build_supplemental_growth_chart(self, rows: List[dict]) -> Optional[dict]:
         values = []
         for row in rows:
@@ -1761,6 +3289,57 @@ class Pipeline:
             ),
         }
 
+    def _build_asin_history_line_chart(self, intent: dict, rows: List[dict]) -> Optional[dict]:
+        if not isinstance(intent, dict) or not rows:
+            return None
+        roles = intent.get("roles") if isinstance(intent.get("roles"), dict) else {}
+        x_field = str(roles.get("x_field") or "date").strip() or "date"
+        series_field = str(roles.get("series_field") or "asin").strip() or "asin"
+        value_field = str(roles.get("value_field") or "").strip()
+        if not value_field:
+            return None
+
+        values: List[dict] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            value = row.get(value_field)
+            if value in (None, ""):
+                continue
+            point = {
+                series_field: row.get(series_field),
+                x_field: row.get(x_field),
+                value_field: self._safe_structured_number(value) if self._safe_structured_number(value) is not None else value,
+            }
+            if row.get("iso_year_week"):
+                point["iso_year_week"] = row.get("iso_year_week")
+            values.append(point)
+        if len(values) < 5:
+            return None
+
+        unique_series = sorted({str(item.get(series_field) or "").strip() for item in values if str(item.get(series_field) or "").strip()})
+        color_field = series_field if len(unique_series) > 1 else None
+        value_title = str(((intent.get("semantics") or {}).get("value_semantic") if isinstance(intent.get("semantics"), dict) else "") or value_field).strip() or value_field
+        x_type = "temporal" if x_field == "date" else "ordinal"
+        return {
+            "chart_id": str(intent.get("intent_id") or "").strip() or value_field,
+            "renderer": "vega-lite",
+            "title": str(intent.get("title") or intent.get("intent_id") or "图表").strip(),
+            "spec": self._build_structured_line_chart_spec(
+                values=values,
+                x_field=x_field,
+                y_field=value_field,
+                y_title=value_title,
+                tooltip=[
+                    {"field": series_field, "type": "nominal", "title": "ASIN"},
+                    {"field": x_field, "type": x_type, "title": "日期" if x_field == "date" else x_field},
+                    {"field": value_field, "type": "quantitative", "title": value_title},
+                ],
+                color_field=color_field,
+                x_type=x_type,
+            ),
+        }
+
     def _synthesize_structured_chart_specs(self, payload: dict, existing_chart_ids: set) -> List[dict]:
         if not isinstance(payload, dict):
             return []
@@ -1769,8 +3348,11 @@ class Pipeline:
         if not isinstance(data_tables, list):
             return []
 
+        chart_intents = payload.get("chart_intents") if isinstance(payload.get("chart_intents"), list) else []
+
         forecast_rows: List[dict] = []
         drilldown_rows: List[dict] = []
+        table_rows_by_id: Dict[str, List[dict]] = {}
         for table in data_tables:
             if not isinstance(table, dict):
                 continue
@@ -1779,6 +3361,8 @@ class Pipeline:
             rows = self._structured_table_rows_as_dicts(table)
             if not rows:
                 continue
+            if table_id:
+                table_rows_by_id[table_id] = rows
             if table_id == "forecast_top_asins" or "候选池预测 Top ASIN" in title:
                 forecast_rows = rows
             elif table_id == "top_asin_drilldown_forecast" or "Top ASIN 预测下钻" in title:
@@ -1794,6 +3378,22 @@ class Pipeline:
             drilldown_chart = self._build_supplemental_drilldown_chart(drilldown_rows)
             if drilldown_chart:
                 charts.append(drilldown_chart)
+
+        for intent in chart_intents:
+            if not isinstance(intent, dict):
+                continue
+            if str(intent.get("status") or "").strip() != "ready":
+                continue
+            if str(intent.get("chart_family") or "").strip() != "line_trend":
+                continue
+            chart_id = str(intent.get("intent_id") or "").strip()
+            if not chart_id or chart_id in existing_chart_ids:
+                continue
+            dataset_ref = str(intent.get("dataset_ref") or "").strip()
+            rows = table_rows_by_id.get(dataset_ref) or []
+            line_chart = self._build_asin_history_line_chart(intent, rows)
+            if line_chart:
+                charts.append(line_chart)
 
         return charts
 
@@ -2676,6 +4276,20 @@ class Pipeline:
                 "candidate_list": "candidate_asins",
                 "candidate_pool": "candidate_asins",
                 "asin_list": "candidate_asins",
+                "query": "product_query",
+                "category": "product_query",
+                "product": "product_query",
+                "product_keyword": "product_query",
+                "market": "marketplace",
+            },
+            "asin_history_timeseries": {
+                "asin": "asins",
+                "asin_code": "asins",
+                "asin_codes": "asins",
+                "asin_list": "asins",
+                "candidate_asins": "asins",
+                "candidate_list": "asins",
+                "candidate_pool": "asins",
                 "query": "product_query",
                 "category": "product_query",
                 "product": "product_query",
