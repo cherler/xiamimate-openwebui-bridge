@@ -1642,6 +1642,35 @@ class Pipeline:
         channel = str(source_context.get("channel") or payload.get("channel") or payload.get("producer") or "").strip().lower()
         return channel in {"", "workflow", "report"}
 
+    def _standard_report_chart_payload(self, payload: dict) -> dict:
+        if not isinstance(payload, dict):
+            return payload
+
+        allowed_chart_ids = {"candidate_vs_benchmark_compare"}
+        suppressed_table_ids = {"forecast_top_asins", "top_asin_drilldown_forecast"}
+        filtered = deepcopy(payload)
+
+        chart_specs = filtered.get("chart_specs")
+        if isinstance(chart_specs, list):
+            filtered["chart_specs"] = [
+                spec
+                for spec in chart_specs
+                if isinstance(spec, dict) and str(spec.get("chart_id") or "").strip() in allowed_chart_ids
+            ]
+
+        data_tables = filtered.get("data_tables")
+        if isinstance(data_tables, list):
+            filtered["data_tables"] = [
+                table
+                for table in data_tables
+                if not (
+                    isinstance(table, dict)
+                    and str(table.get("table_id") or "").strip() in suppressed_table_ids
+                )
+            ]
+
+        return filtered
+
     def _build_selection_report_bundle(self, payload: dict, fallback_summary: str = "") -> Optional[dict]:
         features = self._extract_selection_report_features(payload)
         if not self._selection_features_have_signal(features):
@@ -2916,7 +2945,10 @@ class Pipeline:
         elif fallback_summary.strip():
             sections.append(fallback_summary.strip())
 
-        chart_panels_section = self._render_structured_chart_panels(payload, include_suppressed=False)
+        chart_panels_section = self._render_structured_chart_panels(
+            self._standard_report_chart_payload(payload),
+            include_suppressed=False,
+        )
         if chart_panels_section:
             sections.append(chart_panels_section)
 
@@ -3877,6 +3909,7 @@ class Pipeline:
         if not isinstance(data_tables, list):
             return []
 
+        standard_report = self._is_standard_report_payload(payload)
         chart_intents = payload.get("chart_intents") if isinstance(payload.get("chart_intents"), list) else []
         ready_intent_ids = {
             str(intent.get("intent_id") or "").strip()
@@ -3929,12 +3962,12 @@ class Pipeline:
             if driver_chart:
                 charts.append(driver_chart)
 
-        if forecast_rows and "forecast_top_asins_growth_chart" not in existing_chart_ids:
+        if not standard_report and forecast_rows and "forecast_top_asins_growth_chart" not in existing_chart_ids:
             growth_chart = self._build_supplemental_growth_chart(forecast_rows)
             if growth_chart:
                 charts.append(growth_chart)
 
-        if drilldown_rows and "top_asin_drilldown_chart" not in existing_chart_ids:
+        if not standard_report and drilldown_rows and "top_asin_drilldown_chart" not in existing_chart_ids:
             drilldown_chart = self._build_supplemental_drilldown_chart(drilldown_rows)
             if drilldown_chart:
                 charts.append(drilldown_chart)
