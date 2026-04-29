@@ -45,14 +45,15 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 1. 需要数据时优先调用已挂载的工具，不要凭空编造指标。
 2. 需要平台规则、运营方法、合规要求等知识时，先调用 search_knowledge_base 工具检索知识库，不要依赖自身训练数据。
 3. 需要最新外部动态、站外情报、近期政策变化或实时市场讨论时，调用 web_search 工具，不要把旧知识当成最新事实。
-3. 需要商品数据时，先调用 resolve_candidates 拿到 candidate_asins；后续是否调用 candidate_pool_stats / candidate_pool_trends / candidate_pool_weak_forecast / top_asin_drilldown / asin_history_timeseries / category_benchmark，取决于用户是否需要候选池统计、趋势、销量/评论时序或详情下钻。
-4. 当你已经有明确 ASIN，且需要看近 7 到 90 天的销量、价格、BSR、评论变化、L3/leaf 类目或类目路径时，必须优先调用 asin_history_timeseries；它会返回 latest_snapshot.category_path / l3_category_name / leaf_category_name 以及 window_summary.review_growth_window。
-5. keepa_asin_lookup 只用于本地历史没有命中、需要实时商品快照兜底、或明确要求直连 Keepa 的场景；它不能替代 30 天评论增长、历史窗口和本地类目路径分析。
-6. 如果工具尚未返回数据，只能给出分析框架、验证路径和风险提醒，明确标注为待验证。
-7. 输出尽量围绕结论、证据、风险、下一步动作。
-8. 每个结论标注数据来源类型：知识库 / 推理 / 工具数据。
-9. 涉及类目归属、竞品筛选、是否排除某 ASIN 时，必须基于工具结果中的事实字段判断，优先引用 latest_snapshot.leaf_category_name / latest_snapshot.category_path，其次引用 l3_category_name；不要仅凭标题、品牌或自身知识补全类目。
-10. 当用户要求“清洗/筛选/过滤上一步候选池”，且上一步 resolve_candidates 已返回 ASIN、品牌、product_title、leaf_category_name、fine_category_name、category_path、match_score、match_reasons 等字段时，直接基于这些字段筛选；不要为了判断标题或类目路径是否包含某词而调用 top_asin_drilldown。只有用户明确要求补充销量、价格、BSR、评论、预测等候选池没有的字段，才调用下游详情工具。
+4. 需要商品数据时，先调用 resolve_candidates 拿到 candidate_pool_id 和 candidate_asins；后续 candidate_pool_stats / candidate_pool_trends / candidate_pool_weak_forecast / top_asin_drilldown / category_benchmark 优先传 candidate_pool_id，只有缺少 pool_id 时才传 candidate_asins。
+5. 当你已经有明确 ASIN，且需要看近 7 到 90 天的销量、价格、BSR、评论变化、L3/leaf 类目或类目路径时，必须优先调用 asin_history_timeseries；它会返回 latest_snapshot.category_path / l3_category_name / leaf_category_name 以及 window_summary.review_growth_window。
+6. keepa_asin_lookup 只用于本地历史没有命中、需要实时商品快照兜底、或明确要求直连 Keepa 的场景；它不能替代 30 天评论增长、历史窗口和本地类目路径分析。
+7. 如果工具尚未返回数据，只能给出分析框架、验证路径和风险提醒，明确标注为待验证。
+8. 输出尽量围绕结论、证据、风险、下一步动作。
+9. 每个结论标注数据来源类型：知识库 / 推理 / 工具数据。
+10. 涉及类目归属、竞品筛选、是否排除某 ASIN 时，必须基于工具结果中的事实字段判断，优先引用 latest_snapshot.leaf_category_name / latest_snapshot.category_path，其次引用 l3_category_name；不要仅凭标题、品牌或自身知识补全类目。
+11. 当用户要求“清洗/筛选/过滤上一步候选池”，且上一步 resolve_candidates 已返回 ASIN、品牌、product_title、leaf_category_name、fine_category_name、category_path、match_score、match_reasons 等字段时，直接基于这些字段筛选；不要为了判断标题或类目路径是否包含某词而调用 top_asin_drilldown。只有用户明确要求补充销量、价格、BSR、评论、预测等候选池没有的字段，才调用下游详情工具。
+12. 当 resolve_candidates 返回 pool_quality.is_sufficient_for_analysis=false 时，按闭环流程处理，不要把当前候选池包装成完整品类结论：先引用 pool_quality.insufficient_coverage_reason 说明覆盖不足；再调用 category_resolve 获取稳定 category_id/category_path；随后用 resolve_candidates(recall_mode=hybrid 或 category, category_id/category_path, include_descendants=true) 重试本地类目池；若 pool_quality 仍不足，调用 expand_candidates 创建补池任务，并调用 candidate_expansion_status 查询 queued/waiting_token/discovering/hydrating/syncing/completed 状态；只有补池完成或本地池 sufficient 后，才继续 category_benchmark 和强结论。若补池未完成，输出当前任务状态、token 等待原因和下一步，不给确定性品类/机会结论。
 
 工具调用规则：
 - 当你决定调用工具时，直接输出工具调用指令，不要在工具调用之前添加任何文字（如"好的，我来帮你…"等）。
@@ -66,7 +67,10 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 - search_knowledge_base: 检索跨境电商知识库（平台规则、运营指南、市场洞察）
 - web_search: 联网搜索最新外部信息并返回总结（平台动态、行业新闻、竞争情报、消费者趋势）
 - resolve_candidates: 解析候选 ASIN 池
-- candidate_pool_stats: 候选池描述统计
+- category_resolve: 解析商品类目名称或完整类目路径，返回 category_id 与本地覆盖度
+- expand_candidates: 创建 Keepa 补池任务，不在请求路径直接消耗 token
+- candidate_expansion_status: 查询 Keepa 补池任务状态与 token 等待状态
+- candidate_pool_stats: 候选池描述统计，优先使用 resolve_candidates 返回的 candidate_pool_id
 - candidate_pool_trends: 候选池趋势诊断
 - candidate_pool_weak_forecast: 弱信号预测标记
 - top_asin_drilldown: 头部 ASIN 下钻
@@ -97,6 +101,9 @@ ALLOWED_AGENT_TOOLS = {
     "search_knowledge_base",
     "web_search",
     "resolve_candidates",
+    "category_resolve",
+    "expand_candidates",
+    "candidate_expansion_status",
     "candidate_pool_stats",
     "candidate_pool_trends",
     "candidate_pool_weak_forecast",
@@ -5168,11 +5175,71 @@ class Pipeline:
                 "keywords": "product_query",
                 "product": "product_query",
                 "product_keyword": "product_query",
+                "mode": "recall_mode",
+                "recall": "recall_mode",
+                "categoryId": "category_id",
+                "category_id": "category_id",
+                "path": "category_path",
+                "full_path": "category_path",
+                "descendants": "include_descendants",
+                "include_child_categories": "include_descendants",
+                "min_candidates": "min_pool_size",
+                "target_candidates": "target_pool_size",
                 "market": "marketplace",
                 "target_market": "marketplace",
                 "target_market_norm": "marketplace",
             },
+            "category_resolve": {
+                "query": "category_query",
+                "category": "category_query",
+                "category_name": "category_query",
+                "path": "category_path",
+                "full_path": "category_path",
+                "market": "marketplace",
+                "target_market": "marketplace",
+                "target_market_norm": "marketplace",
+                "top_k": "max_matches",
+                "top_n": "max_matches",
+                "max_results": "max_matches",
+            },
+            "expand_candidates": {
+                "query": "product_query",
+                "category": "product_query",
+                "keywords": "product_query",
+                "product": "product_query",
+                "product_keyword": "product_query",
+                "mode": "recall_mode",
+                "recall": "recall_mode",
+                "categoryId": "category_id",
+                "category_id": "category_id",
+                "path": "category_path",
+                "full_path": "category_path",
+                "descendants": "include_descendants",
+                "include_child_categories": "include_descendants",
+                "target_candidates": "target_asin_count",
+                "target_pool_size": "target_asin_count",
+                "min_candidates": "min_pool_size",
+                "market": "marketplace",
+                "target_market": "marketplace",
+                "target_market_norm": "marketplace",
+                "session_id": "requested_by_session_id",
+                "request_id": "idempotency_key",
+            },
+            "candidate_expansion_status": {
+                "id": "job_id",
+                "job": "job_id",
+                "jobId": "job_id",
+                "market": "marketplace",
+                "target_market": "marketplace",
+                "target_market_norm": "marketplace",
+                "status": "statuses",
+                "state": "statuses",
+                "max_results": "limit",
+                "top_k": "limit",
+            },
             "candidate_pool_stats": {
+                "pool_id": "candidate_pool_id",
+                "candidatePoolId": "candidate_pool_id",
                 "asins": "candidate_asins",
                 "candidate_list": "candidate_asins",
                 "candidate_pool": "candidate_asins",
@@ -5184,6 +5251,8 @@ class Pipeline:
                 "market": "marketplace",
             },
             "candidate_pool_trends": {
+                "pool_id": "candidate_pool_id",
+                "candidatePoolId": "candidate_pool_id",
                 "asins": "candidate_asins",
                 "candidate_list": "candidate_asins",
                 "candidate_pool": "candidate_asins",
@@ -5195,6 +5264,8 @@ class Pipeline:
                 "market": "marketplace",
             },
             "candidate_pool_weak_forecast": {
+                "pool_id": "candidate_pool_id",
+                "candidatePoolId": "candidate_pool_id",
                 "asins": "candidate_asins",
                 "candidate_list": "candidate_asins",
                 "candidate_pool": "candidate_asins",
@@ -5206,6 +5277,8 @@ class Pipeline:
                 "market": "marketplace",
             },
             "top_asin_drilldown": {
+                "pool_id": "candidate_pool_id",
+                "candidatePoolId": "candidate_pool_id",
                 "asins": "candidate_asins",
                 "candidate_list": "candidate_asins",
                 "candidate_pool": "candidate_asins",
@@ -5233,12 +5306,23 @@ class Pipeline:
                 "market": "marketplace",
             },
             "category_benchmark": {
+                "pool_id": "candidate_pool_id",
+                "candidatePoolId": "candidate_pool_id",
                 "asins": "candidate_asins",
                 "candidate_list": "candidate_asins",
                 "candidate_pool": "candidate_asins",
                 "asin_list": "candidate_asins",
                 "query": "product_query",
                 "category": "product_query",
+                "category_id": "benchmark_category_id",
+                "categoryId": "benchmark_category_id",
+                "benchmark_category": "benchmark_category_path",
+                "category_path": "benchmark_category_path",
+                "path": "benchmark_category_path",
+                "full_path": "benchmark_category_path",
+                "level": "benchmark_level",
+                "descendants": "include_descendants",
+                "include_child_categories": "include_descendants",
                 "product": "product_query",
                 "product_keyword": "product_query",
                 "market": "marketplace",
@@ -5531,11 +5615,20 @@ class Pipeline:
             [
                 "marketplace",
                 "domain",
+                "candidate_pool_id",
+                "candidate_pool_version",
+                "candidate_pool_lineage",
+                "candidate_pool_persistence",
                 "raw_product_query",
+                "recall_mode",
+                "category_constraint",
+                "category_scope_applied",
+                "expand_if_small",
                 "normalized_query",
                 "candidate_count",
                 "candidate_total_before_truncate",
                 "candidate_total_before_semantic_category_anchor",
+                "pool_quality",
                 "semantic_fine_category_anchor_applied",
                 "semantic_category_anchor_applied",
                 "candidate_sql_prefilter_count",
@@ -5545,6 +5638,7 @@ class Pipeline:
                 "query_phrases",
                 "query_tokens",
                 "required_product_terms",
+                "effective_required_product_terms",
                 "candidate_asins",
                 "matched_categories",
                 "matched_leaf_categories",
@@ -5651,6 +5745,7 @@ class Pipeline:
             [item for item in compact_data["candidate_items"] if isinstance(item, dict) and item.get("asin")]
         )
         compact_data["candidate_pool_contract"] = {
+            "candidate_pool_id": "stable reference for downstream pool tools in this persisted resolve_candidates result",
             "candidate_asins": "full ranked ASIN pool for downstream tools such as candidate_pool_stats/trends/weak_forecast",
             "candidate_items": "budgeted visible details for reasoning/filtering; omitted details do not remove ASINs from the pool",
         }

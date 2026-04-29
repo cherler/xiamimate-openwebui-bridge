@@ -67,6 +67,13 @@ class Tools:
         marketplace: str = "US",
         query_aliases: str = "",
         category_hints: str = "",
+        recall_mode: str = "keyword",
+        category_id: Optional[int] = None,
+        category_path: str = "",
+        include_descendants: bool = True,
+        min_pool_size: int = 8,
+        target_pool_size: int = 20,
+        expand_if_small: bool = False,
         price_min: Optional[float] = None,
         price_max: Optional[float] = None,
         max_candidates: int = 30,
@@ -78,6 +85,13 @@ class Tools:
         :param marketplace: Marketplace code such as US, UK, DE, or JP.
         :param query_aliases: Optional CSV string of query aliases.
         :param category_hints: Optional CSV string of category hints.
+        :param recall_mode: Recall strategy: keyword, hybrid, category, or asin_seed_expand.
+        :param category_id: Optional Keepa category ID to constrain recall.
+        :param category_path: Optional category path to constrain recall.
+        :param include_descendants: Whether category_id/category_path constraints include descendant categories.
+        :param min_pool_size: Minimum pure candidate pool size for analysis confidence.
+        :param target_pool_size: Target candidate pool size before expansion is recommended.
+        :param expand_if_small: Planning signal that the caller wants expansion if the local pool is too small.
         :param price_min: Optional lower bound for current price.
         :param price_max: Optional upper bound for current price.
         :param max_candidates: Maximum number of ASINs to return.
@@ -91,6 +105,13 @@ class Tools:
                 "marketplace": marketplace,
                 "query_aliases": self._normalize_csv(query_aliases),
                 "category_hints": self._normalize_csv(category_hints),
+                "recall_mode": recall_mode,
+                "category_id": category_id,
+                "category_path": category_path,
+                "include_descendants": include_descendants,
+                "min_pool_size": min_pool_size,
+                "target_pool_size": target_pool_size,
+                "expand_if_small": expand_if_small,
                 "price_min": price_min,
                 "price_max": price_max,
                 "max_candidates": max_candidates,
@@ -98,9 +119,114 @@ class Tools:
             },
         )
 
+    def category_resolve(
+        self,
+        category_query: str = "",
+        category_path: str = "",
+        marketplace: str = "US",
+        max_matches: int = 10,
+    ) -> str:
+        """Resolve an Amazon/Keepa category name or full category path to candidate category IDs and local data coverage.
+
+        Use this tool when a candidate pool is too small or when you need a stable category_id/category_path before benchmark or pool expansion.
+
+        :param category_query: Category keyword or leaf name, e.g. "Humidifiers".
+        :param category_path: Optional full category path, e.g. "Home & Kitchen > Heating, Cooling & Air Quality > Humidifiers".
+        :param marketplace: Marketplace code such as US, UK, DE, or JP.
+        :param max_matches: Maximum category matches to return.
+        :return: JSON response from theme_api.
+        """
+        return self._request(
+            "/api/product-theme/category-resolve",
+            {
+                "category_query": category_query,
+                "category_path": category_path,
+                "marketplace": marketplace,
+                "max_matches": max_matches,
+            },
+        )
+
+    def expand_candidates(
+        self,
+        product_query: str = "",
+        marketplace: str = "US",
+        recall_mode: str = "hybrid",
+        category_id: Optional[int] = None,
+        category_path: str = "",
+        include_descendants: bool = True,
+        target_asin_count: int = 20,
+        min_pool_size: int = 8,
+        priority: str = "interactive_normal",
+        requested_by_session_id: str = "",
+        idempotency_key: str = "",
+        notes: str = "",
+    ) -> str:
+        """Queue a Keepa candidate expansion job without consuming Keepa tokens in the request path.
+
+        Use after resolve_candidates returns low pool_quality or after category_resolve identifies a stable category_id/category_path.
+
+        :param product_query: Product keyword or theme to expand.
+        :param marketplace: Marketplace code such as US, UK, DE, or JP.
+        :param recall_mode: Recall strategy to use after expansion, usually hybrid or category.
+        :param category_id: Optional Keepa category ID to expand.
+        :param category_path: Optional category path to expand.
+        :param include_descendants: Whether category expansion includes descendants.
+        :param target_asin_count: Target ASIN count after expansion.
+        :param min_pool_size: Minimum pool size before analysis is allowed.
+        :param priority: Job priority: interactive_high, interactive_normal, background_high, or background_low.
+        :param requested_by_session_id: Optional chat/session ID for traceability.
+        :param idempotency_key: Optional idempotency key to avoid duplicate jobs.
+        :param notes: Optional human-readable request note.
+        :return: JSON response from theme_api.
+        """
+        return self._request(
+            "/api/product-theme/expand-candidates",
+            {
+                "product_query": product_query,
+                "marketplace": marketplace,
+                "recall_mode": recall_mode,
+                "category_id": category_id,
+                "category_path": category_path,
+                "include_descendants": include_descendants,
+                "target_asin_count": target_asin_count,
+                "min_pool_size": min_pool_size,
+                "source": "agent_interactive",
+                "priority": priority,
+                "requested_by_session_id": requested_by_session_id,
+                "idempotency_key": idempotency_key,
+                "notes": notes,
+            },
+        )
+
+    def candidate_expansion_status(
+        self,
+        job_id: str = "",
+        marketplace: str = "US",
+        statuses: str = "queued,waiting_token,discovering,hydrating,syncing",
+        limit: int = 20,
+    ) -> str:
+        """Query queued or running Keepa candidate expansion jobs.
+
+        :param job_id: Optional specific expansion job ID.
+        :param marketplace: Marketplace code such as US, UK, DE, or JP.
+        :param statuses: CSV statuses to list when job_id is empty.
+        :param limit: Maximum jobs to return.
+        :return: JSON response from theme_api.
+        """
+        return self._request(
+            "/api/product-theme/candidate-expansion-status",
+            {
+                "job_id": job_id,
+                "marketplace": marketplace,
+                "statuses": self._normalize_csv(statuses),
+                "limit": limit,
+            },
+        )
+
     def candidate_pool_stats(
         self,
         candidate_asins: str = "",
+        candidate_pool_id: str = "",
         marketplace: str = "US",
         window_days: int = 30,
         product_query: str = "",
@@ -108,31 +234,36 @@ class Tools:
         """Get descriptive statistics for a resolved candidate pool.
 
         :param candidate_asins: CSV string of candidate ASINs.
+        :param candidate_pool_id: Persisted candidate_pool_id returned by resolve_candidates.
         :param marketplace: Marketplace code such as US, UK, DE, or JP.
         :param window_days: Lookback window for the pool metrics.
         :param product_query: Optional product query fallback when candidate_asins is not yet available.
         :return: JSON response from theme_api.
         """
-        resolved_candidate_asins = self._ensure_candidate_asins(
-            candidate_asins=candidate_asins,
-            marketplace=marketplace,
-            product_query=product_query,
-        )
-        if isinstance(resolved_candidate_asins, str):
-            return resolved_candidate_asins
+        payload = {
+            "candidate_pool_id": str(candidate_pool_id or "").strip() or None,
+            "marketplace": marketplace,
+            "window_days": window_days,
+        }
+        if not payload["candidate_pool_id"]:
+            resolved_candidate_asins = self._ensure_candidate_asins(
+                candidate_asins=candidate_asins,
+                marketplace=marketplace,
+                product_query=product_query,
+            )
+            if isinstance(resolved_candidate_asins, str):
+                return resolved_candidate_asins
+            payload["candidate_asins"] = resolved_candidate_asins
 
         return self._request(
             "/api/product-theme/candidate-pool-stats",
-            {
-                "candidate_asins": resolved_candidate_asins,
-                "marketplace": marketplace,
-                "window_days": window_days,
-            },
+            payload,
         )
 
     def candidate_pool_trends(
         self,
         candidate_asins: str = "",
+        candidate_pool_id: str = "",
         marketplace: str = "US",
         window_days: int = 30,
         product_query: str = "",
@@ -140,31 +271,36 @@ class Tools:
         """Get trend diagnostics for a candidate pool.
 
         :param candidate_asins: CSV string of candidate ASINs.
+        :param candidate_pool_id: Persisted candidate_pool_id returned by resolve_candidates.
         :param marketplace: Marketplace code such as US, UK, DE, or JP.
         :param window_days: Lookback window for trend calculations.
         :param product_query: Optional product query fallback when candidate_asins is not yet available.
         :return: JSON response from theme_api.
         """
-        resolved_candidate_asins = self._ensure_candidate_asins(
-            candidate_asins=candidate_asins,
-            marketplace=marketplace,
-            product_query=product_query,
-        )
-        if isinstance(resolved_candidate_asins, str):
-            return resolved_candidate_asins
+        payload = {
+            "candidate_pool_id": str(candidate_pool_id or "").strip() or None,
+            "marketplace": marketplace,
+            "window_days": window_days,
+        }
+        if not payload["candidate_pool_id"]:
+            resolved_candidate_asins = self._ensure_candidate_asins(
+                candidate_asins=candidate_asins,
+                marketplace=marketplace,
+                product_query=product_query,
+            )
+            if isinstance(resolved_candidate_asins, str):
+                return resolved_candidate_asins
+            payload["candidate_asins"] = resolved_candidate_asins
 
         return self._request(
             "/api/product-theme/candidate-pool-trends",
-            {
-                "candidate_asins": resolved_candidate_asins,
-                "marketplace": marketplace,
-                "window_days": window_days,
-            },
+            payload,
         )
 
     def candidate_pool_weak_forecast(
         self,
         candidate_asins: str = "",
+        candidate_pool_id: str = "",
         marketplace: str = "US",
         window_days: int = 30,
         top_n: int = 5,
@@ -173,33 +309,38 @@ class Tools:
         """Get weak-signal forecast markers for a candidate pool.
 
         :param candidate_asins: CSV string of candidate ASINs.
+        :param candidate_pool_id: Persisted candidate_pool_id returned by resolve_candidates.
         :param marketplace: Marketplace code such as US, UK, DE, or JP.
         :param window_days: Lookback window for forecast features.
         :param top_n: Number of top opportunity or risk signals to keep.
         :param product_query: Optional product query fallback when candidate_asins is not yet available.
         :return: JSON response from theme_api.
         """
-        resolved_candidate_asins = self._ensure_candidate_asins(
-            candidate_asins=candidate_asins,
-            marketplace=marketplace,
-            product_query=product_query,
-        )
-        if isinstance(resolved_candidate_asins, str):
-            return resolved_candidate_asins
+        payload = {
+            "candidate_pool_id": str(candidate_pool_id or "").strip() or None,
+            "marketplace": marketplace,
+            "window_days": window_days,
+            "top_n": top_n,
+        }
+        if not payload["candidate_pool_id"]:
+            resolved_candidate_asins = self._ensure_candidate_asins(
+                candidate_asins=candidate_asins,
+                marketplace=marketplace,
+                product_query=product_query,
+            )
+            if isinstance(resolved_candidate_asins, str):
+                return resolved_candidate_asins
+            payload["candidate_asins"] = resolved_candidate_asins
 
         return self._request(
             "/api/product-theme/candidate-pool-weak-forecast",
-            {
-                "candidate_asins": resolved_candidate_asins,
-                "marketplace": marketplace,
-                "window_days": window_days,
-                "top_n": top_n,
-            },
+            payload,
         )
 
     def top_asin_drilldown(
         self,
         candidate_asins: str = "",
+        candidate_pool_id: str = "",
         marketplace: str = "US",
         window_days: int = 30,
         top_n: Optional[int] = None,
@@ -208,25 +349,27 @@ class Tools:
         """Inspect the strongest ASINs in a candidate pool.
 
         :param candidate_asins: CSV string of candidate ASINs.
+        :param candidate_pool_id: Persisted candidate_pool_id returned by resolve_candidates.
         :param marketplace: Marketplace code such as US, UK, DE, or JP.
         :param window_days: Lookback window for the drilldown.
         :param top_n: Optional limit for the number of ASINs returned.
         :param product_query: Optional product query fallback when candidate_asins is not yet available.
         :return: JSON response from theme_api.
         """
-        resolved_candidate_asins = self._ensure_candidate_asins(
-            candidate_asins=candidate_asins,
-            marketplace=marketplace,
-            product_query=product_query,
-        )
-        if isinstance(resolved_candidate_asins, str):
-            return resolved_candidate_asins
-
         payload = {
-            "candidate_asins": resolved_candidate_asins,
+            "candidate_pool_id": str(candidate_pool_id or "").strip() or None,
             "marketplace": marketplace,
             "window_days": window_days,
         }
+        if not payload["candidate_pool_id"]:
+            resolved_candidate_asins = self._ensure_candidate_asins(
+                candidate_asins=candidate_asins,
+                marketplace=marketplace,
+                product_query=product_query,
+            )
+            if isinstance(resolved_candidate_asins, str):
+                return resolved_candidate_asins
+            payload["candidate_asins"] = resolved_candidate_asins
         if top_n is not None:
             payload["top_n"] = top_n
         return self._request("/api/product-theme/top-asin-drilldown", payload)
@@ -274,33 +417,50 @@ class Tools:
     def category_benchmark(
         self,
         candidate_asins: str = "",
+        candidate_pool_id: str = "",
         marketplace: str = "US",
         window_days: int = 30,
+        benchmark_category_id: Optional[int] = None,
+        benchmark_category_path: str = "",
+        benchmark_level: str = "auto",
+        include_descendants: bool = True,
         product_query: str = "",
     ) -> str:
         """Compare a candidate pool against its benchmark category.
 
         :param candidate_asins: CSV string of candidate ASINs.
+        :param candidate_pool_id: Persisted candidate_pool_id returned by resolve_candidates.
         :param marketplace: Marketplace code such as US, UK, DE, or JP.
         :param window_days: Lookback window for the benchmark snapshot.
+        :param benchmark_category_id: Optional explicit Keepa category ID to use as benchmark anchor.
+        :param benchmark_category_path: Optional explicit category path to use as benchmark anchor.
+        :param benchmark_level: Anchor level: auto, leaf, fine, l3, l2, l1, or root.
+        :param include_descendants: Whether benchmark aggregation includes child categories.
         :param product_query: Optional product query fallback when candidate_asins is not yet available.
         :return: JSON response from theme_api.
         """
-        resolved_candidate_asins = self._ensure_candidate_asins(
-            candidate_asins=candidate_asins,
-            marketplace=marketplace,
-            product_query=product_query,
-        )
-        if isinstance(resolved_candidate_asins, str):
-            return resolved_candidate_asins
+        payload = {
+            "candidate_pool_id": str(candidate_pool_id or "").strip() or None,
+            "marketplace": marketplace,
+            "window_days": window_days,
+            "benchmark_category_id": benchmark_category_id,
+            "benchmark_category_path": benchmark_category_path,
+            "benchmark_level": benchmark_level,
+            "include_descendants": include_descendants,
+        }
+        if not payload["candidate_pool_id"]:
+            resolved_candidate_asins = self._ensure_candidate_asins(
+                candidate_asins=candidate_asins,
+                marketplace=marketplace,
+                product_query=product_query,
+            )
+            if isinstance(resolved_candidate_asins, str):
+                return resolved_candidate_asins
+            payload["candidate_asins"] = resolved_candidate_asins
 
         return self._request(
             "/api/product-theme/category-benchmark",
-            {
-                "candidate_asins": resolved_candidate_asins,
-                "marketplace": marketplace,
-                "window_days": window_days,
-            },
+            payload,
         )
 
     def keepa_asin_lookup(
@@ -379,7 +539,7 @@ class Tools:
 
         normalized_product_query = str(product_query or "").strip()
         if not normalized_product_query:
-            return "缺少 candidate_asins；请先调用 resolve_candidates，或传入 product_query/category。"
+            return "缺少 candidate_asins 或 candidate_pool_id；请先调用 resolve_candidates，或传入 product_query/category。"
 
         resolved = self.resolve_candidates(
             product_query=normalized_product_query,
