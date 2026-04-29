@@ -393,11 +393,23 @@ class Tools:
         except ValueError:
             return "候选池解析结果不是合法 JSON，无法提取 candidate_asins。"
 
-        resolved_candidate_asins = self._normalize_csv(payload.get("candidate_asins"))
+        resolved_candidate_asins = self._extract_candidate_asins(payload)
         if not resolved_candidate_asins:
             return "候选池解析结果缺少 candidate_asins，无法继续执行下游工具。"
 
         return resolved_candidate_asins
+
+    def _extract_candidate_asins(self, payload: dict) -> List[str]:
+        candidates = self._normalize_csv(payload.get("candidate_asins"))
+        if candidates:
+            return candidates
+
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        candidates = self._normalize_csv(data.get("candidate_asins"))
+        if candidates:
+            return candidates
+
+        return self._normalize_csv(data.get("candidate_items"))
 
     def _request(self, path: str, payload: dict) -> str:
         operation = path.rsplit("/", 1)[-1].replace("-", "_")

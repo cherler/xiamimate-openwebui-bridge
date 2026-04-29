@@ -45,18 +45,22 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 1. 需要数据时优先调用已挂载的工具，不要凭空编造指标。
 2. 需要平台规则、运营方法、合规要求等知识时，先调用 search_knowledge_base 工具检索知识库，不要依赖自身训练数据。
 3. 需要最新外部动态、站外情报、近期政策变化或实时市场讨论时，调用 web_search 工具，不要把旧知识当成最新事实。
-3. 需要商品数据时，先调用 resolve_candidates 拿到 candidate_asins，再调用 candidate_pool_stats / candidate_pool_trends / candidate_pool_weak_forecast / top_asin_drilldown / asin_history_timeseries / category_benchmark。
-4. 当你已经有明确 ASIN，且需要看近 7 到 90 天的销量、价格、BSR 或评论变化时，优先调用 asin_history_timeseries。
-5. 当 top_asin_drilldown 返回空结果或用户提供了本地数据库可能没有的 ASIN 时，使用 keepa_asin_lookup 直连 Keepa API 查询实时数据。
+3. 需要商品数据时，先调用 resolve_candidates 拿到 candidate_asins；后续是否调用 candidate_pool_stats / candidate_pool_trends / candidate_pool_weak_forecast / top_asin_drilldown / asin_history_timeseries / category_benchmark，取决于用户是否需要候选池统计、趋势、销量/评论时序或详情下钻。
+4. 当你已经有明确 ASIN，且需要看近 7 到 90 天的销量、价格、BSR、评论变化、L3/leaf 类目或类目路径时，必须优先调用 asin_history_timeseries；它会返回 latest_snapshot.category_path / l3_category_name / leaf_category_name 以及 window_summary.review_growth_window。
+5. keepa_asin_lookup 只用于本地历史没有命中、需要实时商品快照兜底、或明确要求直连 Keepa 的场景；它不能替代 30 天评论增长、历史窗口和本地类目路径分析。
 6. 如果工具尚未返回数据，只能给出分析框架、验证路径和风险提醒，明确标注为待验证。
 7. 输出尽量围绕结论、证据、风险、下一步动作。
 8. 每个结论标注数据来源类型：知识库 / 推理 / 工具数据。
+9. 涉及类目归属、竞品筛选、是否排除某 ASIN 时，必须基于工具结果中的事实字段判断，优先引用 latest_snapshot.leaf_category_name / latest_snapshot.category_path，其次引用 l3_category_name；不要仅凭标题、品牌或自身知识补全类目。
+10. 当用户要求“清洗/筛选/过滤上一步候选池”，且上一步 resolve_candidates 已返回 ASIN、品牌、product_title、leaf_category_name、fine_category_name、category_path、match_score、match_reasons 等字段时，直接基于这些字段筛选；不要为了判断标题或类目路径是否包含某词而调用 top_asin_drilldown。只有用户明确要求补充销量、价格、BSR、评论、预测等候选池没有的字段，才调用下游详情工具。
 
 工具调用规则：
 - 当你决定调用工具时，直接输出工具调用指令，不要在工具调用之前添加任何文字（如"好的，我来帮你…"等）。
 - 等工具返回结果后，再给出分析和回答。
 - 如果需要同时调用多个工具，可以连续输出多个工具调用。
 - 后续工具如果依赖上一步输出参数，不要在同一轮猜测这些参数；先等待上一步工具结果。
+- 工具调用控制字段（如 $TOOL_CALLS、$ABORT_CONTROLLER、<tools>、<tool_call>）永远不能作为最终答复展示给用户。
+- 不要声称“未展开的 ASIN 可能包含更多核心商品”。如果工具结果只展示了部分候选字段，只能说“当前可见字段不足”；如果已有 candidate_items，则按已有 candidate_items 排序和筛选。
 
 可用工具概览：
 - search_knowledge_base: 检索跨境电商知识库（平台规则、运营指南、市场洞察）
@@ -262,10 +266,15 @@ class Pipeline:
     class Valves(BaseModel):
         DIFY_REQUEST_TIMEOUT: int = 180
         CHAT_BACKEND_BASE_URL: str = "http://chat-backend:8200"
-        CHAT_BACKEND_TIMEOUT: int = 30
+        CHAT_BACKEND_TIMEOUT: int = 180
         CHAT_BACKEND_SERVICE_SECRET: str = ""
         CHAT_BACKEND_SERVICE_NAME: str = "open-webui-pipeline"
-        AGENT_OPENAI_MODEL: str = "MiniMax-M2.7-highspeed"
+        AGENT_OPENAI_MODEL: str = "deepseek-v4-pro"
+        AGENT_ANTHROPIC_MODEL: str = "MiniMax-M2.7-highspeed"
+        AGENT_MODEL_DEFAULT_PROFILE: str = "deepseek"
+        AGENT_MODEL_PROFILES: str = "deepseek,minimax"
+        AGENT_MODEL_DEEPSEEK_LABEL: str = "DeepSeek V4 Pro"
+        AGENT_MODEL_MINIMAX_LABEL: str = "MiniMax M2.7"
         XIAMIMATE_MODEL_PREFIX: str = "xiamimate"
 
     def __init__(self):
@@ -277,28 +286,19 @@ class Pipeline:
             **{
                 "DIFY_REQUEST_TIMEOUT": int(os.getenv("DIFY_REQUEST_TIMEOUT", "180")),
                 "CHAT_BACKEND_BASE_URL": os.getenv("CHAT_BACKEND_BASE_URL", "http://chat-backend:8200"),
-                "CHAT_BACKEND_TIMEOUT": int(os.getenv("CHAT_BACKEND_TIMEOUT", "30")),
+                "CHAT_BACKEND_TIMEOUT": int(os.getenv("CHAT_BACKEND_TIMEOUT", "180")),
                 "CHAT_BACKEND_SERVICE_SECRET": os.getenv("CHAT_BACKEND_SERVICE_SECRET", ""),
                 "CHAT_BACKEND_SERVICE_NAME": os.getenv("CHAT_BACKEND_SERVICE_NAME", "open-webui-pipeline"),
-                "AGENT_OPENAI_MODEL": os.getenv("AGENT_OPENAI_MODEL", "MiniMax-M2.7-highspeed"),
+                "AGENT_OPENAI_MODEL": os.getenv("AGENT_OPENAI_MODEL", "deepseek-v4-pro"),
+                "AGENT_ANTHROPIC_MODEL": os.getenv("AGENT_ANTHROPIC_MODEL", "MiniMax-M2.7-highspeed"),
+                "AGENT_MODEL_DEFAULT_PROFILE": os.getenv("AGENT_MODEL_DEFAULT_PROFILE", "deepseek"),
+                "AGENT_MODEL_PROFILES": os.getenv("AGENT_MODEL_PROFILES", "deepseek,minimax"),
+                "AGENT_MODEL_DEEPSEEK_LABEL": os.getenv("AGENT_MODEL_DEEPSEEK_LABEL", "DeepSeek V4 Pro"),
+                "AGENT_MODEL_MINIMAX_LABEL": os.getenv("AGENT_MODEL_MINIMAX_LABEL", "MiniMax M2.7"),
                 "XIAMIMATE_MODEL_PREFIX": os.getenv("XIAMIMATE_MODEL_PREFIX", "xiamimate"),
             }
         )
-        self.pipelines = [
-            {
-                "id": "agent",
-                "name": "Agent",
-                "info": {
-                    "meta": {
-                        "description": "虾米选品的智能体模式，支持 /report 报告编排，并兼容 /workflow 旧入口。",
-                        "capabilities": {
-                            "status_updates": True,
-                        },
-                        "suggestion_prompts": WORKFLOW_SUGGESTION_PROMPTS,
-                    }
-                },
-            },
-        ]
+        self.pipelines = self._build_agent_pipelines()
 
     async def on_startup(self):
         print("on_startup:xiamimate")
@@ -308,6 +308,7 @@ class Pipeline:
 
     async def on_valves_updated(self):
         self.id = self.valves.XIAMIMATE_MODEL_PREFIX
+        self.pipelines = self._build_agent_pipelines()
 
     def _load_agent_tools(self):
         tools_path = Path(__file__).resolve().parent.parent / "tools" / "xiamimate_theme_tools.py"
@@ -328,9 +329,100 @@ class Pipeline:
             print("xiamimate.agent failed to load tools", str(exc))
             return None
 
-    def _get_provider(self) -> ProviderStrategy:
-        """Resolve the LLM provider strategy based on the configured model name."""
-        return get_provider(self.valves.AGENT_OPENAI_MODEL)
+    def _default_agent_profile(self) -> str:
+        normalized = str(self.valves.AGENT_MODEL_DEFAULT_PROFILE or "").strip().lower()
+        return normalized if normalized in {"deepseek", "minimax"} else "deepseek"
+
+    def _configured_agent_profiles(self) -> List[str]:
+        profiles = []
+        for raw_value in str(self.valves.AGENT_MODEL_PROFILES or "").split(","):
+            profile = raw_value.strip().lower()
+            if profile not in {"deepseek", "minimax"} or profile in profiles:
+                continue
+            profiles.append(profile)
+        if not profiles:
+            profiles.append(self._default_agent_profile())
+        return profiles
+
+    def _model_name_for_profile(self, profile: str) -> str:
+        normalized = str(profile or "").strip().lower()
+        if normalized == "minimax":
+            return str(self.valves.AGENT_ANTHROPIC_MODEL or "").strip() or "MiniMax-M2.7-highspeed"
+        return str(self.valves.AGENT_OPENAI_MODEL or "").strip() or "deepseek-v4-pro"
+
+    def _label_for_profile(self, profile: str) -> str:
+        normalized = str(profile or "").strip().lower()
+        if normalized == "minimax":
+            return str(self.valves.AGENT_MODEL_MINIMAX_LABEL or "MiniMax M2.7").strip() or "MiniMax M2.7"
+        return str(self.valves.AGENT_MODEL_DEEPSEEK_LABEL or "DeepSeek V4 Pro").strip() or "DeepSeek V4 Pro"
+
+    def _pipeline_id_for_profile(self, profile: str) -> str:
+        normalized = str(profile or "").strip().lower()
+        if normalized == self._default_agent_profile():
+            return "agent"
+        return "agent-%s" % normalized
+
+    def _build_agent_pipelines(self) -> List[dict]:
+        pipelines: List[dict] = []
+        seen_ids = set()
+        profiles = self._configured_agent_profiles()
+
+        ordered_profiles = [self._default_agent_profile()] + [profile for profile in profiles if profile != self._default_agent_profile()]
+        for profile in ordered_profiles:
+            if profile not in profiles:
+                continue
+            pipeline_id = self._pipeline_id_for_profile(profile)
+            if pipeline_id in seen_ids:
+                continue
+            seen_ids.add(pipeline_id)
+            label = self._label_for_profile(profile)
+            description = "虾米选品的智能体模式，支持 /report 报告编排，并兼容 /workflow 旧入口。当前模型：%s。" % label
+            pipelines.append(
+                {
+                    "id": pipeline_id,
+                    "name": "Agent" if pipeline_id == "agent" else "Agent · %s" % label,
+                    "info": {
+                        "meta": {
+                            "description": description,
+                            "capabilities": {
+                                "status_updates": True,
+                            },
+                            "suggestion_prompts": WORKFLOW_SUGGESTION_PROMPTS,
+                            "xiamimate_profile": profile,
+                            "xiamimate_model_name": self._model_name_for_profile(profile),
+                        }
+                    },
+                }
+            )
+        return pipelines
+
+    def _resolve_agent_profile(self, model_id: str, body: dict) -> str:
+        override = str(
+            body.get("xiamimate_model_profile")
+            or body.get("xiamimate_agent_profile")
+            or ((body.get("metadata") or {}).get("xiamimate_model_profile") if isinstance(body.get("metadata"), dict) else "")
+            or ""
+        ).strip().lower()
+        if override in self._configured_agent_profiles():
+            return override
+
+        effective_model_id = str(body.get("model") or model_id or "").strip().lower()
+        for profile in self._configured_agent_profiles():
+            explicit_pipeline_id = "agent-%s" % profile
+            if effective_model_id.endswith(".%s" % explicit_pipeline_id) or effective_model_id == explicit_pipeline_id:
+                return profile
+
+        return self._default_agent_profile()
+
+    def _response_model_for_profile(self, profile: str, requested_model_id: str) -> str:
+        effective_model_id = str(requested_model_id or "").strip().lower()
+        explicit_pipeline_id = "agent-%s" % str(profile or "").strip().lower()
+        selected_pipeline_id = explicit_pipeline_id if effective_model_id.endswith(".%s" % explicit_pipeline_id) or effective_model_id == explicit_pipeline_id else self._pipeline_id_for_profile(profile)
+        return "%s.%s" % (self.id, selected_pipeline_id)
+
+    def _get_provider(self, model_name: Optional[str] = None) -> ProviderStrategy:
+        """Resolve the LLM provider strategy based on the selected model name."""
+        return get_provider(model_name or self._model_name_for_profile(self._default_agent_profile()))
 
     def pipe(
         self,
@@ -339,7 +431,9 @@ class Pipeline:
         messages: List[dict],
         body: dict,
     ) -> Union[str, dict, Iterator[bytes]]:
-        response_model = "%s.agent" % self.id
+        agent_profile = self._resolve_agent_profile(model_id=model_id, body=body)
+        agent_model_name = self._model_name_for_profile(agent_profile)
+        response_model = self._response_model_for_profile(agent_profile, str(body.get("model") or model_id or ""))
         account_command = self._parse_account_command(self._extract_last_user_text(messages) or (user_message or ""))
         if account_command is not None:
             return self._handle_account_command(command=account_command, body=body, model=response_model)
@@ -363,7 +457,13 @@ class Pipeline:
         if mode == "web":
             return self._run_web_search(query=normalized_user_message, body=body, model=response_model)
         if mode in {"agent", "tool"}:
-            return self._run_agent(messages=normalized_messages, body=body, model=response_model, mode=mode)
+            return self._run_agent(
+                messages=normalized_messages,
+                body=body,
+                model=response_model,
+                mode=mode,
+                model_name=agent_model_name,
+            )
 
         return self._chat_response(content="未识别的 XiaMimate 模式。请使用 Agent。", model=response_model)
 
@@ -524,6 +624,7 @@ class Pipeline:
         messages: List[dict],
         body: dict,
         model: str,
+        model_name: str,
         mode: str = "agent",
     ) -> Union[dict, Iterator[bytes], str]:
         if not self.valves.CHAT_BACKEND_SERVICE_SECRET:
@@ -539,12 +640,19 @@ class Pipeline:
                 messages=messages,
                 body=body,
                 model=model,
+                model_name=model_name,
                 billing_context=billing_context,
                 mode=mode,
             )
 
         try:
-            answer = self._run_agent_loop(messages=messages, body=body, billing_context=billing_context, mode=mode)
+            answer = self._run_agent_loop(
+                messages=messages,
+                body=body,
+                billing_context=billing_context,
+                mode=mode,
+                model_name=model_name,
+            )
         except RuntimeError as exc:
             return self._error_text(str(exc))
 
@@ -555,6 +663,7 @@ class Pipeline:
         messages: List[dict],
         body: dict,
         model: str,
+        model_name: str,
         billing_context: dict,
         mode: str,
     ) -> Iterator[bytes]:
@@ -564,6 +673,7 @@ class Pipeline:
         answer_started = False
         used_tools = False
         reasoning_open = False
+        tool_observations: List[dict] = []
 
         def emit_text_chunk(content: str) -> bytes:
             return self._stream_content_chunk(
@@ -614,7 +724,7 @@ class Pipeline:
                 yield chunk
 
             for round_index in range(6):
-                payload = self._prepare_agent_payload(messages=conversation, body=body, mode=mode)
+                payload = self._prepare_agent_payload(messages=conversation, body=body, mode=mode, model_name=model_name)
                 payload["stream"] = False
                 minimax_charge = self._charge_billing_event(
                     billing_context=billing_context,
@@ -628,7 +738,7 @@ class Pipeline:
                     },
                 )
                 try:
-                    response = self._post_agent_payload(payload)
+                    response = self._post_agent_payload(payload, model_name=model_name)
                 except RuntimeError as exc:
                     self._refund_billing_event(
                         billing_context=billing_context,
@@ -636,16 +746,30 @@ class Pipeline:
                         description="LLM 请求失败，已退款",
                         meta={"mode": "agent", "stream": True, "error": str(exc)[:500]},
                     )
+                    if tool_observations:
+                        final_answer = self._fallback_answer_from_tool_observations(tool_observations, error=str(exc))
+                        for chunk in emit_reasoning_chunks(self._format_agent_progress("模型整理失败，返回工具结果摘要")):
+                            yield chunk
+                        close_chunk = close_reasoning_chunk()
+                        if close_chunk is not None:
+                            yield close_chunk
+                        for chunk in self._split_text(final_answer):
+                            answer_started = True
+                            yield emit_text_chunk(chunk)
+                        break
                     raise
 
                 content = self._extract_assistant_content(response)
-                tool_calls = self._extract_tool_calls(content)
+                assistant_message = self._extract_assistant_message(response)
+                native_tool_calls = self._extract_response_tool_calls(response)
+                text_tool_calls = [] if native_tool_calls else self._extract_tool_calls(content, model_name=model_name)
+                tool_calls = native_tool_calls or text_tool_calls
 
                 if not tool_calls:
-                    cleaned = self._clean_agent_content(content)
+                    cleaned = self._clean_agent_content(content, model_name=model_name)
                     if cleaned:
                         final_answer = cleaned
-                    elif self._agent_stream_contains_internal_markup(content):
+                    elif self._agent_stream_contains_internal_markup(content, model_name=model_name):
                         final_answer = "已完成分析，但未生成可展示的结果，请重试。"
                     else:
                         final_answer = str(content or "").strip()
@@ -657,18 +781,22 @@ class Pipeline:
                     if close_chunk is not None:
                         yield close_chunk
 
-                    if used_tools or self._agent_stream_contains_internal_markup(content):
+                    if used_tools or self._agent_stream_contains_internal_markup(content, model_name=model_name):
                         for chunk in self._split_text(final_answer):
                             answer_started = True
                             yield emit_text_chunk(chunk)
                     else:
-                        for chunk in self._stream_agent_final_answer_chunks(payload=payload, fallback_content=final_answer):
+                        for chunk in self._stream_agent_final_answer_chunks(
+                            payload=payload,
+                            fallback_content=final_answer,
+                            model_name=model_name,
+                        ):
                             answer_started = True
                             yield emit_text_chunk(chunk)
                     break
 
                 used_tools = True
-                conversation.append({"role": "assistant", "content": content})
+                conversation.append(assistant_message if native_tool_calls else {"role": "assistant", "content": content})
 
                 tool_names = ", ".join(tool_call["name"] for tool_call in tool_calls)
                 for chunk in emit_reasoning_chunks(self._format_agent_progress("正在调用工具: %s" % tool_names)):
@@ -676,21 +804,33 @@ class Pipeline:
 
                 tool_results = []
                 for tool_call in tool_calls:
-                    result = self._execute_tool_call(tool_call, billing_context)
-                    tool_results.append(
-                        TOOL_RESULT_TEMPLATE.format(
-                            tool_name=tool_call["name"],
-                            arguments=json.dumps(tool_call.get("parameters") or {}, ensure_ascii=False),
-                            result=result,
+                    result = self._execute_tool_call(tool_call, billing_context, truncate=False)
+                    observation = self._build_tool_observation(tool_call=tool_call, result=result)
+                    tool_observations.append(observation)
+                    if native_tool_calls and tool_call.get("tool_call_id"):
+                        conversation.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": str(tool_call.get("tool_call_id")),
+                                "content": observation["llm_result"],
+                            }
                         )
-                    )
+                    else:
+                        tool_results.append(
+                            TOOL_RESULT_TEMPLATE.format(
+                                tool_name=tool_call["name"],
+                                arguments=json.dumps(tool_call.get("parameters") or {}, ensure_ascii=False),
+                                result=observation["llm_result"],
+                            )
+                        )
                     tool_status = "失败" if self._tool_result_has_error(result) else "完成"
                     for chunk in emit_reasoning_chunks(
                         self._format_agent_progress("工具 %s 已%s" % (tool_call["name"], tool_status))
                     ):
                         yield chunk
 
-                conversation.append({"role": "user", "content": "\n\n".join(tool_results)})
+                if tool_results:
+                    conversation.append({"role": "user", "content": "\n\n".join(tool_results)})
 
             if not answer_started:
                 raise RuntimeError("Agent 工具调用轮次超过上限，已中止。")
@@ -754,6 +894,30 @@ class Pipeline:
         first_token, _, _ = stripped.partition(" ")
         normalized = first_token.lower().rstrip("：:")
         return ACCOUNT_COMMANDS.get(normalized)
+
+    def _load_tool_json_payload(self, result: Any) -> Optional[dict]:
+        if isinstance(result, dict):
+            return result
+
+        text = str(result or "").strip()
+        if not text:
+            return None
+
+        try:
+            payload = json.loads(text)
+            return payload if isinstance(payload, dict) else None
+        except ValueError:
+            pass
+
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            payload = json.loads(text[start : end + 1])
+        except ValueError:
+            return None
+        return payload if isinstance(payload, dict) else None
 
     def _handle_account_command(self, command: str, body: dict, model: str) -> Union[dict, Iterator[bytes], str]:
         try:
@@ -4021,11 +4185,76 @@ class Pipeline:
         level = max(1, int(heading_level or 2))
         return "%s %s\n```%s\n%s\n```" % ("#" * level, title, renderer, spec_text)
 
-    def _prepare_agent_payload(self, messages: List[dict], body: dict, mode: str = "agent") -> dict:
-        provider = self._get_provider()
+    def _build_agent_tool_definitions(self) -> List[dict]:
+        definitions = []
+        if self.agent_tools is None:
+            return definitions
+        for tool_name in sorted(ALLOWED_AGENT_TOOLS):
+            method = getattr(self.agent_tools, tool_name, None)
+            if method is None:
+                continue
+            definitions.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "description": self._tool_description(method),
+                        "parameters": self._tool_parameters_schema(method),
+                    },
+                }
+            )
+        return definitions
+
+    def _tool_description(self, method: Any) -> str:
+        doc = str(getattr(method, "__doc__", "") or "").strip()
+        if not doc:
+            return "XiaMimate tool."
+        return re.split(r"\n\s*:param\s+", doc, maxsplit=1)[0].strip()
+
+    def _tool_parameters_schema(self, method: Any) -> dict:
+        doc = str(getattr(method, "__doc__", "") or "")
+        param_descriptions = {
+            name.strip(): desc.strip()
+            for name, desc in re.findall(r":param\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([^\n]+)", doc)
+        }
+        properties = {}
+        required = []
+        for param_name, param in signature(method).parameters.items():
+            if param_name.startswith("_"):
+                continue
+            schema = self._json_schema_for_tool_param(param.default)
+            description = param_descriptions.get(param_name)
+            if description:
+                schema["description"] = description
+            properties[param_name] = schema
+            if param.default is param.empty:
+                required.append(param_name)
+        return {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": False,
+        }
+
+    def _json_schema_for_tool_param(self, default: Any) -> dict:
+        if isinstance(default, bool):
+            return {"type": "boolean"}
+        if isinstance(default, int) and not isinstance(default, bool):
+            return {"type": "integer"}
+        if isinstance(default, float):
+            return {"type": "number"}
+        if default is None:
+            return {"type": "string"}
+        return {"type": "string"}
+
+    def _prepare_agent_payload(self, messages: List[dict], body: dict, mode: str = "agent", model_name: str = "") -> dict:
+        provider = self._get_provider(model_name)
         payload = provider.filter_payload(body)
-        payload["model"] = self.valves.AGENT_OPENAI_MODEL
+        payload["model"] = model_name or self._model_name_for_profile(self._default_agent_profile())
         payload["messages"] = self._inject_agent_system_prompt(messages, mode=mode)
+        if "tools" in getattr(provider, "allowed_params", set()):
+            payload["tools"] = self._build_agent_tool_definitions()
+            payload.setdefault("tool_choice", "auto")
 
         user_value = payload.get("user")
         if isinstance(user_value, dict):
@@ -4038,12 +4267,14 @@ class Pipeline:
         messages: List[dict],
         body: dict,
         billing_context: dict,
+        model_name: str,
         mode: str = "agent",
     ) -> str:
         conversation = deepcopy(messages or [])
+        tool_observations: List[dict] = []
 
         for _ in range(6):
-            payload = self._prepare_agent_payload(messages=conversation, body=body, mode=mode)
+            payload = self._prepare_agent_payload(messages=conversation, body=body, mode=mode, model_name=model_name)
             payload["stream"] = False
             minimax_charge = self._charge_billing_event(
                 billing_context=billing_context,
@@ -4056,7 +4287,7 @@ class Pipeline:
                 },
             )
             try:
-                response = self._post_agent_payload(payload)
+                response = self._post_agent_payload(payload, model_name=model_name)
             except RuntimeError as exc:
                 self._refund_billing_event(
                     billing_context=billing_context,
@@ -4064,32 +4295,49 @@ class Pipeline:
                     description="LLM 请求失败，已退款",
                     meta={"mode": "agent", "error": str(exc)[:500]},
                 )
+                if tool_observations:
+                    return self._fallback_answer_from_tool_observations(tool_observations, error=str(exc))
                 raise
             content = self._extract_assistant_content(response)
-            tool_calls = self._extract_tool_calls(content)
+            assistant_message = self._extract_assistant_message(response)
+            native_tool_calls = self._extract_response_tool_calls(response)
+            text_tool_calls = [] if native_tool_calls else self._extract_tool_calls(content, model_name=model_name)
+            tool_calls = native_tool_calls or text_tool_calls
 
             if not tool_calls:
-                cleaned = self._clean_agent_content(content)
+                cleaned = self._clean_agent_content(content, model_name=model_name)
                 if cleaned:
                     return cleaned
-                if self._agent_stream_contains_internal_markup(content):
+                if self._agent_stream_contains_internal_markup(content, model_name=model_name):
                     return "已完成分析，但未生成可展示的结果，请重试。"
                 return str(content or "").strip()
 
-            conversation.append({"role": "assistant", "content": content})
+            conversation.append(assistant_message if native_tool_calls else {"role": "assistant", "content": content})
 
             tool_results = []
             for tool_call in tool_calls:
-                result = self._execute_tool_call(tool_call, billing_context)
-                tool_results.append(
-                    TOOL_RESULT_TEMPLATE.format(
-                        tool_name=tool_call["name"],
-                        arguments=json.dumps(tool_call.get("parameters") or {}, ensure_ascii=False),
-                        result=result,
+                result = self._execute_tool_call(tool_call, billing_context, truncate=False)
+                observation = self._build_tool_observation(tool_call=tool_call, result=result)
+                tool_observations.append(observation)
+                if native_tool_calls and tool_call.get("tool_call_id"):
+                    conversation.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": str(tool_call.get("tool_call_id")),
+                            "content": observation["llm_result"],
+                        }
                     )
-                )
+                else:
+                    tool_results.append(
+                        TOOL_RESULT_TEMPLATE.format(
+                            tool_name=tool_call["name"],
+                            arguments=json.dumps(tool_call.get("parameters") or {}, ensure_ascii=False),
+                            result=observation["llm_result"],
+                        )
+                    )
 
-            conversation.append({"role": "user", "content": "\n\n".join(tool_results)})
+            if tool_results:
+                conversation.append({"role": "user", "content": "\n\n".join(tool_results)})
 
         raise RuntimeError("Agent 工具调用轮次超过上限，已中止。")
 
@@ -4287,8 +4535,8 @@ class Pipeline:
         )
         return any(normalized.startswith(prefix) for prefix in error_prefixes)
 
-    def _post_agent_payload(self, payload: dict) -> dict:
-        provider = self._get_provider()
+    def _post_agent_payload(self, payload: dict, model_name: str) -> dict:
+        provider = self._get_provider(model_name)
         return self._chat_backend_request(
             method="POST",
             path=provider.chat_completions_path(),
@@ -4297,17 +4545,23 @@ class Pipeline:
             timeout=self.valves.DIFY_REQUEST_TIMEOUT,
         )
 
-    def _stream_agent_final_answer_chunks(self, payload: dict, fallback_content: str) -> Iterator[str]:
+    def _stream_agent_final_answer_chunks(self, payload: dict, fallback_content: str, model_name: str) -> Iterator[str]:
+        provider = self._get_provider(model_name)
         stream_payload = dict(payload)
         stream_payload["stream"] = True
         streamed = False
         stream_state = {"pending": "", "in_think": False, "blocked": False}
         emitted_parts: List[str] = []
-        fallback_text = self._clean_agent_content(fallback_content or "已完成，但未返回可展示的结果。")
+        fallback_text = self._clean_agent_content(fallback_content or "已完成，但未返回可展示的结果。", model_name=model_name)
+
+        if not provider.supports_streaming_final_answer():
+            for chunk in self._split_text(fallback_text):
+                yield chunk
+            return
 
         try:
             with self._chat_backend_stream_request(
-                path=self._get_provider().chat_completions_stream_path(),
+                path=provider.chat_completions_stream_path(),
                 body={"payload": stream_payload},
             ) as response:
                 response.raise_for_status()
@@ -4315,7 +4569,7 @@ class Pipeline:
                     chunk = self._extract_openai_stream_delta_text(event)
                     if not chunk:
                         continue
-                    cleaned_chunk = self._consume_agent_stream_text(stream_state, chunk)
+                    cleaned_chunk = self._consume_agent_stream_text(stream_state, chunk, model_name=model_name)
                     if not cleaned_chunk:
                         continue
                     streamed = True
@@ -4324,7 +4578,7 @@ class Pipeline:
         except RuntimeError as exc:
             print("xiamimate.agent final stream failed", str(exc))
 
-        flushed_chunk = self._flush_agent_stream_text(stream_state)
+        flushed_chunk = self._flush_agent_stream_text(stream_state, model_name=model_name)
         if flushed_chunk:
             streamed = True
             emitted_parts.append(flushed_chunk)
@@ -4346,12 +4600,12 @@ class Pipeline:
         for chunk in self._split_text(final_text):
             yield chunk
 
-    def _consume_agent_stream_text(self, state: dict, chunk: str) -> str:
+    def _consume_agent_stream_text(self, state: dict, chunk: str, model_name: str) -> str:
         if state.get("blocked"):
             return ""
 
         pending = "%s%s" % (state.get("pending") or "", chunk or "")
-        if self._agent_stream_contains_internal_markup(pending):
+        if self._agent_stream_contains_internal_markup(pending, model_name=model_name):
             state["pending"] = ""
             state["in_think"] = False
             state["blocked"] = True
@@ -4391,7 +4645,7 @@ class Pipeline:
         state["in_think"] = in_think
         return "".join(emitted)
 
-    def _flush_agent_stream_text(self, state: dict) -> str:
+    def _flush_agent_stream_text(self, state: dict, model_name: str) -> str:
         if state.get("blocked"):
             state["pending"] = ""
             return ""
@@ -4400,7 +4654,7 @@ class Pipeline:
             return ""
         pending = str(state.get("pending") or "")
         state["pending"] = ""
-        return self._clean_agent_content(pending)
+        return self._clean_agent_content(pending, model_name=model_name)
 
     def _extract_assistant_content(self, response: dict) -> str:
         choices = response.get("choices") or []
@@ -4409,7 +4663,46 @@ class Pipeline:
         message = choices[0].get("message") or {}
         return str(message.get("content") or "")
 
-    def _extract_tool_calls(self, content: str) -> List[Dict[str, Any]]:
+    def _extract_assistant_message(self, response: dict) -> dict:
+        choices = response.get("choices") or []
+        message = choices[0].get("message") if choices and isinstance(choices[0].get("message"), dict) else {}
+        assistant_message = {"role": "assistant", "content": str(message.get("content") or "")}
+        for key in ("reasoning_content", "tool_calls"):
+            value = message.get(key)
+            if value not in (None, "", [], {}):
+                assistant_message[key] = value
+        return assistant_message
+
+    def _extract_response_tool_calls(self, response: dict) -> List[Dict[str, Any]]:
+        choices = response.get("choices") or []
+        if not choices:
+            return []
+        message = choices[0].get("message") or {}
+        tool_calls = message.get("tool_calls") if isinstance(message.get("tool_calls"), list) else []
+        parsed_calls: List[Dict[str, Any]] = []
+        for raw_call in tool_calls:
+            if not isinstance(raw_call, dict):
+                continue
+            function = raw_call.get("function") if isinstance(raw_call.get("function"), dict) else {}
+            arguments = function.get("arguments")
+            params: Dict[str, Any] = {}
+            if isinstance(arguments, str) and arguments.strip():
+                try:
+                    decoded = json.loads(arguments)
+                    if isinstance(decoded, dict):
+                        params = decoded
+                except ValueError:
+                    params = {}
+            elif isinstance(arguments, dict):
+                params = arguments
+            normalized = self._normalize_tool_call(name=str(function.get("name") or raw_call.get("name") or ""), parameters=params)
+            if normalized:
+                if raw_call.get("id"):
+                    normalized["tool_call_id"] = str(raw_call.get("id"))
+                parsed_calls.append(normalized)
+        return parsed_calls
+
+    def _extract_tool_calls(self, content: str, model_name: str) -> List[Dict[str, Any]]:
         calls: List[Dict[str, Any]] = []
         text = content or ""
 
@@ -4419,9 +4712,11 @@ class Pipeline:
         calls.extend(self._extract_hash_arrow_tool_calls(text))
         calls.extend(self._extract_colon_args_tool_calls(text))
         calls.extend(self._extract_function_style_tool_calls(text))
+        calls.extend(self._extract_xml_tool_calls(text))
+        calls.extend(self._extract_tool_calls_variable(text))
 
         # ── Provider-specific tool call formats ──
-        provider = self._get_provider()
+        provider = self._get_provider(model_name)
         for pc in provider.extract_provider_tool_calls(text):
             normalized = self._normalize_tool_call(name=pc.get("name", ""), parameters=pc.get("parameters", {}))
             if normalized:
@@ -4614,32 +4909,68 @@ class Pipeline:
     def _extract_function_style_tool_calls(self, content: str) -> List[Dict[str, Any]]:
         calls: List[Dict[str, Any]] = []
         text = content or ""
-        tool_name_pattern = "|".join(re.escape(name) for name in sorted(ALLOWED_AGENT_TOOLS))
-        pattern = re.compile(r"\b(%s)\s*\((.*?)\)" % tool_name_pattern, flags=re.DOTALL)
+        tool_aliases = sorted(ALLOWED_AGENT_TOOLS | {name.replace("_", "-") for name in ALLOWED_AGENT_TOOLS}, key=len, reverse=True)
+        tool_name_pattern = "|".join(re.escape(name) for name in tool_aliases)
+        pattern = re.compile(r"\$?\b(%s)\s*\((.*?)\)" % tool_name_pattern, flags=re.DOTALL)
 
         for tool_name, args_text in pattern.findall(text):
-            parsed = self._parse_function_style_tool_call(tool_name, args_text)
+            parsed = self._parse_function_style_tool_call(tool_name.replace("-", "_"), args_text)
             if parsed:
                 calls.append(parsed)
 
         return calls
 
-    def _extract_minimax_invoke_tool_calls(self, content: str) -> List[Dict[str, Any]]:
+    def _extract_xml_tool_calls(self, content: str) -> List[Dict[str, Any]]:
         calls: List[Dict[str, Any]] = []
         text = content or ""
+        decoder = json.JSONDecoder()
+        pattern = re.compile(r'<tool\s+name=["\']([^"\']+)["\']\s*>\s*(.*?)\s*</tool>', flags=re.DOTALL | re.IGNORECASE)
 
-        pattern = re.compile(
-            r'<invoke name="([^"]+)"\s*>?\s*(.*?)\s*</invoke>',
-            flags=re.DOTALL,
-        )
-
-        for tool_name, block in pattern.findall(text):
-            params = {}
-            for key, value in re.findall(r'<?parameter name="([^"]+)">(.*?)</parameter>', block, flags=re.DOTALL):
-                params[key] = value.strip()
+        for tool_name, raw_params in pattern.findall(text):
+            params: Dict[str, Any] = {}
+            stripped = raw_params.strip()
+            if stripped:
+                try:
+                    decoded, _ = decoder.raw_decode(stripped)
+                    if isinstance(decoded, dict):
+                        params = decoded
+                except json.JSONDecodeError:
+                    params = self._parse_tool_parameter_block(stripped)
             parsed = self._normalize_tool_call(name=tool_name, parameters=params)
             if parsed:
                 calls.append(parsed)
+
+        return calls
+
+    def _extract_tool_calls_variable(self, content: str) -> List[Dict[str, Any]]:
+        calls: List[Dict[str, Any]] = []
+        text = content or ""
+        decoder = json.JSONDecoder()
+
+        for match in re.finditer(r"\$TOOL_CALLS\s*=\s*", text, flags=re.IGNORECASE):
+            array_start = text.find("[", match.end())
+            if array_start < 0:
+                continue
+            try:
+                payload, _ = decoder.raw_decode(text[array_start:])
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, list):
+                continue
+            for raw_call in payload:
+                if not isinstance(raw_call, dict):
+                    continue
+                tool_name = str(
+                    raw_call.get("toolkit-name")
+                    or raw_call.get("toolkit_name")
+                    or raw_call.get("tool_name")
+                    or raw_call.get("name")
+                    or ""
+                ).strip()
+                params = raw_call.get("args") or raw_call.get("arguments") or raw_call.get("parameters") or {}
+                parsed = self._normalize_tool_call(name=tool_name, parameters=params if isinstance(params, dict) else {})
+                if parsed:
+                    calls.append(parsed)
 
         return calls
 
@@ -4804,7 +5135,7 @@ class Pipeline:
         return self._normalize_tool_call(name=function_name, parameters=params if isinstance(params, dict) else {})
 
     def _normalize_tool_call(self, name: str, parameters: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        tool_name = (name or "").strip()
+        tool_name = (name or "").strip().replace("-", "_")
         if tool_name not in ALLOWED_AGENT_TOOLS:
             return None
 
@@ -4834,6 +5165,7 @@ class Pipeline:
             "resolve_candidates": {
                 "query": "product_query",
                 "category": "product_query",
+                "keywords": "product_query",
                 "product": "product_query",
                 "product_keyword": "product_query",
                 "market": "marketplace",
@@ -4886,6 +5218,7 @@ class Pipeline:
             },
             "asin_history_timeseries": {
                 "asin": "asins",
+                "as_i_n": "asins",
                 "asin_code": "asins",
                 "asin_codes": "asins",
                 "asin_list": "asins",
@@ -4896,6 +5229,7 @@ class Pipeline:
                 "category": "product_query",
                 "product": "product_query",
                 "product_keyword": "product_query",
+                "domain": "marketplace",
                 "market": "marketplace",
             },
             "category_benchmark": {
@@ -4907,6 +5241,17 @@ class Pipeline:
                 "category": "product_query",
                 "product": "product_query",
                 "product_keyword": "product_query",
+                "market": "marketplace",
+            },
+            "keepa_asin_lookup": {
+                "asin": "asins",
+                "as_i_n": "asins",
+                "asin_code": "asins",
+                "asin_codes": "asins",
+                "asin_list": "asins",
+                "candidate_asins": "asins",
+                "candidate_list": "asins",
+                "domain": "marketplace",
                 "market": "marketplace",
             },
         }
@@ -4922,6 +5267,10 @@ class Pipeline:
         if tool_name == "search_knowledge_base" and isinstance(normalized_params.get("query"), list):
             normalized_params["query"] = " ".join(
                 str(item).strip() for item in normalized_params["query"] if str(item).strip()
+            )
+        if tool_name == "resolve_candidates" and isinstance(normalized_params.get("product_query"), list):
+            normalized_params["product_query"] = " ".join(
+                str(item).strip() for item in normalized_params["product_query"] if str(item).strip()
             )
 
         method = getattr(self.agent_tools, tool_name, None) if self.agent_tools is not None else None
@@ -4977,6 +5326,9 @@ class Pipeline:
         compact = re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_").upper()
         direct_map = {
             "GB": "UK",
+            "COM": "US",
+            "AMAZON_COM": "US",
+            "US_COM": "US",
         }
         known_codes = {"US", "UK", "DE", "FR", "JP", "CA", "IT", "ES", "IN", "MX", "BR", "AU"}
 
@@ -5037,7 +5389,7 @@ class Pipeline:
                 return text
         return text
 
-    def _execute_tool_call(self, tool_call: Dict[str, Any], billing_context: dict) -> str:
+    def _execute_tool_call(self, tool_call: Dict[str, Any], billing_context: dict, truncate: bool = True) -> str:
         tool_name = tool_call["name"]
         parameters = tool_call.get("parameters") or {}
         method = getattr(self.agent_tools, tool_name, None) if self.agent_tools is not None else None
@@ -5081,18 +5433,458 @@ class Pipeline:
                 description="工具调用异常：%s" % self._tool_name_label(tool_name),
                 meta={"tool_name": tool_name, "result_preview": result_text[:500]},
             )
-        if len(result_text) > 12000:
+        if truncate and len(result_text) > 12000:
             return "%s\n\n[结果已截断，原始长度 %d 字符]" % (result_text[:12000], len(result_text))
         return result_text
 
-    def _agent_stream_contains_internal_markup(self, text: str) -> bool:
-        return self._get_provider().has_internal_markup(text)
+    def _build_tool_observation(self, tool_call: Dict[str, Any], result: str) -> dict:
+        return {
+            "tool_name": str(tool_call.get("name") or ""),
+            "arguments": tool_call.get("parameters") or {},
+            "raw_result": str(result or ""),
+            "llm_result": self._format_tool_result_for_llm(tool_name=str(tool_call.get("name") or ""), result=result),
+        }
 
-    def _strip_agent_internal_markup(self, content: str) -> str:
-        return self._get_provider().strip_internal_markup(content)
+    def _format_tool_result_for_llm(self, tool_name: str, result: str, budget: int = 9000) -> str:
+        result_text = str(result or "").strip()
+        if not result_text:
+            return "工具返回为空。"
+        if self._tool_result_has_error(result_text):
+            return result_text[:budget]
 
-    def _clean_agent_content(self, content: str) -> str:
-        return self._strip_agent_internal_markup(content)
+        payload = self._load_tool_json_payload(result_text)
+        if payload is None:
+            return self._truncate_text_for_llm(result_text, budget=budget)
+
+        compact_payload = self._compact_tool_payload_for_llm(
+            tool_name=tool_name,
+            payload=payload,
+            max_depth=5,
+            max_items=12,
+            max_scalar_items=40,
+            max_string=700,
+        )
+        envelope = {
+            "tool_name": tool_name,
+            "result_format": "compacted_json",
+            "original_chars": len(result_text),
+            "compaction_note": "Large arrays/strings may be shortened; use visible counts and omitted markers when reasoning.",
+            "payload": compact_payload,
+        }
+        rendered = json.dumps(envelope, ensure_ascii=False, indent=2)
+        if len(rendered) <= budget:
+            return rendered
+
+        compact_payload = self._compact_tool_payload_for_llm(
+            tool_name=tool_name,
+            payload=payload,
+            max_depth=4,
+            max_items=6,
+            max_scalar_items=30,
+            max_string=350,
+        )
+        envelope["payload"] = compact_payload
+        rendered = json.dumps(envelope, ensure_ascii=False, indent=2)
+        if len(rendered) <= budget:
+            return rendered
+
+        if str(tool_name or "") == "resolve_candidates":
+            for item_limit, string_limit in ((6, 80), (6, 60), (6, 32), (6, 24), (4, 120), (2, 120), (1, 120)):
+                compact_payload = self._compact_candidate_pool_payload(payload, max_items=item_limit, max_string=string_limit)
+                envelope["payload"] = compact_payload
+                rendered = json.dumps(envelope, ensure_ascii=False, indent=2)
+                if len(rendered) <= budget:
+                    return rendered
+
+        return self._truncate_text_for_llm(rendered, budget=budget)
+
+    def _compact_tool_payload_for_llm(
+        self,
+        tool_name: str,
+        payload: dict,
+        *,
+        max_depth: int,
+        max_items: int,
+        max_scalar_items: int,
+        max_string: int,
+    ) -> Any:
+        normalized_tool = str(tool_name or "").strip()
+        if normalized_tool == "resolve_candidates":
+            return self._compact_candidate_pool_payload(payload, max_items=max_items, max_string=max_string)
+        if normalized_tool == "asin_history_timeseries":
+            return self._compact_asin_history_payload(payload, max_items=max_items, max_string=max_string)
+        return self._compact_json_value(
+            payload,
+            max_depth=max_depth,
+            max_items=max_items,
+            max_scalar_items=max_scalar_items,
+            max_string=max_string,
+        )
+
+    def _compact_candidate_pool_payload(self, payload: dict, *, max_items: int, max_string: int) -> dict:
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        if not data:
+            return self._compact_json_value(payload, max_depth=4, max_items=max_items, max_scalar_items=30, max_string=max_string)
+
+        compact_data = self._copy_keys(
+            data,
+            [
+                "marketplace",
+                "domain",
+                "raw_product_query",
+                "normalized_query",
+                "candidate_count",
+                "candidate_total_before_truncate",
+                "candidate_total_before_semantic_category_anchor",
+                "semantic_fine_category_anchor_applied",
+                "semantic_category_anchor_applied",
+                "candidate_sql_prefilter_count",
+                "candidate_sql_prefilter_limit",
+                "candidate_sql_prefilter_truncated",
+                "truncated",
+                "query_phrases",
+                "query_tokens",
+                "required_product_terms",
+                "candidate_asins",
+                "matched_categories",
+                "matched_leaf_categories",
+                "matched_fine_categories",
+                "matched_root_categories",
+            ],
+        )
+
+        matched_keywords = data.get("matched_keywords")
+        if isinstance(matched_keywords, list):
+            compact_data["matched_keywords"] = self._compact_json_value(
+                matched_keywords,
+                max_depth=2,
+                max_items=10,
+                max_scalar_items=10,
+                max_string=80,
+            )
+
+        query_normalization = data.get("query_normalization")
+        if isinstance(query_normalization, dict):
+            compact_query_normalization = self._copy_keys(
+                query_normalization,
+                [
+                    "mode",
+                    "llm_used",
+                    "pipeline_mode",
+                    "pipeline_llm_used",
+                    "llm_language",
+                    "llm_confidence",
+                    "llm_error",
+                    "normalized_product_query",
+                    "normalized_query_aliases",
+                    "normalized_category_hints",
+                ],
+            )
+            for stage_key in ["theme_extraction", "recall_normalization"]:
+                stage = query_normalization.get(stage_key)
+                if isinstance(stage, dict):
+                    compact_query_normalization[stage_key] = self._copy_keys(
+                        stage,
+                        [
+                            "mode",
+                            "llm_used",
+                            "llm_language",
+                            "llm_confidence",
+                            "llm_error",
+                            "extracted_theme",
+                            "normalized_product_query",
+                            "extracted_query_aliases",
+                            "normalized_query_aliases",
+                            "extracted_category_hints",
+                            "normalized_category_hints",
+                        ],
+                    )
+            compact_data["query_normalization"] = self._compact_json_value(
+                compact_query_normalization,
+                max_depth=3,
+                max_items=8,
+                max_scalar_items=16,
+                max_string=120,
+            )
+
+        ranking_policy = data.get("ranking_policy")
+        if isinstance(ranking_policy, dict):
+            compact_ranking_policy = self._copy_keys(
+                ranking_policy,
+                ["primary_sort", "match_score_components", "matched_fields", "note"],
+            )
+            if isinstance(compact_ranking_policy.get("note"), str):
+                compact_ranking_policy["note"] = self._truncate_text_for_llm(compact_ranking_policy["note"], budget=140)
+            compact_data["ranking_policy"] = self._compact_json_value(
+                compact_ranking_policy,
+                max_depth=3,
+                max_items=8,
+                max_scalar_items=16,
+                max_string=140,
+            )
+
+        timing_ms = data.get("timing_ms")
+        if isinstance(timing_ms, dict):
+            compact_data["timing_ms"] = self._copy_keys(
+                timing_ms,
+                ["query_normalization", "domain_candidate_fetch", "scoring_and_sorting", "total"],
+            )
+
+        recall_notes = data.get("recall_notes")
+        if isinstance(recall_notes, list):
+            compact_data["recall_notes"] = self._compact_json_value(
+                recall_notes,
+                max_depth=2,
+                max_items=3,
+                max_scalar_items=3,
+                max_string=160,
+            )
+
+        candidate_items = data.get("candidate_items") if isinstance(data.get("candidate_items"), list) else []
+        candidate_item_limit = min(50, max(max_items, len(candidate_items))) if max_items >= 12 else min(max_items, len(candidate_items))
+        compact_data["candidate_items"] = [
+            self._compact_candidate_item(item, max_string=max_string)
+            for item in candidate_items[:candidate_item_limit]
+            if isinstance(item, dict)
+        ]
+        compact_data["candidate_items_visible_count"] = len(
+            [item for item in compact_data["candidate_items"] if isinstance(item, dict) and item.get("asin")]
+        )
+        compact_data["candidate_pool_contract"] = {
+            "candidate_asins": "full ranked ASIN pool for downstream tools such as candidate_pool_stats/trends/weak_forecast",
+            "candidate_items": "budgeted visible details for reasoning/filtering; omitted details do not remove ASINs from the pool",
+        }
+        if len(candidate_items) > candidate_item_limit:
+            compact_data["candidate_items"].append({"_omitted_items": len(candidate_items) - candidate_item_limit, "_total_items": len(candidate_items)})
+
+        compact_payload = self._copy_keys(payload, ["success", "code", "message"])
+        compact_payload["data"] = compact_data
+        return compact_payload
+
+    def _compact_candidate_item(self, item: dict, *, max_string: int) -> dict:
+        candidate_string_limit = min(max_string, 160)
+        compact_item = self._copy_keys(
+            item,
+            [
+                "asin",
+                "brand",
+                "product_title",
+                "category",
+                "category_path",
+                "root_category_name",
+                "category_l2_name",
+                "category_l3_name",
+                "leaf_category_name",
+                "fine_category_name",
+                "current_price",
+                "current_rating",
+                "current_review_count",
+                "current_bsr",
+                "history_rows_30d",
+                "latest_history_date",
+                "sql_prefilter_score",
+                "match_score",
+                "match_reasons",
+            ],
+        )
+        return self._compact_json_value(compact_item, max_depth=3, max_items=8, max_scalar_items=16, max_string=candidate_string_limit)
+
+    def _compact_asin_history_payload(self, payload: dict, *, max_items: int, max_string: int) -> dict:
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        if not data:
+            return self._compact_json_value(payload, max_depth=4, max_items=max_items, max_scalar_items=30, max_string=max_string)
+
+        compact_data = self._copy_keys(
+            data,
+            [
+                "marketplace",
+                "domain",
+                "window_days",
+                "interval",
+                "metrics",
+                "source_preference",
+                "requested_asin_count",
+                "local_history_hit_count",
+                "missing_local_history_asin_count",
+                "fallback_keepa_snapshot",
+            ],
+        )
+        items = data.get("items") if isinstance(data.get("items"), list) else []
+        compact_data["items"] = [
+            self._compact_asin_history_item(item, max_string=max_string)
+            for item in items[:max_items]
+            if isinstance(item, dict)
+        ]
+        if len(items) > max_items:
+            compact_data["items"].append({"_omitted_items": len(items) - max_items, "_total_items": len(items)})
+
+        compact_payload = self._copy_keys(payload, ["success", "code", "message"])
+        compact_payload["data"] = compact_data
+        return compact_payload
+
+    def _compact_asin_history_item(self, item: dict, *, max_string: int) -> dict:
+        latest_snapshot = item.get("latest_snapshot") if isinstance(item.get("latest_snapshot"), dict) else {}
+        window_summary = item.get("window_summary") if isinstance(item.get("window_summary"), dict) else {}
+        compact_item = self._copy_keys(item, ["asin", "history_status"])
+        compact_item["latest_snapshot"] = self._compact_json_value(
+            self._copy_keys(
+                latest_snapshot,
+                [
+                    "asin",
+                    "product_title",
+                    "brand",
+                    "category",
+                    "category_path",
+                    "l3_category_name",
+                    "leaf_category_name",
+                    "effective_price",
+                    "rating",
+                    "review_count",
+                    "offer_count",
+                    "bsr",
+                    "estimated_daily_sales",
+                    "latest_date",
+                    "source",
+                ],
+            ),
+            max_depth=3,
+            max_items=8,
+            max_scalar_items=16,
+            max_string=max_string,
+        )
+        compact_item["window_summary"] = self._compact_json_value(
+            self._copy_keys(
+                window_summary,
+                [
+                    "sales_window_sum",
+                    "sales_daily_avg",
+                    "price_min_window",
+                    "price_max_window",
+                    "review_growth_window",
+                    "offer_count_avg_window",
+                    "bsr_avg_window",
+                    "series_row_count",
+                    "coverage_ratio",
+                ],
+            ),
+            max_depth=2,
+            max_items=8,
+            max_scalar_items=16,
+            max_string=max_string,
+        )
+        if isinstance(item.get("series"), list):
+            compact_item["series"] = self._compact_series_items(item["series"], max_string=max_string)
+        return compact_item
+
+    def _copy_keys(self, source: dict, keys: List[str]) -> dict:
+        return {key: source[key] for key in keys if key in source and source[key] not in (None, "", [], {})}
+
+    def _compact_json_value(
+        self,
+        value: Any,
+        *,
+        max_depth: int,
+        max_items: int,
+        max_scalar_items: int,
+        max_string: int,
+        depth: int = 0,
+    ) -> Any:
+        if depth >= max_depth:
+            return self._compact_leaf_value(value, max_string=max_string)
+
+        if isinstance(value, dict):
+            compacted = {}
+            for key, nested_value in value.items():
+                if str(key) == "series" and isinstance(nested_value, list):
+                    compacted[str(key)] = self._compact_series_items(nested_value, max_string=max_string)
+                    continue
+                compacted[str(key)] = self._compact_json_value(
+                    nested_value,
+                    max_depth=max_depth,
+                    max_items=max_items,
+                    max_scalar_items=max_scalar_items,
+                    max_string=max_string,
+                    depth=depth + 1,
+                )
+            return compacted
+
+        if isinstance(value, list):
+            item_limit = max_scalar_items if all(not isinstance(item, (dict, list)) for item in value) else max_items
+            compacted_items = [
+                self._compact_json_value(
+                    item,
+                    max_depth=max_depth,
+                    max_items=max_items,
+                    max_scalar_items=max_scalar_items,
+                    max_string=max_string,
+                    depth=depth + 1,
+                )
+                for item in value[:item_limit]
+            ]
+            if len(value) > item_limit:
+                compacted_items.append({"_omitted_items": len(value) - item_limit, "_total_items": len(value)})
+            return compacted_items
+
+        return self._compact_leaf_value(value, max_string=max_string)
+
+    def _compact_series_items(self, items: List[Any], *, max_string: int) -> dict:
+        first_items = items[:2]
+        last_items = items[-2:] if len(items) > 2 else []
+        return {
+            "_compacted_series": True,
+            "total_items": len(items),
+            "first_items": [self._compact_leaf_value(item, max_string=max_string) for item in first_items],
+            "last_items": [self._compact_leaf_value(item, max_string=max_string) for item in last_items],
+        }
+
+    def _compact_leaf_value(self, value: Any, *, max_string: int) -> Any:
+        if isinstance(value, str) and len(value) > max_string:
+            return "%s...[truncated %d chars]" % (value[:max_string], len(value) - max_string)
+        return value
+
+    def _truncate_text_for_llm(self, text: str, budget: int) -> str:
+        if len(text) <= budget:
+            return text
+        return "%s\n\n[结果已压缩截断，原始长度 %d 字符]" % (text[:budget], len(text))
+
+    def _fallback_answer_from_tool_observations(self, tool_observations: List[dict], error: str = "") -> str:
+        lines = [
+            "工具已经执行完成，但模型整理最终答复时失败；先返回工具结果摘要，方便继续分析。",
+        ]
+        if error:
+            lines.append("失败原因：%s" % str(error).strip()[:500])
+        for index, observation in enumerate(tool_observations[-3:], start=1):
+            lines.extend(
+                [
+                    "",
+                    "### 工具结果 %d：%s" % (index, observation.get("tool_name") or "unknown"),
+                    "参数：`%s`" % json.dumps(observation.get("arguments") or {}, ensure_ascii=False),
+                    "```json",
+                    str(observation.get("llm_result") or "")[:9000],
+                    "```",
+                ]
+            )
+        return "\n".join(lines)
+
+    def _agent_stream_contains_internal_markup(self, text: str, model_name: str) -> bool:
+        return self._get_provider(model_name).has_internal_markup(text)
+
+    def _strip_agent_internal_markup(self, content: str, model_name: str) -> str:
+        return self._get_provider(model_name).strip_internal_markup(content)
+
+    def _clean_agent_content(self, content: str, model_name: str) -> str:
+        cleaned = self._strip_agent_internal_markup(content, model_name=model_name)
+        return self._strip_agent_function_tool_markup(cleaned)
+
+    def _strip_agent_function_tool_markup(self, content: str) -> str:
+        text = content or ""
+        tool_aliases = sorted(ALLOWED_AGENT_TOOLS | {name.replace("_", "-") for name in ALLOWED_AGENT_TOOLS}, key=len, reverse=True)
+        tool_name_pattern = "|".join(re.escape(name) for name in tool_aliases)
+        text = re.sub(r"\$TOOL_CALLS\s*=\s*\[.*?\](?=\s*\$ABORT_CONTROLLER|\s*\$TOOL_CALLS|\s*$)", "", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"\$ABORT_CONTROLLER\s*=\s*[^\n$]*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\$?\b(?:%s)\s*\([^)]*\)" % tool_name_pattern, "", text, flags=re.DOTALL)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
 
     def _disable_web_search_feature(self, body: dict) -> None:
         features = body.get("features")

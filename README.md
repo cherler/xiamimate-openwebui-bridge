@@ -24,6 +24,7 @@
 2. 上游 Dify、MiniMax 与 Theme API 密钥继续由 `chat_backend` 统一承接，本仓只保留 `CHAT_BACKEND_*` 接入参数。
 3. 当前 bridge 默认指向正式 `chat-backend`：`http://host.docker.internal:8200`。
 4. Portal / 使用指南页右下角的 Dify 智能客服现在通过 bridge 的 `/_dify/` 统一代理暴露，默认回源 `DIFY_CHATBOT_BASE_URL=http://host.docker.internal:80`；如果 Dify 实际在别的端口或 SSH 隧道后面，需要在 `.env` 中覆盖这个值。
+5. Agent 现支持双模型线路：`AGENT_OPENAI_MODEL` 对应 DeepSeek OpenAI-compatible 路径，`AGENT_ANTHROPIC_MODEL` 对应 MiniMax Anthropic-compatible 路径；通过 `AGENT_MODEL_DEFAULT_PROFILE` 与 `AGENT_MODEL_PROFILES` 控制默认模型和可选模型列表。
 
 推荐启动方式：
 

@@ -17,7 +17,6 @@ Usage inside Pipeline:
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Any, Dict, List, Optional, Set
 
@@ -50,6 +49,9 @@ class ProviderStrategy:
     def chat_completions_stream_path(self) -> str:
         raise NotImplementedError
 
+    def supports_streaming_final_answer(self) -> bool:
+        return True
+
     # ── tool-call extraction ──
 
     def extract_provider_tool_calls(self, content: str) -> List[Dict[str, Any]]:
@@ -69,9 +71,15 @@ class ProviderStrategy:
         "[tool_call]",
         "[/tool_call]",
         "$tool_call$",
+        "$tool_calls",
         "$end$",
+        "$abort_controller",
         "<tool_response>",
         "</tool_response>",
+        "<tools>",
+        "</tools>",
+        "<tool name=",
+        "</tool>",
         "<invoke name=",
         "$params =",
     )
@@ -93,7 +101,11 @@ class ProviderStrategy:
         text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r"\[TOOL_CALL\].*?\[/TOOL_CALL\]", "", text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r"\$TOOL_CALL\$.*?\$END\$", "", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"\$TOOL_CALLS\s*=\s*\[.*?\](?=\s*\$ABORT_CONTROLLER|\s*\$TOOL_CALLS|\s*$)", "", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"\$ABORT_CONTROLLER\s*=\s*[^\n$]*", "", text, flags=re.IGNORECASE)
         text = re.sub(r"<tool_response>.*?</tool_response>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<tools>.*?</tools>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<tool\s+name=["\'][^"\']+["\']\s*>.*?</tool>', "", text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r"\$PARAMS\s*=\s*\{.*?\}\s*[A-Za-z_][A-Za-z0-9_]*\(\$PARAMS\)", "", text, flags=re.DOTALL)
         text = re.sub(r'<invoke name="[^"]+">.*?</invoke>', "", text, flags=re.DOTALL | re.IGNORECASE)
         text = self._strip_provider_markup(text)
@@ -103,77 +115,6 @@ class ProviderStrategy:
 
     def _strip_provider_markup(self, text: str) -> str:
         """Override in subclasses for provider-specific regex cleanup."""
-        return text
-
-
-# ---------------------------------------------------------------------------
-# MiniMax
-# ---------------------------------------------------------------------------
-
-class MiniMaxProvider(ProviderStrategy):
-    """MiniMax (MiniMax-M2.7-highspeed etc.)
-
-    - Does NOT support: response_format, max_completion_tokens, logit_bias,
-      seed, n (>1), tools, tool_choice, stream_options.
-    - Uses custom XML tool-call format: ``<minimax:tool_call><invoke …>``
-    """
-
-    name = "minimax"
-
-    allowed_params: Set[str] = {
-        "messages", "temperature", "top_p", "stream", "stop",
-        "max_tokens", "presence_penalty", "frequency_penalty", "user",
-    }
-
-    def chat_completions_path(self) -> str:
-        return "/internal/provider/minimax/chat-completions"
-
-    def chat_completions_stream_path(self) -> str:
-        return "/internal/provider/minimax/chat-completions/stream"
-
-    # ── MiniMax XML tool calls ──
-
-    _invoke_pattern = re.compile(
-        r'<invoke name="([^"]+)"\s*>?\s*(.*?)\s*</invoke>',
-        flags=re.DOTALL,
-    )
-    _param_pattern = re.compile(
-        r'<?parameter name="([^"]+)">(.*?)</parameter>',
-        flags=re.DOTALL,
-    )
-    _minimax_block = re.compile(
-        r"<minimax:tool_call>\s*(.*?)\s*</minimax:tool_call>",
-        flags=re.DOTALL,
-    )
-
-    def extract_provider_tool_calls(self, content: str) -> List[Dict[str, Any]]:
-        calls: List[Dict[str, Any]] = []
-        text = content or ""
-        for block in self._minimax_block.findall(text):
-            for tool_name, param_block in self._invoke_pattern.findall(block):
-                params = {}
-                for key, value in self._param_pattern.findall(param_block):
-                    params[key] = value.strip()
-                calls.append({"name": tool_name.strip(), "parameters": params})
-        return calls
-
-    # ── markup ──
-
-    def _provider_markers(self) -> tuple:
-        return (
-            "minimax:tool_call",
-            "<minimax:tool_call>",
-            "</minimax:tool_call>",
-        )
-
-    def _strip_provider_markup(self, text: str) -> str:
-        text = re.sub(r"<minimax:tool_call>.*?</minimax:tool_call>", "", text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(
-            r"minimax:tool_call\s*.*?(?=(?:minimax:tool_call|<tool_response>|</tool_call>|</minimax:tool_call>|$))",
-            "",
-            text,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
         return text
 
 
@@ -197,6 +138,7 @@ class OpenAIProvider(ProviderStrategy):
         "user", "seed", "n",
         "response_format", "logit_bias",
         "tools", "tool_choice", "stream_options",
+        "reasoning_effort", "thinking",
     }
 
     def chat_completions_path(self) -> str:
@@ -216,24 +158,61 @@ class OpenAIProvider(ProviderStrategy):
 
 
 # ---------------------------------------------------------------------------
+# Anthropic-compatible (MiniMax M2.7 / Claude-style messages API)
+# ---------------------------------------------------------------------------
+
+class AnthropicProvider(ProviderStrategy):
+    """Anthropic-compatible provider.
+
+    Bridge still sends OpenAI-style messages internally; chat-backend adapts
+    them to Anthropic messages API and maps the response back to an OpenAI-like
+    chat completion object.
+    """
+
+    name = "anthropic"
+
+    allowed_params: Set[str] = {
+        "messages", "temperature", "top_p", "stream", "stop",
+        "max_tokens", "max_completion_tokens",
+        "user", "metadata",
+        "tools", "tool_choice",
+    }
+
+    def chat_completions_path(self) -> str:
+        return "/internal/provider/anthropic/messages"
+
+    def chat_completions_stream_path(self) -> str:
+        return "/internal/provider/anthropic/messages"
+
+    def supports_streaming_final_answer(self) -> bool:
+        return False
+
+    def _provider_markers(self) -> tuple:
+        return ()
+
+    def _strip_provider_markup(self, text: str) -> str:
+        return text
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
 _PROVIDERS: Dict[str, ProviderStrategy] = {}
 
 def _build_registry() -> Dict[str, ProviderStrategy]:
-    minimax = MiniMaxProvider()
     openai = OpenAIProvider()
+    anthropic = AnthropicProvider()
     return {
-        "minimax": minimax,
         "openai": openai,
+        "anthropic": anthropic,
     }
 
 _PROVIDERS = _build_registry()
 
 # Model-name → provider mapping (prefix match, case-insensitive).
 _MODEL_PREFIX_MAP = [
-    ("minimax", "minimax"),
+    ("minimax", "anthropic"),
     ("gpt-", "openai"),
     ("gpt4", "openai"),
     ("gpt5", "openai"),
@@ -241,11 +220,11 @@ _MODEL_PREFIX_MAP = [
     ("o3", "openai"),
     ("o4", "openai"),
     ("deepseek", "openai"),
-    ("claude", "openai"),
+    ("claude", "anthropic"),
     ("qwen", "openai"),
 ]
 
-_DEFAULT_PROVIDER_KEY = "minimax"
+_DEFAULT_PROVIDER_KEY = "openai"
 
 
 def get_provider(model_name: str) -> ProviderStrategy:

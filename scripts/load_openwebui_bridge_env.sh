@@ -47,6 +47,11 @@ set_default_if_missing "CHAT_BACKEND_TRUSTED_ADMIN_SERVICE_NAME" "openwebui-brid
 set_default_if_missing "CHAT_BACKEND_SERVICE_NAME" "open-webui-pipeline"
 set_default_if_missing "DIFY_CHATBOT_BASE_URL" "http://host.docker.internal:80"
 set_default_if_missing "DIFY_REQUEST_TIMEOUT" "180"
-set_default_if_missing "AGENT_OPENAI_MODEL" "MiniMax-M2.7-highspeed"
+set_default_if_missing "AGENT_OPENAI_MODEL" "deepseek-v4-pro"
+set_default_if_missing "AGENT_ANTHROPIC_MODEL" "MiniMax-M2.7-highspeed"
+set_default_if_missing "AGENT_MODEL_DEFAULT_PROFILE" "deepseek"
+set_default_if_missing "AGENT_MODEL_PROFILES" "deepseek,minimax"
+set_default_if_missing "AGENT_MODEL_DEEPSEEK_LABEL" "DeepSeek V4 Pro"
+set_default_if_missing "AGENT_MODEL_MINIMAX_LABEL" "MiniMax M2.7"
 
 export XIAMIMATE_BASELINE_ROOT
