@@ -227,7 +227,6 @@ class Tools:
 
     def opportunity_discovery(
         self,
-        query: str = "",
         marketplace: str = "US",
         platform: str = "Amazon",
         category_id: Optional[int] = None,
@@ -237,12 +236,12 @@ class Tools:
         min_data_confidence: str = "low",
         include_expandable: bool = True,
         include_descendants: bool = True,
+        _memory_profile: Optional[dict] = None,
     ) -> str:
         """Discover product opportunity cards before a user has selected a specific product theme.
 
-        Use this tool for blank opportunity discovery, category-scoped discovery, or as a pre-report step that returns opportunity cards and next_action requests for product theme analysis.
+        Use this tool for spontaneous blank opportunity discovery, broad category-scoped discovery, or as a pre-report step that returns opportunity cards and next_action requests for product theme analysis.
 
-        :param query: Optional product theme or seed keyword. Leave empty for blank/category discovery.
         :param marketplace: Marketplace code such as US, UK, DE, or JP.
         :param platform: Platform name. The MVP currently supports Amazon.
         :param category_id: Optional Keepa category ID to scope discovery.
@@ -257,7 +256,6 @@ class Tools:
         return self._request(
             "/api/product-theme/opportunity-discovery",
             {
-                "query": str(query or "").strip() or None,
                 "marketplace": marketplace,
                 "platform": platform,
                 "category_id": category_id,
@@ -267,6 +265,34 @@ class Tools:
                 "min_data_confidence": min_data_confidence,
                 "include_expandable": include_expandable,
                 "include_descendants": include_descendants,
+                "memory_profile": _memory_profile if isinstance(_memory_profile, dict) and _memory_profile else None,
+            },
+        )
+
+    def opportunity_discovery_job(
+        self,
+        job_id: str = "",
+        marketplace: str = "US",
+        include_result: bool = True,
+        limit: int = 20,
+    ) -> str:
+        """Retrieve stored opportunity discovery evidence by job ID.
+
+        Use this when an opportunity discovery response provides opportunity_discovery_job_id and the agent needs the full cards or structured opportunities without relying on compressed context.
+
+        :param job_id: Opportunity discovery job ID returned by opportunity_discovery.
+        :param marketplace: Marketplace code such as US, UK, DE, or JP.
+        :param include_result: Whether to include the full result payload.
+        :param limit: Maximum recent jobs to list when job_id is empty.
+        :return: JSON response from theme_api.
+        """
+        return self._request(
+            "/api/product-theme/opportunity-discovery-job",
+            {
+                "job_id": str(job_id or "").strip() or None,
+                "marketplace": marketplace,
+                "include_result": include_result,
+                "limit": limit,
             },
         )
 
@@ -422,6 +448,72 @@ class Tools:
             payload["candidate_asins"] = resolved_candidate_asins
 
         return self._request("/api/product-theme/product-forecast-explain", payload)
+
+    def launch_budget_calculator(
+        self,
+        product_theme: str = "",
+        marketplace: str = "US",
+        selling_price: Optional[float] = None,
+        unit_product_cost: Optional[float] = None,
+        landed_cost_per_unit: Optional[float] = None,
+        packaging_cost: Optional[float] = None,
+        inbound_shipping_per_unit: Optional[float] = None,
+        duty_per_unit: Optional[float] = None,
+        fba_fee: Optional[float] = None,
+        referral_fee_rate: Optional[float] = None,
+        coupon_discount_rate: Optional[float] = None,
+        return_rate: Optional[float] = None,
+        fixed_startup_cost: Optional[float] = None,
+        monthly_fixed_cost: Optional[float] = None,
+        monthly_ad_budget: Optional[float] = None,
+        launch_units: Optional[int] = None,
+        launch_months: Optional[int] = None,
+    ) -> str:
+        """Calculate deterministic launch budget, unit economics, and break-even scenarios from explicit assumptions.
+
+        Use this tool whenever users ask about startup capital, launch budget, break-even units, operating runway, or product unit economics. Pass observed product price or user-provided cost assumptions when available; otherwise the tool marks defaults as default_assumption so the final answer can separate facts, assumptions, and hypotheses.
+
+        :param product_theme: Optional product theme or category being planned.
+        :param marketplace: Marketplace code such as US, UK, DE, or JP.
+        :param selling_price: Planned selling price per unit.
+        :param unit_product_cost: Supplier product cost per unit.
+        :param landed_cost_per_unit: Optional all-in landed cost per unit. If provided, it overrides product+packaging+inbound+duty component sum.
+        :param packaging_cost: Packaging cost per unit.
+        :param inbound_shipping_per_unit: Inbound freight or first-mile cost per unit.
+        :param duty_per_unit: Duty/customs cost per unit.
+        :param fba_fee: FBA fulfillment fee per sold unit.
+        :param referral_fee_rate: Platform referral fee rate, e.g. 0.15 for 15%.
+        :param coupon_discount_rate: Planned coupon/promo reserve rate, e.g. 0.10.
+        :param return_rate: Return/refund reserve rate, e.g. 0.08.
+        :param fixed_startup_cost: One-time fixed setup cost.
+        :param monthly_fixed_cost: Recurring fixed operating cost excluding ads.
+        :param monthly_ad_budget: Monthly ad budget during launch.
+        :param launch_units: Initial launch inventory units.
+        :param launch_months: Planning runway in months.
+        :return: JSON response with assumptions, formulas, unit economics, break-even, and launch budget scenarios.
+        """
+        return self._request(
+            "/api/product-theme/launch-budget-calculator",
+            {
+                "product_theme": str(product_theme or "").strip() or None,
+                "marketplace": marketplace,
+                "selling_price": selling_price,
+                "unit_product_cost": unit_product_cost,
+                "landed_cost_per_unit": landed_cost_per_unit,
+                "packaging_cost": packaging_cost,
+                "inbound_shipping_per_unit": inbound_shipping_per_unit,
+                "duty_per_unit": duty_per_unit,
+                "fba_fee": fba_fee,
+                "referral_fee_rate": referral_fee_rate,
+                "coupon_discount_rate": coupon_discount_rate,
+                "return_rate": return_rate,
+                "fixed_startup_cost": fixed_startup_cost,
+                "monthly_fixed_cost": monthly_fixed_cost,
+                "monthly_ad_budget": monthly_ad_budget,
+                "launch_units": launch_units,
+                "launch_months": launch_months,
+            },
+        )
 
     def top_asin_drilldown(
         self,

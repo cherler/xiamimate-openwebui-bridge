@@ -106,6 +106,41 @@ class FakeAgentTools:
         """Query candidate expansion status."""
         return ""
 
+    def opportunity_discovery(
+        self,
+        marketplace: str = "US",
+        category_id: int | None = None,
+        category_path: str = "",
+        limit: int = 10,
+        _memory_profile: dict | None = None,
+    ) -> str:
+        """Discover product opportunity cards."""
+        return ""
+
+    def opportunity_discovery_job(
+        self,
+        job_id: str = "",
+        marketplace: str = "US",
+        include_result: bool = True,
+        limit: int = 20,
+    ) -> str:
+        """Retrieve stored opportunity discovery job evidence."""
+        return ""
+
+    def launch_budget_calculator(
+        self,
+        product_theme: str = "",
+        marketplace: str = "US",
+        selling_price: float | None = None,
+        unit_product_cost: float | None = None,
+        landed_cost_per_unit: float | None = None,
+        monthly_ad_budget: float | None = None,
+        launch_units: int | None = None,
+        launch_months: int | None = None,
+    ) -> str:
+        """Calculate deterministic launch budget and break-even scenarios."""
+        return ""
+
 
 class TextToolOnlyProvider:
     allowed_params = {"messages", "stream", "temperature"}
@@ -207,16 +242,30 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertTrue(any(tool["function"]["name"] == "category_resolve" for tool in observed_payloads[0]["tools"]))
         self.assertTrue(any(tool["function"]["name"] == "expand_candidates" for tool in observed_payloads[0]["tools"]))
         self.assertTrue(any(tool["function"]["name"] == "candidate_expansion_status" for tool in observed_payloads[0]["tools"]))
+        self.assertTrue(any(tool["function"]["name"] == "opportunity_discovery_job" for tool in observed_payloads[0]["tools"]))
+        self.assertTrue(any(tool["function"]["name"] == "launch_budget_calculator" for tool in observed_payloads[0]["tools"]))
         resolve_schema = next(
             tool for tool in observed_payloads[0]["tools"] if tool["function"]["name"] == "resolve_candidates"
+        )["function"]["parameters"]["properties"]
+        opportunity_schema = next(
+            tool for tool in observed_payloads[0]["tools"] if tool["function"]["name"] == "opportunity_discovery"
         )["function"]["parameters"]["properties"]
         self.assertIn("recall_mode", resolve_schema)
         self.assertIn("category_id", resolve_schema)
         self.assertIn("category_path", resolve_schema)
+        self.assertNotIn("query", opportunity_schema)
+        self.assertNotIn("_memory_profile", opportunity_schema)
+        self.assertIn("category_id", opportunity_schema)
+        self.assertIn("category_path", opportunity_schema)
         self.assertIn("leaf_category_name / latest_snapshot.category_path", observed_payloads[0]["messages"][0]["content"])
         self.assertIn("pool_quality.is_sufficient_for_analysis=false", observed_payloads[0]["messages"][0]["content"])
         self.assertIn("candidate_pool_id", observed_payloads[0]["messages"][0]["content"])
         self.assertIn("candidate_expansion_status", observed_payloads[0]["messages"][0]["content"])
+        self.assertIn("opportunity_discovery_job", observed_payloads[0]["messages"][0]["content"])
+        self.assertIn("next_action.request", observed_payloads[0]["messages"][0]["content"])
+        self.assertIn("rank/title/category_path", observed_payloads[0]["messages"][0]["content"])
+        self.assertIn("tool_contract.capability", observed_payloads[0]["messages"][0]["content"])
+        self.assertIn("launch_budget_calculator", observed_payloads[0]["messages"][0]["content"])
 
         second_messages = observed_payloads[1]["messages"]
         assistant_message = next(message for message in second_messages if message.get("role") == "assistant")
@@ -398,6 +447,8 @@ class AgentNativeToolTests(unittest.TestCase):
         )
         payload = {
             "instruction": "优先原样使用 opportunity_cards_text 展示。",
+            "opportunity_discovery_job_id": "odisc_test",
+            "result_ref": {"type": "opportunity_discovery_job", "job_id": "odisc_test"},
             "opportunity_count": 10,
             "opportunity_cards_text": cards_text,
             "opportunities_for_llm": [
@@ -409,7 +460,17 @@ class AgentNativeToolTests(unittest.TestCase):
                     "opportunity_score": 0.9 - index * 0.01,
                     "candidate_count": 10 + index,
                     "row_count": 30 + index,
-                    "next_action": {"tool": "resolve_candidates", "category_id": 1000 + index},
+                    "next_action": {
+                        "type": "analyze_theme",
+                        "request": {
+                            "product_query": "真实机会%d" % index,
+                            "marketplace": "US",
+                            "category_id": 1000 + index,
+                            "category_path": "Home & Kitchen > Storage > Box %d" % index,
+                            "recall_mode": "category",
+                            "include_descendants": True,
+                        },
+                    },
                     "large_unused_field": "drop-me" * 200,
                 }
                 for index in range(1, 11)
@@ -422,17 +483,111 @@ class AgentNativeToolTests(unittest.TestCase):
         compacted = json.loads(rendered)
 
         self.assertEqual(compacted["result_format"], "opportunity_cards_text_preserved")
+        self.assertEqual(compacted["payload"]["opportunity_discovery_job_id"], "odisc_test")
+        self.assertEqual(compacted["payload"]["result_ref"]["job_id"], "odisc_test")
         self.assertEqual(compacted["payload"]["opportunity_count"], 10)
         self.assertIn("完整10大机会卡片", compacted["payload"]["opportunity_cards_text"])
         self.assertIn("| #10 | 真实机会10", compacted["payload"]["opportunity_cards_text"])
         self.assertIn("样本ASIN数", compacted["payload"]["opportunity_cards_text"])
         self.assertIn("竞争Offer", compacted["payload"]["opportunity_cards_text"])
         self.assertIn("真实机会3", rendered)
+        self.assertEqual(compacted["payload"]["opportunities_for_llm"][2]["next_action"]["request"]["category_id"], 1003)
+        self.assertEqual(compacted["payload"]["opportunities_for_llm"][2]["next_action"]["request"]["recall_mode"], "category")
+        self.assertEqual(compacted["payload"]["opportunities_for_llm"][2]["next_action"]["request"]["category_path"], "Home & Kitchen > Storage > Box 3")
         self.assertNotIn("待补全", rendered)
         self.assertNotIn("估算区间", rendered)
         self.assertNotIn("结果已压缩截断", rendered)
         self.assertNotIn("large_unused_field", rendered)
         self.assertLessEqual(len(rendered), 7000)
+
+    def test_repeated_opportunity_discovery_reuses_first_result_even_with_changed_args(self) -> None:
+        pipe = self.make_pipeline()
+        responses = [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "opportunity_discovery",
+                                        "arguments": json.dumps({"query": "找机会", "marketplace": "US", "limit": 3}),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_2",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "opportunity_discovery",
+                                        "arguments": json.dumps({"marketplace": "US", "limit": 10}),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+        ]
+        execute_count = {"value": 0}
+
+        def post_agent_payload(payload: dict, model_name: str) -> dict:
+            return responses.pop(0)
+
+        def execute_tool_call(tool_call: dict, billing_context: dict, truncate: bool = True) -> str:
+            execute_count["value"] += 1
+            return json.dumps(
+                {
+                    "success": True,
+                    "opportunity_count": 1,
+                    "opportunity_cards_text": "## 机会发现结果\n\n| 排名 | 机会主题 |\n|---:|---|\n| 1 | Women's Pants |",
+                    "opportunities_for_llm": [{"rank": 1, "title": "Women's Pants"}],
+                },
+                ensure_ascii=False,
+            )
+
+        pipe._post_agent_payload = post_agent_payload
+        pipe._execute_tool_call = execute_tool_call
+
+        answer = pipe._run_agent_loop(
+            messages=[{"role": "user", "content": "机会发现"}],
+            body={},
+            billing_context={"api_key": "test"},
+            model_name="deepseek-v4-pro",
+            mode="agent",
+        )
+
+        self.assertEqual(execute_count["value"], 1)
+        self.assertIn("Women's Pants", answer)
+        self.assertNotIn("不要补齐", answer)
+
+    def test_opportunity_discovery_drops_query_parameter_from_llm_call(self) -> None:
+        pipe = self.make_pipeline()
+
+        normalized = pipe._normalize_tool_call(
+            "opportunity_discovery",
+            {"query": "机会发现", "keyword": "找机会", "market": "US", "limit": 5},
+        )
+
+        self.assertIsNotNone(normalized)
+        self.assertNotIn("query", normalized["parameters"])
+        self.assertEqual(normalized["parameters"]["marketplace"], "US")
+        self.assertEqual(normalized["parameters"]["limit"], 5)
 
     def test_invalid_opportunity_expansion_falls_back_to_real_cards(self) -> None:
         pipe = self.make_pipeline()
@@ -456,9 +611,132 @@ class AgentNativeToolTests(unittest.TestCase):
 
         self.assertIn("真实机会1", answer)
         self.assertIn("真实机会2", answer)
-        self.assertIn("不补齐不存在的排名", answer)
-        self.assertIn("真实返回的 2 个机会", answer)
+        self.assertIn("本次机会发现返回的机会卡片", answer)
+        self.assertIn("当前可继续分析的机会编号共有 2 个", answer)
         self.assertNotIn("估算区间", answer)
+
+    def test_ungrounded_opportunity_answer_falls_back_to_real_cards(self) -> None:
+        pipe = self.make_pipeline()
+        raw_result = json.dumps(
+            {
+                "opportunity_count": 3,
+                "opportunity_cards_text": "| 排名 | 机会主题 | 类目路径 |\n| --- | --- | --- |\n| #1 | 真实机会A | Home & Kitchen |\n| #2 | 真实机会B | Sports & Outdoors |\n| #3 | 真实机会C | Beauty |",
+                "opportunities_for_llm": [
+                    {"rank": 1, "title": "真实机会A", "category_id": 11},
+                    {"rank": 2, "title": "真实机会B", "category_id": 22},
+                    {"rank": 3, "title": "真实机会C", "category_id": 33},
+                ],
+            },
+            ensure_ascii=False,
+        )
+        observation = pipe._build_tool_observation({"name": "opportunity_discovery", "parameters": {}}, raw_result)
+
+        answer = pipe._fallback_opportunity_answer_if_needed(
+            "## 机会发现结果\n\n1. 口腔护理\n2. 宠物用品\n3. 智能家居",
+            [observation],
+        )
+
+        self.assertIn("真实机会A", answer)
+        self.assertIn("真实机会B", answer)
+        self.assertIn("真实机会C", answer)
+        self.assertNotIn("口腔护理", answer)
+
+    def test_opportunity_fallback_uses_raw_result_when_llm_result_is_overflow_only(self) -> None:
+        pipe = self.make_pipeline()
+        raw_result = json.dumps(
+            {
+                "success": True,
+                "data": {
+                    "opportunity_count": 1,
+                    "opportunity_cards_text": "## 机会发现结果\n\n| 排名 | 机会主题 |\n|---:|---|\n| 1 | Women's Pants |",
+                    "opportunities_for_llm": [{"rank": 1, "title": "Women's Pants"}],
+                },
+            },
+            ensure_ascii=False,
+        )
+        overflow_only = json.dumps(
+            {
+                "tool_name": "opportunity_discovery",
+                "payload": {
+                    "opportunity_count": 1,
+                    "overflow_note": "机会表文本过长，本次压缩保留可执行 opportunities_for_llm。",
+                },
+            },
+            ensure_ascii=False,
+        )
+
+        answer = pipe._fallback_answer_from_tool_observations(
+            [
+                {
+                    "tool_name": "opportunity_discovery",
+                    "arguments": {"marketplace": "US", "limit": 10},
+                    "llm_result": overflow_only,
+                    "raw_result": raw_result,
+                }
+            ],
+            error="upstream failed",
+        )
+
+        self.assertIn("Women's Pants", answer)
+        self.assertIn("下面是本次机会发现返回的机会卡片", answer)
+        self.assertNotIn("工具已经执行完成", answer)
+
+    def test_memory_profile_context_is_compacted_and_injected(self) -> None:
+        pipe = self.make_pipeline()
+        payloads = []
+
+        def chat_backend_request(method: str, path: str, body: dict | None = None, **kwargs) -> dict:
+            payloads.append({"method": method, "path": path, "body": body, "kwargs": kwargs})
+            return {
+                "summary_version": "memory_profile_v1",
+                "user_identity_summary": "verified user focused on US Amazon",
+                "role_hint": "subscriber_user",
+                "market_focus": ["US"],
+                "preferred_platforms": ["amazon"],
+                "risk_preference": "evidence_first",
+                "decision_style": "evidence_first",
+                "hard_constraints": ["避免侵权和重货"],
+                "recent_topics": ["women pants"],
+                "memory_confidence": {"market_focus": "high"},
+                "evidence_sources": {"recent_messages": 3},
+                "confidence_digest": "主要字段已有可用置信度。",
+                "full_payload": {"large": "drop-me" * 500},
+            }
+
+        pipe._chat_backend_request = chat_backend_request
+
+        profile = pipe._build_agent_memory_profile_context(
+            messages=[{"role": "user", "content": "帮我找机会"}],
+            body={"metadata": {"target_market": "US"}},
+            billing_context={"user_id": "user_1"},
+            mode="agent",
+        )
+        messages = pipe._inject_agent_system_prompt(
+            [{"role": "user", "content": "帮我找机会"}],
+            mode="agent",
+            memory_profile=profile,
+        )
+
+        self.assertEqual(payloads[0]["path"], "/internal/provider/memory-profile/build")
+        self.assertEqual(payloads[0]["body"]["user_id"], "user_1")
+        self.assertEqual(payloads[0]["body"]["target_market"], "US")
+        memory_message = messages[1]
+        self.assertEqual(memory_message["role"], "system")
+        self.assertIn("memory_profile_context", memory_message["content"])
+        self.assertIn("women pants", memory_message["content"])
+        self.assertNotIn("full_payload", memory_message["content"])
+
+    def test_opportunity_discovery_receives_memory_profile_as_internal_context(self) -> None:
+        pipe = self.make_pipeline()
+        tool_call = {"name": "opportunity_discovery", "parameters": {"marketplace": "US", "limit": 5}}
+        body = {"_xiamimate_memory_profile": {"recent_topics": ["women pants"], "risk_preference": "evidence_first"}}
+
+        internal_call = pipe._attach_internal_tool_context(tool_call, body)
+        public_call = pipe._strip_internal_tool_context(internal_call)
+
+        self.assertIn("_memory_profile", internal_call["parameters"])
+        self.assertNotIn("_memory_profile", public_call["parameters"])
+        self.assertEqual(public_call["parameters"], {"marketplace": "US", "limit": 5})
 
     def test_resolve_candidates_aliases_support_category_recall_controls(self) -> None:
         pipe = self.make_pipeline()
@@ -569,6 +847,22 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertEqual(params["statuses"], "queued,waiting_token")
         self.assertEqual(params["limit"], 3)
 
+    def test_launch_budget_calculator_aliases_are_normalized(self) -> None:
+        pipe = self.make_pipeline()
+
+        normalized = pipe._normalize_tool_call(
+            "launch_budget_calculator",
+            {"product": "Women's Pants", "price": 22.94, "landed_cost": 8.3, "ad_budget": 600, "units": 300},
+        )
+
+        self.assertIsNotNone(normalized)
+        params = normalized["parameters"]
+        self.assertEqual(params["product_theme"], "Women's Pants")
+        self.assertEqual(params["selling_price"], 22.94)
+        self.assertEqual(params["landed_cost_per_unit"], 8.3)
+        self.assertEqual(params["monthly_ad_budget"], 600)
+        self.assertEqual(params["launch_units"], 300)
+
     def test_tool_wrapper_extracts_nested_candidate_asins(self) -> None:
         tools = xiamimate.Pipeline()._load_agent_tools()
         payload = {
@@ -606,6 +900,15 @@ class AgentNativeToolTests(unittest.TestCase):
                         "window_summary": {"review_growth_window": 84, "series_row_count": 30, "coverage_ratio": 1.0},
                     }
                 ],
+                "tool_contract": {"capability": "asin_history_analysis"},
+                "evidence_contract": {
+                    "evidence_ledger": [
+                        {
+                            "evidence_id": "asin_history:B08FB31NH5:30d",
+                            "allowed_claim_strength": "tool_fact",
+                        }
+                    ]
+                },
             },
         }
 
@@ -616,6 +919,8 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertEqual(item["latest_snapshot"]["leaf_category_name"], "Hand Mixers")
         self.assertIn("Mixers > Hand Mixers", item["latest_snapshot"]["category_path"])
         self.assertEqual(item["window_summary"]["review_growth_window"], 84)
+        self.assertEqual(compacted["payload"]["data"]["tool_contract"]["capability"], "asin_history_analysis")
+        self.assertEqual(compacted["payload"]["data"]["evidence_contract"]["evidence_ledger"][0]["evidence_id"], "asin_history:B08FB31NH5:30d")
         self.assertTrue(item["series"]["_compacted_series"])
         self.assertLessEqual(len(rendered), 4000)
 

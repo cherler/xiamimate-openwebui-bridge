@@ -54,8 +54,9 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 10. 涉及类目归属、竞品筛选、是否排除某 ASIN 时，必须基于工具结果中的事实字段判断，优先引用 latest_snapshot.leaf_category_name / latest_snapshot.category_path，其次引用 l3_category_name；不要仅凭标题、品牌或自身知识补全类目。
 11. 当用户要求“清洗/筛选/过滤上一步候选池”，且上一步 resolve_candidates 已返回 ASIN、品牌、product_title、leaf_category_name、fine_category_name、category_path、match_score、match_reasons 等字段时，直接基于这些字段筛选；不要为了判断标题或类目路径是否包含某词而调用 top_asin_drilldown。只有用户明确要求补充销量、价格、BSR、评论、预测等候选池没有的字段，才调用下游详情工具。
 12. 当 resolve_candidates 返回 pool_quality.is_sufficient_for_analysis=false 时，按闭环流程处理，不要把当前候选池包装成完整品类结论：先引用 pool_quality.insufficient_coverage_reason 说明覆盖不足；再调用 category_resolve 获取稳定 category_id/category_path；随后用 resolve_candidates(recall_mode=hybrid 或 category, category_id/category_path, include_descendants=true) 重试本地类目池；若 pool_quality 仍不足，调用 expand_candidates 创建补池任务，并调用 candidate_expansion_status 查询 queued/waiting_token/discovering/hydrating/syncing/completed 状态和 data_readiness。只有补池 job 的 data_readiness.analysis_ready=true，或本地池已 sufficient 且 stats/trends 有有效数值时，才继续 category_benchmark、candidate_pool_stats、top_asin_drilldown 和强结论；如果 status=completed 但 data_readiness.readiness_status=history_hydration_pending 或 serving_sync_pending，要说明“ASIN 已补入但分析特征未就绪”，建议等待 hydrate/serving sync 或只给待验证框架，不要把空 stats 当成市场事实。
-13. 当用户不知道选什么、要求找机会、问某大类下有什么细分方向时，优先调用 opportunity_discovery 输出机会卡片；机会卡片只是继续分析入口，不能直接写成最终选品结论。机会发现结果必须只展示工具真实返回的 opportunity_cards_text / opportunities_for_llm；用户要求“展开全部/完整10个/全部机会”时，如果当前真实结果不足目标数量，重新调用 opportunity_discovery(limit=10)，不要补齐不存在的排名，不要输出“待补全”“估算区间”“基于得分分布估算”。按机会编号深入分析只适用于 opportunities_for_llm 里真实存在、带 category_id/category_path/next_action 的机会。
+13. 当用户不知道选什么、要求找机会、问某大类下有什么细分方向时，优先调用 opportunity_discovery 输出机会卡片；机会卡片是继续分析入口。按机会编号深入分析时，沿用 opportunities_for_llm 中该编号的 next_action.request 继续调用 resolve_candidates，并以返回的 rank/title/category_path 作为上下文。
 14. 当用户明确询问销量预测、未来增长或“为什么模型看好/看空”时，优先调用 product_forecast_explain；不要把 candidate_pool_weak_forecast 的弱信号包装成正式模型预测。
+15. 不要把“用户问法”写成固定流程；按 tool_contract.capability 选择能回答问题的工具，按 evidence_contract 区分 tool_fact、derived_metric、default_assumption、hypothesis。涉及启动资金、盈亏平衡、单件利润、预算周期等计算时，调用 launch_budget_calculator，让工具产出公式和数值；最终答复可以自由组织，但必须把明确事实、计算结果、默认假设和商业判断分开。
 
 工具调用规则：
 - 当你决定调用工具时，直接输出工具调用指令，不要在工具调用之前添加任何文字（如"好的，我来帮你…"等）。
@@ -73,10 +74,12 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 - expand_candidates: 创建 Keepa 补池任务，不在请求路径直接消耗 token
 - candidate_expansion_status: 查询 Keepa 补池任务状态、token 等待状态，以及 data_readiness 分析数据就绪度
 - opportunity_discovery: 发现空白机会、大类细分机会或 report 前置机会卡
+- opportunity_discovery_job: 按机会发现 job_id 回取完整机会卡片和结构化证据
 - candidate_pool_stats: 候选池描述统计，优先使用 resolve_candidates 返回的 candidate_pool_id
 - candidate_pool_trends: 候选池趋势诊断
 - candidate_pool_weak_forecast: 弱信号预测标记
 - product_forecast_explain: 商品销量模型预测与自动解释，调用正式 Theme API forecast explainability 路由
+- launch_budget_calculator: 启动资金、单件经济模型、盈亏平衡与多场景预算计算
 - top_asin_drilldown: 头部 ASIN 下钻
 - asin_history_timeseries: 指定 ASIN 的历史时序
 - category_benchmark: 类目基准对比
@@ -109,10 +112,12 @@ ALLOWED_AGENT_TOOLS = {
     "expand_candidates",
     "candidate_expansion_status",
     "opportunity_discovery",
+    "opportunity_discovery_job",
     "candidate_pool_stats",
     "candidate_pool_trends",
     "candidate_pool_weak_forecast",
     "product_forecast_explain",
+    "launch_budget_calculator",
     "top_asin_drilldown",
     "asin_history_timeseries",
     "category_benchmark",
@@ -648,10 +653,20 @@ class Pipeline:
         except RuntimeError as exc:
             return self._error_text(str(exc))
 
-        if body.get("stream"):
+        agent_body = dict(body or {})
+        memory_profile = self._build_agent_memory_profile_context(
+            messages=messages,
+            body=agent_body,
+            billing_context=billing_context,
+            mode=mode,
+        )
+        if memory_profile:
+            agent_body["_xiamimate_memory_profile"] = memory_profile
+
+        if agent_body.get("stream"):
             return self._run_agent_stream(
                 messages=messages,
-                body=body,
+                body=agent_body,
                 model=model,
                 model_name=model_name,
                 billing_context=billing_context,
@@ -661,7 +676,7 @@ class Pipeline:
         try:
             answer = self._run_agent_loop(
                 messages=messages,
-                body=body,
+                body=agent_body,
                 billing_context=billing_context,
                 mode=mode,
                 model_name=model_name,
@@ -687,6 +702,7 @@ class Pipeline:
         used_tools = False
         reasoning_open = False
         tool_observations: List[dict] = []
+        tool_result_cache: Dict[Tuple[str, str], dict] = {}
 
         def emit_text_chunk(content: str) -> bytes:
             return self._stream_content_chunk(
@@ -811,15 +827,62 @@ class Pipeline:
 
                 used_tools = True
                 conversation.append(assistant_message)
+                tool_calls = [self._attach_internal_tool_context(tool_call, body) for tool_call in tool_calls]
 
-                tool_names = ", ".join(tool_call["name"] for tool_call in tool_calls)
+                cached_tool_calls = []
+                new_tool_calls = []
+                for tool_call in tool_calls:
+                    cached_observation = self._cached_tool_observation_for_call(
+                        tool_call=tool_call,
+                        tool_result_cache=tool_result_cache,
+                        tool_observations=tool_observations,
+                    )
+                    if cached_observation is not None:
+                        cached_tool_calls.append((tool_call, cached_observation))
+                    else:
+                        new_tool_calls.append(tool_call)
+
+                if cached_tool_calls and not new_tool_calls:
+                    final_answer = self._fallback_opportunity_answer_from_observations(tool_observations) or self._fallback_answer_from_tool_observations(tool_observations)
+                    for chunk in emit_reasoning_chunks(self._format_agent_progress("工具结果已就绪，正在生成最终答复")):
+                        yield chunk
+                    close_chunk = close_reasoning_chunk()
+                    if close_chunk is not None:
+                        yield close_chunk
+                    for chunk in self._split_text(final_answer):
+                        answer_started = True
+                        yield emit_text_chunk(chunk)
+                    break
+
+                tool_results = []
+                for cached_tool_call, cached_observation in cached_tool_calls:
+                    public_cached_tool_call = self._strip_internal_tool_context(cached_tool_call)
+                    if native_tool_calls and cached_tool_call.get("tool_call_id"):
+                        conversation.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": str(cached_tool_call.get("tool_call_id")),
+                                "content": cached_observation["llm_result"],
+                            }
+                        )
+                    else:
+                        tool_results.append(
+                            TOOL_RESULT_TEMPLATE.format(
+                                tool_name=public_cached_tool_call["name"],
+                                arguments=json.dumps(public_cached_tool_call.get("parameters") or {}, ensure_ascii=False),
+                                result=cached_observation["llm_result"],
+                            )
+                        )
+
+                tool_names = ", ".join(tool_call["name"] for tool_call in new_tool_calls)
                 for chunk in emit_reasoning_chunks(self._format_agent_progress("正在调用工具: %s" % tool_names)):
                     yield chunk
 
-                tool_results = []
-                for tool_call in tool_calls:
+                for tool_call in new_tool_calls:
+                    public_tool_call = self._strip_internal_tool_context(tool_call)
                     result = self._execute_tool_call(tool_call, billing_context, truncate=False)
-                    observation = self._build_tool_observation(tool_call=tool_call, result=result)
+                    observation = self._build_tool_observation(tool_call=public_tool_call, result=result)
+                    tool_result_cache[self._tool_call_cache_key(tool_call)] = observation
                     tool_observations.append(observation)
                     if native_tool_calls and tool_call.get("tool_call_id"):
                         conversation.append(
@@ -832,8 +895,8 @@ class Pipeline:
                     else:
                         tool_results.append(
                             TOOL_RESULT_TEMPLATE.format(
-                                tool_name=tool_call["name"],
-                                arguments=json.dumps(tool_call.get("parameters") or {}, ensure_ascii=False),
+                                tool_name=public_tool_call["name"],
+                                arguments=json.dumps(public_tool_call.get("parameters") or {}, ensure_ascii=False),
                                 result=observation["llm_result"],
                             )
                         )
@@ -4267,7 +4330,11 @@ class Pipeline:
         provider = self._get_provider(model_name)
         payload = provider.filter_payload(body)
         payload["model"] = model_name or self._model_name_for_profile(self._default_agent_profile())
-        payload["messages"] = self._inject_agent_system_prompt(messages, mode=mode)
+        payload["messages"] = self._inject_agent_system_prompt(
+            messages,
+            mode=mode,
+            memory_profile=body.get("_xiamimate_memory_profile") if isinstance(body, dict) else None,
+        )
         if "tools" in getattr(provider, "allowed_params", set()):
             payload["tools"] = self._build_agent_tool_definitions()
             payload.setdefault("tool_choice", "auto")
@@ -4282,6 +4349,54 @@ class Pipeline:
         provider = self._get_provider(model_name)
         return "tools" in getattr(provider, "allowed_params", set())
 
+    def _tool_call_cache_key(self, tool_call: Dict[str, Any]) -> Tuple[str, str]:
+        name = str(tool_call.get("name") or "").strip()
+        parameters = tool_call.get("parameters") if isinstance(tool_call.get("parameters"), dict) else {}
+        return name, json.dumps(parameters, sort_keys=True, ensure_ascii=False, default=str)
+
+    def _latest_tool_observation(self, tool_observations: List[dict], tool_name: str) -> Optional[dict]:
+        normalized_name = str(tool_name or "").strip()
+        for observation in reversed(tool_observations or []):
+            if str(observation.get("tool_name") or "").strip() == normalized_name:
+                return observation
+        return None
+
+    def _cached_tool_observation_for_call(
+        self,
+        *,
+        tool_call: Dict[str, Any],
+        tool_result_cache: Dict[Tuple[str, str], dict],
+        tool_observations: List[dict],
+    ) -> Optional[dict]:
+        cache_key = self._tool_call_cache_key(tool_call)
+        if cache_key in tool_result_cache:
+            return tool_result_cache[cache_key]
+        if str(tool_call.get("name") or "").strip() == "opportunity_discovery":
+            return self._latest_tool_observation(tool_observations, "opportunity_discovery")
+        return None
+
+    def _attach_internal_tool_context(self, tool_call: Dict[str, Any], body: dict) -> Dict[str, Any]:
+        if str(tool_call.get("name") or "").strip() != "opportunity_discovery":
+            return tool_call
+        memory_profile = body.get("_xiamimate_memory_profile") if isinstance(body, dict) else None
+        if not isinstance(memory_profile, dict) or not memory_profile:
+            return tool_call
+        updated = deepcopy(tool_call)
+        parameters = dict(updated.get("parameters") or {})
+        parameters["_memory_profile"] = memory_profile
+        updated["parameters"] = parameters
+        return updated
+
+    def _strip_internal_tool_context(self, tool_call: Dict[str, Any]) -> Dict[str, Any]:
+        updated = deepcopy(tool_call)
+        parameters = {
+            key: value
+            for key, value in dict(updated.get("parameters") or {}).items()
+            if not str(key).startswith("_")
+        }
+        updated["parameters"] = parameters
+        return updated
+
     def _run_agent_loop(
         self,
         messages: List[dict],
@@ -4292,6 +4407,7 @@ class Pipeline:
     ) -> str:
         conversation = deepcopy(messages or [])
         tool_observations: List[dict] = []
+        tool_result_cache: Dict[Tuple[str, str], dict] = {}
 
         for _ in range(6):
             payload = self._prepare_agent_payload(messages=conversation, body=body, mode=mode, model_name=model_name)
@@ -4333,11 +4449,49 @@ class Pipeline:
                 return self._fallback_opportunity_answer_if_needed(str(content or "").strip(), tool_observations)
 
             conversation.append(assistant_message)
+            tool_calls = [self._attach_internal_tool_context(tool_call, body) for tool_call in tool_calls]
+
+            cached_tool_calls = []
+            new_tool_calls = []
+            for tool_call in tool_calls:
+                cached_observation = self._cached_tool_observation_for_call(
+                    tool_call=tool_call,
+                    tool_result_cache=tool_result_cache,
+                    tool_observations=tool_observations,
+                )
+                if cached_observation is not None:
+                    cached_tool_calls.append((tool_call, cached_observation))
+                else:
+                    new_tool_calls.append(tool_call)
+
+            if cached_tool_calls and not new_tool_calls:
+                return self._fallback_opportunity_answer_from_observations(tool_observations) or self._fallback_answer_from_tool_observations(tool_observations)
 
             tool_results = []
-            for tool_call in tool_calls:
+            for cached_tool_call, cached_observation in cached_tool_calls:
+                public_cached_tool_call = self._strip_internal_tool_context(cached_tool_call)
+                if native_tool_calls and cached_tool_call.get("tool_call_id"):
+                    conversation.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": str(cached_tool_call.get("tool_call_id")),
+                            "content": cached_observation["llm_result"],
+                        }
+                    )
+                else:
+                    tool_results.append(
+                        TOOL_RESULT_TEMPLATE.format(
+                            tool_name=public_cached_tool_call["name"],
+                            arguments=json.dumps(public_cached_tool_call.get("parameters") or {}, ensure_ascii=False),
+                            result=cached_observation["llm_result"],
+                        )
+                    )
+
+            for tool_call in new_tool_calls:
+                public_tool_call = self._strip_internal_tool_context(tool_call)
                 result = self._execute_tool_call(tool_call, billing_context, truncate=False)
-                observation = self._build_tool_observation(tool_call=tool_call, result=result)
+                observation = self._build_tool_observation(tool_call=public_tool_call, result=result)
+                tool_result_cache[self._tool_call_cache_key(tool_call)] = observation
                 tool_observations.append(observation)
                 if native_tool_calls and tool_call.get("tool_call_id"):
                     conversation.append(
@@ -4350,8 +4504,8 @@ class Pipeline:
                 else:
                     tool_results.append(
                         TOOL_RESULT_TEMPLATE.format(
-                            tool_name=tool_call["name"],
-                            arguments=json.dumps(tool_call.get("parameters") or {}, ensure_ascii=False),
+                            tool_name=public_tool_call["name"],
+                            arguments=json.dumps(public_tool_call.get("parameters") or {}, ensure_ascii=False),
                             result=observation["llm_result"],
                         )
                     )
@@ -4382,6 +4536,81 @@ class Pipeline:
             "pricing_version": data.get("pricing_version") or "unknown",
             "point_cost_by_event": data.get("point_cost_by_event") or POINT_COST_BY_EVENT,
         }
+
+    def _build_agent_memory_profile_context(
+        self,
+        *,
+        messages: List[dict],
+        body: dict,
+        billing_context: dict,
+        mode: str,
+    ) -> Optional[dict]:
+        if mode not in {"agent", "tool"}:
+            return None
+        query = (self._extract_last_user_text(messages) or "").strip()
+        if not query:
+            return None
+        try:
+            data = self._chat_backend_request(
+                method="POST",
+                path="/internal/provider/memory-profile/build",
+                body={
+                    "user_id": billing_context.get("user_id") or self._user_id(body),
+                    "query": query,
+                    "target_platform": self._body_context_value(body, "target_platform"),
+                    "target_market": self._body_context_value(body, "target_market") or self._body_context_value(body, "marketplace"),
+                    "report_profile": "research",
+                },
+                internal=True,
+                timeout=12,
+            )
+        except RuntimeError as exc:
+            print("xiamimate memory profile build failed", str(exc)[:500])
+            return None
+        return self._compact_memory_profile_context(data)
+
+    def _body_context_value(self, body: dict, key: str) -> str:
+        if not isinstance(body, dict):
+            return ""
+        candidates = [body.get(key)]
+        metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+        candidates.append(metadata.get(key))
+        extra = body.get("extra_body") if isinstance(body.get("extra_body"), dict) else {}
+        candidates.append(extra.get(key))
+        for value in candidates:
+            text = str(value or "").strip()
+            if text:
+                return text[:120]
+        return ""
+
+    def _compact_memory_profile_context(self, data: dict) -> dict:
+        if not isinstance(data, dict):
+            return {}
+        keys = [
+            "summary_version",
+            "user_identity_summary",
+            "role_hint",
+            "market_focus",
+            "preferred_platforms",
+            "preferred_price_band",
+            "risk_preference",
+            "decision_style",
+            "hard_constraints",
+            "recent_topics",
+            "memory_confidence",
+            "evidence_sources",
+            "confidence_digest",
+        ]
+        compact = self._copy_keys(data, keys)
+        if "summary_version" not in compact:
+            compact["summary_version"] = "memory_profile_v1"
+        return self._compact_json_value(
+            compact,
+            max_depth=4,
+            max_items=8,
+            max_scalar_items=32,
+            max_string=240,
+        )
 
     def _charge_billing_event(
         self,
@@ -5251,11 +5480,6 @@ class Pipeline:
                 "top_k": "limit",
             },
             "opportunity_discovery": {
-                "question": "query",
-                "keyword": "query",
-                "keywords": "query",
-                "product": "query",
-                "product_query": "query",
                 "category": "category_path",
                 "category_id": "category_id",
                 "categoryId": "category_id",
@@ -5325,6 +5549,36 @@ class Pipeline:
                 "market": "marketplace",
                 "top_k": "top_n",
                 "max_results": "top_n",
+            },
+            "launch_budget_calculator": {
+                "query": "product_theme",
+                "category": "product_theme",
+                "product": "product_theme",
+                "product_query": "product_theme",
+                "theme": "product_theme",
+                "market": "marketplace",
+                "target_market": "marketplace",
+                "price": "selling_price",
+                "sellingPrice": "selling_price",
+                "unit_cost": "unit_product_cost",
+                "product_cost": "unit_product_cost",
+                "landed_cost": "landed_cost_per_unit",
+                "landed_cost_per_unit": "landed_cost_per_unit",
+                "shipping": "inbound_shipping_per_unit",
+                "inbound_shipping": "inbound_shipping_per_unit",
+                "duty": "duty_per_unit",
+                "referral_rate": "referral_fee_rate",
+                "commission_rate": "referral_fee_rate",
+                "coupon_rate": "coupon_discount_rate",
+                "promo_rate": "coupon_discount_rate",
+                "refund_rate": "return_rate",
+                "returns_rate": "return_rate",
+                "ad_budget": "monthly_ad_budget",
+                "monthly_ads": "monthly_ad_budget",
+                "units": "launch_units",
+                "inventory_units": "launch_units",
+                "months": "launch_months",
+                "runway_months": "launch_months",
             },
             "top_asin_drilldown": {
                 "pool_id": "candidate_pool_id",
@@ -5526,6 +5780,11 @@ class Pipeline:
     def _execute_tool_call(self, tool_call: Dict[str, Any], billing_context: dict, truncate: bool = True) -> str:
         tool_name = tool_call["name"]
         parameters = tool_call.get("parameters") or {}
+        public_parameters = {
+            key: value
+            for key, value in dict(parameters or {}).items()
+            if not str(key).startswith("_")
+        }
         method = getattr(self.agent_tools, tool_name, None) if self.agent_tools is not None else None
 
         if method is None or tool_name.startswith("_"):
@@ -5541,7 +5800,7 @@ class Pipeline:
                     description="工具调用：%s" % self._tool_name_label(tool_name),
                     meta={
                         "tool_name": tool_name,
-                        "parameters": parameters,
+                        "parameters": public_parameters,
                     },
                 )
             except RuntimeError as exc:
@@ -5644,11 +5903,16 @@ class Pipeline:
             opportunity_payload,
             [
                 "instruction",
+                "opportunity_discovery_job_id",
+                "opportunity_discovery_job",
+                "result_ref",
                 "opportunity_count",
                 "opportunity_cards_text",
                 "opportunities_for_llm",
                 "metric_definitions",
                 "display_rules",
+                "tool_contract",
+                "evidence_contract",
                 "diagnostics",
                 "notes",
                 "meta",
@@ -5675,10 +5939,8 @@ class Pipeline:
             "result_format": "opportunity_cards_text_preserved",
             "original_chars": original_chars,
             "instruction": (
-                "最终答复必须优先原样使用 opportunity_cards_text；只展示真实返回的机会行。"
-                "不要补齐不存在的 # 排名，不要用占位状态或推算范围冒充工具结果。"
-                "如果用户要求展开全部但真实 opportunity_count 不足目标数量，重新调用 opportunity_discovery(limit=10)。"
-                "按编号深入分析只适用于 opportunities_for_llm 中真实存在的编号。"
+                "opportunity_cards_text 是面向用户的机会发现展示文本。"
+                "opportunities_for_llm 包含可继续分析的结构化机会入口。"
             ),
             "payload": compact_payload,
         }
@@ -5693,6 +5955,12 @@ class Pipeline:
         if len(rendered) <= budget:
             return rendered
 
+        compact_payload.pop("tool_contract", None)
+        compact_payload.pop("evidence_contract", None)
+        rendered = json.dumps(envelope, ensure_ascii=False, indent=2)
+        if len(rendered) <= budget:
+            return rendered
+
         if "opportunities_for_llm" in compact_payload:
             compact_payload["opportunities_for_llm"] = self._compact_opportunities_for_llm(
                 compact_payload.get("opportunities_for_llm"), max_items=10, max_string=90
@@ -5701,17 +5969,48 @@ class Pipeline:
         if len(rendered) <= budget:
             return rendered
 
-        compact_payload.pop("opportunities_for_llm", None)
+        if cards_text:
+            compact_payload["opportunity_cards_text"] = self._trim_opportunity_cards_text(
+                cards_text,
+                budget=max(1200, budget - 3200),
+            )
+            compact_payload["overflow_note"] = "机会表文本过长，当前内容保留工具返回文本的前段和结构化机会入口。"
         rendered = json.dumps(envelope, ensure_ascii=False, indent=2)
         if len(rendered) <= budget:
             return rendered
 
-        compact_payload["opportunity_cards_text"] = self._trim_opportunity_cards_text(cards_text, budget=max(1200, budget - 1200))
-        compact_payload["overflow_note"] = "机会表文本过长，当前内容只保留工具真实返回文本的前段；不要据此补齐缺失机会。"
+        compact_payload.pop("metric_definitions", None)
+        compact_payload.pop("display_rules", None)
         rendered = json.dumps(envelope, ensure_ascii=False, indent=2)
         if len(rendered) <= budget:
             return rendered
-        return rendered[:budget]
+
+        if "opportunities_for_llm" in compact_payload:
+            compact_payload["opportunities_for_llm"] = self._compact_opportunities_for_llm(
+                compact_payload.get("opportunities_for_llm"), max_items=10, max_string=60
+            )
+        rendered = json.dumps(envelope, ensure_ascii=False, indent=2)
+        if len(rendered) <= budget:
+            return rendered
+
+        rendered = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+        if len(rendered) <= budget:
+            return rendered
+
+        if cards_text:
+            compact_payload["opportunity_cards_text"] = self._trim_opportunity_cards_text(cards_text, budget=1600)
+        rendered = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+        if len(rendered) <= budget:
+            return rendered
+
+        compact_payload.pop("opportunity_cards_text", None)
+        compact_payload["overflow_note"] = "机会表文本过长，本次压缩保留可执行 opportunities_for_llm。"
+        rendered = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+        if len(rendered) <= budget:
+            return rendered
+
+        compact_payload.pop("opportunities_for_llm", None)
+        return json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
 
     def _extract_opportunity_payload(self, payload: dict) -> dict:
         if not isinstance(payload, dict):
@@ -5758,9 +6057,12 @@ class Pipeline:
                         item,
                         [
                             "rank",
+                            "opportunity_id",
                             "title",
+                            "source",
                             "category_id",
                             "category_path",
+                            "candidate_pool_id",
                             "opportunity_score",
                             "sales_window_sum",
                             "candidate_count",
@@ -5796,14 +6098,48 @@ class Pipeline:
                 break
             kept_lines.append(line)
             used = next_used
-        kept_lines.append("[后续真实工具文本过长已省略；不要补齐缺失机会行]")
+        kept_lines.append("[后续工具文本过长已省略]")
         return "\n".join(kept_lines)
 
     def _fallback_opportunity_answer_if_needed(self, answer: str, tool_observations: List[dict]) -> str:
-        if not self._answer_has_invalid_opportunity_expansion(answer):
+        if not self._answer_has_invalid_opportunity_expansion(answer) and self._opportunity_answer_matches_observations(answer, tool_observations):
             return answer
         fallback = self._fallback_opportunity_answer_from_observations(tool_observations)
         return fallback or answer
+
+    def _opportunity_answer_matches_observations(self, answer: str, tool_observations: List[dict]) -> bool:
+        titles = self._opportunity_titles_from_observations(tool_observations)
+        if not titles:
+            return True
+        answer_text = str(answer or "").lower()
+        matched_count = 0
+        for title in titles[:10]:
+            normalized_title = str(title or "").strip().lower()
+            if len(normalized_title) < 3:
+                continue
+            if normalized_title in answer_text:
+                matched_count += 1
+        return matched_count >= min(3, max(1, len(titles)))
+
+    def _opportunity_titles_from_observations(self, tool_observations: List[dict]) -> List[str]:
+        for observation in reversed(tool_observations or []):
+            if str(observation.get("tool_name") or "") != "opportunity_discovery":
+                continue
+            for result_key in ("raw_result", "llm_result"):
+                payload = self._load_tool_json_payload(observation.get(result_key))
+                if payload is None:
+                    continue
+                opportunity_payload = self._extract_opportunity_payload(payload.get("payload") if isinstance(payload.get("payload"), dict) else payload)
+                titles: List[str] = []
+                for key in ("opportunities_for_llm", "opportunities"):
+                    items = opportunity_payload.get(key) if isinstance(opportunity_payload, dict) else None
+                    if not isinstance(items, list):
+                        continue
+                    for item in items:
+                        if isinstance(item, dict) and str(item.get("title") or "").strip():
+                            titles.append(str(item.get("title")).strip())
+                return titles
+        return []
 
     def _answer_has_invalid_opportunity_expansion(self, answer: str) -> bool:
         text = str(answer or "")
@@ -5816,29 +6152,28 @@ class Pipeline:
         for observation in reversed(tool_observations or []):
             if str(observation.get("tool_name") or "") != "opportunity_discovery":
                 continue
-            payload = self._load_tool_json_payload(observation.get("llm_result"))
-            if payload is None:
-                payload = self._load_tool_json_payload(observation.get("raw_result"))
-            if payload is None:
-                continue
-            opportunity_payload = self._extract_opportunity_payload(payload.get("payload") if isinstance(payload.get("payload"), dict) else payload)
-            cards_text = str(opportunity_payload.get("opportunity_cards_text") or "").strip()
-            if not cards_text:
-                continue
-            opportunity_count = self._opportunity_count(opportunity_payload)
-            lines = [
-                "下面只展示 opportunity_discovery 工具真实返回的机会卡片，不补齐不存在的排名。",
-                "",
-                cards_text,
-            ]
-            if opportunity_count:
-                lines.extend(
-                    [
-                        "",
-                        "说明：当前可深入分析的机会编号只限于上表真实返回的 %d 个机会；如果要完整 10 个，需要重新调用 opportunity_discovery(limit=10) 并以新返回结果为准。" % opportunity_count,
-                    ]
-                )
-            return "\n".join(lines)
+            for result_key in ("llm_result", "raw_result"):
+                payload = self._load_tool_json_payload(observation.get(result_key))
+                if payload is None:
+                    continue
+                opportunity_payload = self._extract_opportunity_payload(payload.get("payload") if isinstance(payload.get("payload"), dict) else payload)
+                cards_text = str(opportunity_payload.get("opportunity_cards_text") or "").strip()
+                if not cards_text:
+                    continue
+                opportunity_count = self._opportunity_count(opportunity_payload)
+                lines = [
+                    "下面是本次机会发现返回的机会卡片。",
+                    "",
+                    cards_text,
+                ]
+                if opportunity_count:
+                    lines.extend(
+                        [
+                            "",
+                            "当前可继续分析的机会编号共有 %d 个。" % opportunity_count,
+                        ]
+                    )
+                return "\n".join(lines)
         return ""
 
     def _compact_tool_payload_for_llm(
@@ -6011,6 +6346,16 @@ class Pipeline:
         if len(candidate_items) > candidate_item_limit:
             compact_data["candidate_items"].append({"_omitted_items": len(candidate_items) - candidate_item_limit, "_total_items": len(candidate_items)})
 
+        for contract_key in ("tool_contract", "evidence_contract"):
+            if contract_key in data:
+                compact_data[contract_key] = self._compact_json_value(
+                    data[contract_key],
+                    max_depth=4,
+                    max_items=8,
+                    max_scalar_items=20,
+                    max_string=240,
+                )
+
         compact_payload = self._copy_keys(payload, ["success", "code", "message"])
         compact_payload["data"] = compact_data
         return compact_payload
@@ -6071,6 +6416,16 @@ class Pipeline:
         ]
         if len(items) > max_items:
             compact_data["items"].append({"_omitted_items": len(items) - max_items, "_total_items": len(items)})
+
+        for contract_key in ("tool_contract", "evidence_contract"):
+            if contract_key in data:
+                compact_data[contract_key] = self._compact_json_value(
+                    data[contract_key],
+                    max_depth=4,
+                    max_items=8,
+                    max_scalar_items=20,
+                    max_string=240,
+                )
 
         compact_payload = self._copy_keys(payload, ["success", "code", "message"])
         compact_payload["data"] = compact_data
@@ -6202,6 +6557,9 @@ class Pipeline:
         return "%s\n\n[结果已压缩截断，原始长度 %d 字符]" % (text[:budget], len(text))
 
     def _fallback_answer_from_tool_observations(self, tool_observations: List[dict], error: str = "") -> str:
+        opportunity_fallback = self._fallback_opportunity_answer_from_observations(tool_observations)
+        if opportunity_fallback:
+            return opportunity_fallback
         lines = [
             "工具已经执行完成，但模型整理最终答复时失败；先返回工具结果摘要，方便继续分析。",
         ]
@@ -6348,19 +6706,45 @@ class Pipeline:
     def _sse_chunk(self, payload: dict) -> bytes:
         return ("data: %s\n\n" % json.dumps(payload, ensure_ascii=False)).encode("utf-8")
 
-    def _inject_agent_system_prompt(self, messages: List[dict], mode: str = "agent") -> List[dict]:
+    def _inject_agent_system_prompt(self, messages: List[dict], mode: str = "agent", memory_profile: Optional[dict] = None) -> List[dict]:
         clean_messages = deepcopy(messages or [])
         system_prompt = self._agent_system_prompt_for_mode(mode)
         if clean_messages:
             first_message = clean_messages[0]
             if first_message.get("role") == "system":
                 if first_message.get("content") == system_prompt:
+                    self._insert_agent_memory_profile_message(clean_messages, memory_profile)
                     return clean_messages
                 if first_message.get("content") in {AGENT_SYSTEM_PROMPT, TOOL_ONLY_SYSTEM_PROMPT}:
                     first_message["content"] = system_prompt
+                    self._insert_agent_memory_profile_message(clean_messages, memory_profile)
                     return clean_messages
         clean_messages.insert(0, {"role": "system", "content": system_prompt})
+        self._insert_agent_memory_profile_message(clean_messages, memory_profile)
         return clean_messages
+
+    def _insert_agent_memory_profile_message(self, messages: List[dict], memory_profile: Optional[dict]) -> None:
+        if not isinstance(memory_profile, dict) or not memory_profile:
+            return
+        messages[:] = [
+            message
+            for message in messages
+            if not (
+                message.get("role") == "system"
+                and isinstance(message.get("content"), str)
+                and message.get("content", "").startswith("XiaMimate memory_profile_context:")
+            )
+        ]
+        content = "XiaMimate memory_profile_context:\n%s" % json.dumps(
+            {
+                "usage": "User preference context for personalization and explanation only; it is not market evidence and must not override tool facts.",
+                "profile": memory_profile,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        insert_index = 1 if messages and messages[0].get("role") == "system" else 0
+        messages.insert(insert_index, {"role": "system", "content": content})
 
     def _agent_system_prompt_for_mode(self, mode: str) -> str:
         return TOOL_ONLY_SYSTEM_PROMPT if mode == "tool" else AGENT_SYSTEM_PROMPT
