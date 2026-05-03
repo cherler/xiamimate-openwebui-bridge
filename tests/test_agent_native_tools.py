@@ -107,6 +107,25 @@ class FakeAgentTools:
         return ""
 
 
+class TextToolOnlyProvider:
+    allowed_params = {"messages", "stream", "temperature"}
+
+    def filter_payload(self, body: dict) -> dict:
+        return {key: value for key, value in body.items() if key in self.allowed_params}
+
+    def has_internal_markup(self, text: str) -> bool:
+        return "$tool_calls" in str(text or "").lower()
+
+    def strip_internal_markup(self, content: str) -> str:
+        return str(content or "")
+
+    def extract_provider_tool_calls(self, content: str) -> list[dict]:
+        return []
+
+    def supports_streaming_final_answer(self) -> bool:
+        return True
+
+
 class AgentNativeToolTests(unittest.TestCase):
     def make_pipeline(self) -> xiamimate.Pipeline:
         pipe = xiamimate.Pipeline()
@@ -207,6 +226,85 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertIn("compacted_json", tool_message["content"])
         self.assertIn("candidate_asins", tool_message["content"])
         self.assertFalse(any("以下是工具执行结果" in str(message.get("content") or "") for message in second_messages))
+
+    def test_native_capable_provider_does_not_execute_text_tool_markup(self) -> None:
+        pipe = self.make_pipeline()
+        observed_payloads = []
+
+        def post_agent_payload(payload: dict, model_name: str) -> dict:
+            observed_payloads.append(copy.deepcopy(payload))
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": '$TOOL_CALLS = [{"name":"web_search","arguments":{}}]\n$ABORT_CONTROLLER = null',
+                            "reasoning_content": "native-capable provider should not use text tool fallback",
+                        }
+                    }
+                ]
+            }
+
+        def execute_tool_call(tool_call: dict, billing_context: dict, truncate: bool = True) -> str:
+            raise AssertionError("text tool markup should not be executed when native tools are available")
+
+        pipe._post_agent_payload = post_agent_payload
+        pipe._execute_tool_call = execute_tool_call
+
+        answer = pipe._run_agent_loop(
+            messages=[{"role": "user", "content": "查一下补池状态。"}],
+            body={},
+            billing_context={"api_key": "test"},
+            model_name="deepseek-v4-pro",
+            mode="tool",
+        )
+
+        self.assertIn("未生成可展示的结果", answer)
+        self.assertEqual(len(observed_payloads), 1)
+        self.assertEqual(observed_payloads[0]["tool_choice"], "auto")
+
+    def test_legacy_text_tool_path_preserves_reasoning_content(self) -> None:
+        pipe = self.make_pipeline()
+        text_only_provider = TextToolOnlyProvider()
+        pipe._get_provider = lambda model_name=None: text_only_provider
+        observed_payloads = []
+        responses = [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": '$TOOL_CALLS = [{"name":"resolve_candidates","arguments":{"product_query":"humidifier"}}]',
+                            "reasoning_content": "must be sent back on the next request",
+                        }
+                    }
+                ]
+            },
+            {"choices": [{"message": {"role": "assistant", "content": "最终答复。"}}]},
+        ]
+
+        def post_agent_payload(payload: dict, model_name: str) -> dict:
+            observed_payloads.append(copy.deepcopy(payload))
+            return responses.pop(0)
+
+        def execute_tool_call(tool_call: dict, billing_context: dict, truncate: bool = True) -> str:
+            self.assertEqual(tool_call["name"], "resolve_candidates")
+            return json.dumps({"success": True, "data": {"candidate_asins": ["B001"]}}, ensure_ascii=False)
+
+        pipe._post_agent_payload = post_agent_payload
+        pipe._execute_tool_call = execute_tool_call
+
+        answer = pipe._run_agent_loop(
+            messages=[{"role": "user", "content": "兼容旧文本工具调用。"}],
+            body={},
+            billing_context={"api_key": "test"},
+            model_name="legacy-text-tools",
+            mode="tool",
+        )
+
+        self.assertEqual(answer, "最终答复。")
+        assistant_message = next(message for message in observed_payloads[1]["messages"] if message.get("role") == "assistant")
+        self.assertEqual(assistant_message["reasoning_content"], "must be sent back on the next request")
 
     def test_resolve_candidates_compaction_prioritizes_candidate_identity_fields(self) -> None:
         pipe = self.make_pipeline()

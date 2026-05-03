@@ -205,13 +205,15 @@ class Tools:
         statuses: str = "queued,waiting_token,discovering,hydrating,syncing",
         limit: int = 20,
     ) -> str:
-        """Query queued or running Keepa candidate expansion jobs.
+        """Query queued or running Keepa candidate expansion jobs and analysis data readiness.
+
+        The response includes data_readiness for each job. Treat status=completed as ASIN registry visibility only; use data_readiness.analysis_ready before running stats, benchmark, drilldown, or forecast analysis.
 
         :param job_id: Optional specific expansion job ID.
         :param marketplace: Marketplace code such as US, UK, DE, or JP.
         :param statuses: CSV statuses to list when job_id is empty.
         :param limit: Maximum jobs to return.
-        :return: JSON response from theme_api.
+        :return: JSON response from theme_api, including data_readiness.readiness_status and analysis_ready.
         """
         return self._request(
             "/api/product-theme/candidate-expansion-status",
@@ -220,6 +222,51 @@ class Tools:
                 "marketplace": marketplace,
                 "statuses": self._normalize_csv(statuses),
                 "limit": limit,
+            },
+        )
+
+    def opportunity_discovery(
+        self,
+        query: str = "",
+        marketplace: str = "US",
+        platform: str = "Amazon",
+        category_id: Optional[int] = None,
+        category_path: str = "",
+        limit: int = 10,
+        window_days: int = 30,
+        min_data_confidence: str = "low",
+        include_expandable: bool = True,
+        include_descendants: bool = True,
+    ) -> str:
+        """Discover product opportunity cards before a user has selected a specific product theme.
+
+        Use this tool for blank opportunity discovery, category-scoped discovery, or as a pre-report step that returns opportunity cards and next_action requests for product theme analysis.
+
+        :param query: Optional product theme or seed keyword. Leave empty for blank/category discovery.
+        :param marketplace: Marketplace code such as US, UK, DE, or JP.
+        :param platform: Platform name. The MVP currently supports Amazon.
+        :param category_id: Optional Keepa category ID to scope discovery.
+        :param category_path: Optional category path to scope discovery, e.g. "Home & Kitchen".
+        :param limit: Maximum opportunity cards to return.
+        :param window_days: Lookback window for local evidence.
+        :param min_data_confidence: low, medium, or high.
+        :param include_expandable: Whether low-coverage opportunities can still be returned with expansion suggestions.
+        :param include_descendants: Whether category constraints include descendants.
+        :return: JSON response from theme_api.
+        """
+        return self._request(
+            "/api/product-theme/opportunity-discovery",
+            {
+                "query": str(query or "").strip() or None,
+                "marketplace": marketplace,
+                "platform": platform,
+                "category_id": category_id,
+                "category_path": str(category_path or "").strip() or None,
+                "limit": limit,
+                "window_days": window_days,
+                "min_data_confidence": min_data_confidence,
+                "include_expandable": include_expandable,
+                "include_descendants": include_descendants,
             },
         )
 
@@ -336,6 +383,45 @@ class Tools:
             "/api/product-theme/candidate-pool-weak-forecast",
             payload,
         )
+
+    def product_forecast_explain(
+        self,
+        candidate_asins: str = "",
+        candidate_pool_id: str = "",
+        marketplace: str = "US",
+        window_days: int = 30,
+        top_n: int = 10,
+        product_query: str = "",
+    ) -> str:
+        """Return trained sales forecast fields and explainability summaries for top ASINs.
+
+        Use this formal Theme API tool when users ask for model forecast, future sales, or why the model is bullish/bearish. It returns trained sales_forecast fields plus explainability fields such as primary_driver_label, top_feature_contributions, and driver_summary_text.
+
+        :param candidate_asins: CSV string of candidate ASINs.
+        :param candidate_pool_id: Persisted candidate_pool_id returned by resolve_candidates.
+        :param marketplace: Marketplace code such as US, UK, DE, or JP.
+        :param window_days: Lookback window for the drilldown context.
+        :param top_n: Maximum number of top ASIN forecast explanations to return.
+        :param product_query: Optional product query fallback when candidate_asins is not yet available.
+        :return: JSON response from theme_api with model forecast coverage and ASIN-level explainability.
+        """
+        payload = {
+            "candidate_pool_id": str(candidate_pool_id or "").strip() or None,
+            "marketplace": marketplace,
+            "window_days": window_days,
+            "top_n": top_n,
+        }
+        if not payload["candidate_pool_id"]:
+            resolved_candidate_asins = self._ensure_candidate_asins(
+                candidate_asins=candidate_asins,
+                marketplace=marketplace,
+                product_query=product_query,
+            )
+            if isinstance(resolved_candidate_asins, str):
+                return resolved_candidate_asins
+            payload["candidate_asins"] = resolved_candidate_asins
+
+        return self._request("/api/product-theme/product-forecast-explain", payload)
 
     def top_asin_drilldown(
         self,

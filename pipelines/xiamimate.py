@@ -45,7 +45,7 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 1. 需要数据时优先调用已挂载的工具，不要凭空编造指标。
 2. 需要平台规则、运营方法、合规要求等知识时，先调用 search_knowledge_base 工具检索知识库，不要依赖自身训练数据。
 3. 需要最新外部动态、站外情报、近期政策变化或实时市场讨论时，调用 web_search 工具，不要把旧知识当成最新事实。
-4. 需要商品数据时，先调用 resolve_candidates 拿到 candidate_pool_id 和 candidate_asins；后续 candidate_pool_stats / candidate_pool_trends / candidate_pool_weak_forecast / top_asin_drilldown / category_benchmark 优先传 candidate_pool_id，只有缺少 pool_id 时才传 candidate_asins。
+4. 需要商品数据时，先调用 resolve_candidates 拿到 candidate_pool_id 和 candidate_asins；后续 candidate_pool_stats / candidate_pool_trends / candidate_pool_weak_forecast / product_forecast_explain / top_asin_drilldown / category_benchmark 优先传 candidate_pool_id，只有缺少 pool_id 时才传 candidate_asins。
 5. 当你已经有明确 ASIN，且需要看近 7 到 90 天的销量、价格、BSR、评论变化、L3/leaf 类目或类目路径时，必须优先调用 asin_history_timeseries；它会返回 latest_snapshot.category_path / l3_category_name / leaf_category_name 以及 window_summary.review_growth_window。
 6. keepa_asin_lookup 只用于本地历史没有命中、需要实时商品快照兜底、或明确要求直连 Keepa 的场景；它不能替代 30 天评论增长、历史窗口和本地类目路径分析。
 7. 如果工具尚未返回数据，只能给出分析框架、验证路径和风险提醒，明确标注为待验证。
@@ -53,7 +53,9 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 9. 每个结论标注数据来源类型：知识库 / 推理 / 工具数据。
 10. 涉及类目归属、竞品筛选、是否排除某 ASIN 时，必须基于工具结果中的事实字段判断，优先引用 latest_snapshot.leaf_category_name / latest_snapshot.category_path，其次引用 l3_category_name；不要仅凭标题、品牌或自身知识补全类目。
 11. 当用户要求“清洗/筛选/过滤上一步候选池”，且上一步 resolve_candidates 已返回 ASIN、品牌、product_title、leaf_category_name、fine_category_name、category_path、match_score、match_reasons 等字段时，直接基于这些字段筛选；不要为了判断标题或类目路径是否包含某词而调用 top_asin_drilldown。只有用户明确要求补充销量、价格、BSR、评论、预测等候选池没有的字段，才调用下游详情工具。
-12. 当 resolve_candidates 返回 pool_quality.is_sufficient_for_analysis=false 时，按闭环流程处理，不要把当前候选池包装成完整品类结论：先引用 pool_quality.insufficient_coverage_reason 说明覆盖不足；再调用 category_resolve 获取稳定 category_id/category_path；随后用 resolve_candidates(recall_mode=hybrid 或 category, category_id/category_path, include_descendants=true) 重试本地类目池；若 pool_quality 仍不足，调用 expand_candidates 创建补池任务，并调用 candidate_expansion_status 查询 queued/waiting_token/discovering/hydrating/syncing/completed 状态；只有补池完成或本地池 sufficient 后，才继续 category_benchmark 和强结论。若补池未完成，输出当前任务状态、token 等待原因和下一步，不给确定性品类/机会结论。
+12. 当 resolve_candidates 返回 pool_quality.is_sufficient_for_analysis=false 时，按闭环流程处理，不要把当前候选池包装成完整品类结论：先引用 pool_quality.insufficient_coverage_reason 说明覆盖不足；再调用 category_resolve 获取稳定 category_id/category_path；随后用 resolve_candidates(recall_mode=hybrid 或 category, category_id/category_path, include_descendants=true) 重试本地类目池；若 pool_quality 仍不足，调用 expand_candidates 创建补池任务，并调用 candidate_expansion_status 查询 queued/waiting_token/discovering/hydrating/syncing/completed 状态和 data_readiness。只有补池 job 的 data_readiness.analysis_ready=true，或本地池已 sufficient 且 stats/trends 有有效数值时，才继续 category_benchmark、candidate_pool_stats、top_asin_drilldown 和强结论；如果 status=completed 但 data_readiness.readiness_status=history_hydration_pending 或 serving_sync_pending，要说明“ASIN 已补入但分析特征未就绪”，建议等待 hydrate/serving sync 或只给待验证框架，不要把空 stats 当成市场事实。
+13. 当用户不知道选什么、要求找机会、问某大类下有什么细分方向时，优先调用 opportunity_discovery 输出机会卡片；机会卡片只是继续分析入口，不能直接写成最终选品结论。
+14. 当用户明确询问销量预测、未来增长或“为什么模型看好/看空”时，优先调用 product_forecast_explain；不要把 candidate_pool_weak_forecast 的弱信号包装成正式模型预测。
 
 工具调用规则：
 - 当你决定调用工具时，直接输出工具调用指令，不要在工具调用之前添加任何文字（如"好的，我来帮你…"等）。
@@ -69,10 +71,12 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 - resolve_candidates: 解析候选 ASIN 池
 - category_resolve: 解析商品类目名称或完整类目路径，返回 category_id 与本地覆盖度
 - expand_candidates: 创建 Keepa 补池任务，不在请求路径直接消耗 token
-- candidate_expansion_status: 查询 Keepa 补池任务状态与 token 等待状态
+- candidate_expansion_status: 查询 Keepa 补池任务状态、token 等待状态，以及 data_readiness 分析数据就绪度
+- opportunity_discovery: 发现空白机会、大类细分机会或 report 前置机会卡
 - candidate_pool_stats: 候选池描述统计，优先使用 resolve_candidates 返回的 candidate_pool_id
 - candidate_pool_trends: 候选池趋势诊断
 - candidate_pool_weak_forecast: 弱信号预测标记
+- product_forecast_explain: 商品销量模型预测与自动解释，调用正式 Theme API forecast explainability 路由
 - top_asin_drilldown: 头部 ASIN 下钻
 - asin_history_timeseries: 指定 ASIN 的历史时序
 - category_benchmark: 类目基准对比
@@ -104,9 +108,11 @@ ALLOWED_AGENT_TOOLS = {
     "category_resolve",
     "expand_candidates",
     "candidate_expansion_status",
+    "opportunity_discovery",
     "candidate_pool_stats",
     "candidate_pool_trends",
     "candidate_pool_weak_forecast",
+    "product_forecast_explain",
     "top_asin_drilldown",
     "asin_history_timeseries",
     "category_benchmark",
@@ -769,7 +775,7 @@ class Pipeline:
                 content = self._extract_assistant_content(response)
                 assistant_message = self._extract_assistant_message(response)
                 native_tool_calls = self._extract_response_tool_calls(response)
-                text_tool_calls = [] if native_tool_calls else self._extract_tool_calls(content, model_name=model_name)
+                text_tool_calls = [] if native_tool_calls or self._provider_uses_native_tool_calls(model_name) else self._extract_tool_calls(content, model_name=model_name)
                 tool_calls = native_tool_calls or text_tool_calls
 
                 if not tool_calls:
@@ -803,7 +809,7 @@ class Pipeline:
                     break
 
                 used_tools = True
-                conversation.append(assistant_message if native_tool_calls else {"role": "assistant", "content": content})
+                conversation.append(assistant_message)
 
                 tool_names = ", ".join(tool_call["name"] for tool_call in tool_calls)
                 for chunk in emit_reasoning_chunks(self._format_agent_progress("正在调用工具: %s" % tool_names)):
@@ -1282,7 +1288,9 @@ class Pipeline:
             "candidate_pool_stats": "候选池统计",
             "candidate_pool_trends": "候选池趋势",
             "candidate_pool_weak_forecast": "弱信号预测",
+            "product_forecast_explain": "模型预测解释",
             "top_asin_drilldown": "头部 ASIN 深挖",
+            "opportunity_discovery": "机会发现",
             "asin_history_timeseries": "ASIN 历史时序",
             "category_benchmark": "类目基准对比",
             "keepa_asin_lookup": "Keepa ASIN 查询",
@@ -4269,6 +4277,10 @@ class Pipeline:
 
         return payload
 
+    def _provider_uses_native_tool_calls(self, model_name: str) -> bool:
+        provider = self._get_provider(model_name)
+        return "tools" in getattr(provider, "allowed_params", set())
+
     def _run_agent_loop(
         self,
         messages: List[dict],
@@ -4308,7 +4320,7 @@ class Pipeline:
             content = self._extract_assistant_content(response)
             assistant_message = self._extract_assistant_message(response)
             native_tool_calls = self._extract_response_tool_calls(response)
-            text_tool_calls = [] if native_tool_calls else self._extract_tool_calls(content, model_name=model_name)
+            text_tool_calls = [] if native_tool_calls or self._provider_uses_native_tool_calls(model_name) else self._extract_tool_calls(content, model_name=model_name)
             tool_calls = native_tool_calls or text_tool_calls
 
             if not tool_calls:
@@ -4319,7 +4331,7 @@ class Pipeline:
                     return "已完成分析，但未生成可展示的结果，请重试。"
                 return str(content or "").strip()
 
-            conversation.append(assistant_message if native_tool_calls else {"role": "assistant", "content": content})
+            conversation.append(assistant_message)
 
             tool_results = []
             for tool_call in tool_calls:
@@ -5237,6 +5249,28 @@ class Pipeline:
                 "max_results": "limit",
                 "top_k": "limit",
             },
+            "opportunity_discovery": {
+                "question": "query",
+                "keyword": "query",
+                "keywords": "query",
+                "product": "query",
+                "product_query": "query",
+                "category": "category_path",
+                "category_id": "category_id",
+                "categoryId": "category_id",
+                "path": "category_path",
+                "full_path": "category_path",
+                "market": "marketplace",
+                "target_market": "marketplace",
+                "target_market_norm": "marketplace",
+                "top_k": "limit",
+                "top_n": "limit",
+                "max_results": "limit",
+                "confidence": "min_data_confidence",
+                "min_confidence": "min_data_confidence",
+                "descendants": "include_descendants",
+                "include_child_categories": "include_descendants",
+            },
             "candidate_pool_stats": {
                 "pool_id": "candidate_pool_id",
                 "candidatePoolId": "candidate_pool_id",
@@ -5275,6 +5309,21 @@ class Pipeline:
                 "product": "product_query",
                 "product_keyword": "product_query",
                 "market": "marketplace",
+            },
+            "product_forecast_explain": {
+                "pool_id": "candidate_pool_id",
+                "candidatePoolId": "candidate_pool_id",
+                "asins": "candidate_asins",
+                "candidate_list": "candidate_asins",
+                "candidate_pool": "candidate_asins",
+                "asin_list": "candidate_asins",
+                "query": "product_query",
+                "category": "product_query",
+                "product": "product_query",
+                "product_keyword": "product_query",
+                "market": "marketplace",
+                "top_k": "top_n",
+                "max_results": "top_n",
             },
             "top_asin_drilldown": {
                 "pool_id": "candidate_pool_id",
