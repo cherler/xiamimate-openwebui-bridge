@@ -54,7 +54,7 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 10. 涉及类目归属、竞品筛选、是否排除某 ASIN 时，必须基于工具结果中的事实字段判断，优先引用 latest_snapshot.leaf_category_name / latest_snapshot.category_path，其次引用 l3_category_name；不要仅凭标题、品牌或自身知识补全类目。
 11. 当用户要求“清洗/筛选/过滤上一步候选池”，且上一步 resolve_candidates 已返回 ASIN、品牌、product_title、leaf_category_name、fine_category_name、category_path、match_score、match_reasons 等字段时，直接基于这些字段筛选；不要为了判断标题或类目路径是否包含某词而调用 top_asin_drilldown。只有用户明确要求补充销量、价格、BSR、评论、预测等候选池没有的字段，才调用下游详情工具。
 12. 当 resolve_candidates 返回 pool_quality.is_sufficient_for_analysis=false 时，按闭环流程处理，不要把当前候选池包装成完整品类结论：先引用 pool_quality.insufficient_coverage_reason 说明覆盖不足；再调用 category_resolve 获取稳定 category_id/category_path；随后用 resolve_candidates(recall_mode=hybrid 或 category, category_id/category_path, include_descendants=true) 重试本地类目池；若 pool_quality 仍不足，调用 expand_candidates 创建补池任务，并调用 candidate_expansion_status 查询 queued/waiting_token/discovering/hydrating/syncing/completed 状态和 data_readiness。只有补池 job 的 data_readiness.analysis_ready=true，或本地池已 sufficient 且 stats/trends 有有效数值时，才继续 category_benchmark、candidate_pool_stats、top_asin_drilldown 和强结论；如果 status=completed 但 data_readiness.readiness_status=history_hydration_pending 或 serving_sync_pending，要说明“ASIN 已补入但分析特征未就绪”，建议等待 hydrate/serving sync 或只给待验证框架，不要把空 stats 当成市场事实。
-13. 当用户不知道选什么、要求找机会、问某大类下有什么细分方向时，优先调用 opportunity_discovery 输出机会卡片；机会卡片只是继续分析入口，不能直接写成最终选品结论。
+13. 当用户不知道选什么、要求找机会、问某大类下有什么细分方向时，优先调用 opportunity_discovery 输出机会卡片；机会卡片只是继续分析入口，不能直接写成最终选品结论。机会发现结果必须只展示工具真实返回的 opportunity_cards_text / opportunities_for_llm；用户要求“展开全部/完整10个/全部机会”时，如果当前真实结果不足目标数量，重新调用 opportunity_discovery(limit=10)，不要补齐不存在的排名，不要输出“待补全”“估算区间”“基于得分分布估算”。按机会编号深入分析只适用于 opportunities_for_llm 里真实存在、带 category_id/category_path/next_action 的机会。
 14. 当用户明确询问销量预测、未来增长或“为什么模型看好/看空”时，优先调用 product_forecast_explain；不要把 candidate_pool_weak_forecast 的弱信号包装成正式模型预测。
 
 工具调用规则：
@@ -786,6 +786,7 @@ class Pipeline:
                         final_answer = "已完成分析，但未生成可展示的结果，请重试。"
                     else:
                         final_answer = str(content or "").strip()
+                    final_answer = self._fallback_opportunity_answer_if_needed(final_answer, tool_observations)
                     status_line = "正在生成最终答复" if round_index == 0 else "工具执行完成，正在生成最终答复"
                     for chunk in emit_reasoning_chunks(self._format_agent_progress(status_line)):
                         yield chunk
@@ -4326,10 +4327,10 @@ class Pipeline:
             if not tool_calls:
                 cleaned = self._clean_agent_content(content, model_name=model_name)
                 if cleaned:
-                    return cleaned
+                    return self._fallback_opportunity_answer_if_needed(cleaned, tool_observations)
                 if self._agent_stream_contains_internal_markup(content, model_name=model_name):
-                    return "已完成分析，但未生成可展示的结果，请重试。"
-                return str(content or "").strip()
+                    return self._fallback_opportunity_answer_if_needed("已完成分析，但未生成可展示的结果，请重试。", tool_observations)
+                return self._fallback_opportunity_answer_if_needed(str(content or "").strip(), tool_observations)
 
             conversation.append(assistant_message)
 
@@ -5589,6 +5590,9 @@ class Pipeline:
         if payload is None:
             return self._truncate_text_for_llm(result_text, budget=budget)
 
+        if str(tool_name or "").strip() == "opportunity_discovery":
+            return self._format_opportunity_discovery_result_for_llm(payload=payload, original_chars=len(result_text), budget=budget)
+
         compact_payload = self._compact_tool_payload_for_llm(
             tool_name=tool_name,
             payload=payload,
@@ -5630,6 +5634,212 @@ class Pipeline:
                     return rendered
 
         return self._truncate_text_for_llm(rendered, budget=budget)
+
+    def _format_opportunity_discovery_result_for_llm(self, payload: dict, original_chars: int, budget: int) -> str:
+        opportunity_payload = self._extract_opportunity_payload(payload)
+        opportunity_count = self._opportunity_count(opportunity_payload)
+        cards_text = str(opportunity_payload.get("opportunity_cards_text") or "").strip()
+
+        compact_payload = self._copy_keys(
+            opportunity_payload,
+            [
+                "instruction",
+                "opportunity_count",
+                "opportunity_cards_text",
+                "opportunities_for_llm",
+                "metric_definitions",
+                "display_rules",
+                "diagnostics",
+                "notes",
+                "meta",
+            ],
+        )
+        compact_payload["opportunity_count"] = opportunity_count
+        if cards_text:
+            compact_payload["opportunity_cards_text"] = cards_text
+        if "opportunities_for_llm" in compact_payload:
+            compact_payload["opportunities_for_llm"] = self._compact_opportunities_for_llm(
+                compact_payload.get("opportunities_for_llm"), max_items=12, max_string=180
+            )
+        if "metric_definitions" in compact_payload:
+            compact_payload["metric_definitions"] = self._compact_json_value(
+                compact_payload["metric_definitions"],
+                max_depth=4,
+                max_items=12,
+                max_scalar_items=30,
+                max_string=360,
+            )
+
+        envelope = {
+            "tool_name": "opportunity_discovery",
+            "result_format": "opportunity_cards_text_preserved",
+            "original_chars": original_chars,
+            "instruction": (
+                "最终答复必须优先原样使用 opportunity_cards_text；只展示真实返回的机会行。"
+                "不要补齐不存在的 # 排名，不要用占位状态或推算范围冒充工具结果。"
+                "如果用户要求展开全部但真实 opportunity_count 不足目标数量，重新调用 opportunity_discovery(limit=10)。"
+                "按编号深入分析只适用于 opportunities_for_llm 中真实存在的编号。"
+            ),
+            "payload": compact_payload,
+        }
+        rendered = json.dumps(envelope, ensure_ascii=False, indent=2)
+        if len(rendered) <= budget:
+            return rendered
+
+        compact_payload.pop("diagnostics", None)
+        compact_payload.pop("meta", None)
+        compact_payload.pop("notes", None)
+        rendered = json.dumps(envelope, ensure_ascii=False, indent=2)
+        if len(rendered) <= budget:
+            return rendered
+
+        if "opportunities_for_llm" in compact_payload:
+            compact_payload["opportunities_for_llm"] = self._compact_opportunities_for_llm(
+                compact_payload.get("opportunities_for_llm"), max_items=10, max_string=90
+            )
+        rendered = json.dumps(envelope, ensure_ascii=False, indent=2)
+        if len(rendered) <= budget:
+            return rendered
+
+        compact_payload.pop("opportunities_for_llm", None)
+        rendered = json.dumps(envelope, ensure_ascii=False, indent=2)
+        if len(rendered) <= budget:
+            return rendered
+
+        compact_payload["opportunity_cards_text"] = self._trim_opportunity_cards_text(cards_text, budget=max(1200, budget - 1200))
+        compact_payload["overflow_note"] = "机会表文本过长，当前内容只保留工具真实返回文本的前段；不要据此补齐缺失机会。"
+        rendered = json.dumps(envelope, ensure_ascii=False, indent=2)
+        if len(rendered) <= budget:
+            return rendered
+        return rendered[:budget]
+
+    def _extract_opportunity_payload(self, payload: dict) -> dict:
+        if not isinstance(payload, dict):
+            return {}
+        if any(key in payload for key in ("opportunity_cards_text", "opportunities_for_llm", "opportunities")):
+            return payload
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else None
+        if data is not None:
+            if any(key in data for key in ("opportunity_cards_text", "opportunities_for_llm", "opportunities")):
+                return data
+            result = data.get("result")
+            nested = self._load_tool_json_payload(result) if isinstance(result, str) else None
+            if nested is not None:
+                return self._extract_opportunity_payload(nested)
+        result = payload.get("result")
+        nested = self._load_tool_json_payload(result) if isinstance(result, str) else None
+        if nested is not None:
+            return self._extract_opportunity_payload(nested)
+        return payload
+
+    def _opportunity_count(self, payload: dict) -> int:
+        raw_count = payload.get("opportunity_count") if isinstance(payload, dict) else None
+        try:
+            return int(raw_count)
+        except (TypeError, ValueError):
+            pass
+        for key in ("opportunities_for_llm", "opportunities"):
+            value = payload.get(key) if isinstance(payload, dict) else None
+            if isinstance(value, list):
+                return len(value)
+        return 0
+
+    def _compact_opportunities_for_llm(self, opportunities: Any, *, max_items: int, max_string: int) -> Any:
+        if not isinstance(opportunities, list):
+            return opportunities
+        compact_items = []
+        for item in opportunities[:max_items]:
+            if not isinstance(item, dict):
+                compact_items.append(self._compact_leaf_value(item, max_string=max_string))
+                continue
+            compact_items.append(
+                self._compact_json_value(
+                    self._copy_keys(
+                        item,
+                        [
+                            "rank",
+                            "title",
+                            "category_id",
+                            "category_path",
+                            "opportunity_score",
+                            "sales_window_sum",
+                            "candidate_count",
+                            "row_count",
+                            "sales_momentum_pct",
+                            "trend_momentum_pct",
+                            "offer_count_avg",
+                            "data_confidence",
+                            "next_action",
+                            "metric_explanations",
+                        ],
+                    ),
+                    max_depth=4,
+                    max_items=8,
+                    max_scalar_items=18,
+                    max_string=max_string,
+                )
+            )
+        if len(opportunities) > max_items:
+            compact_items.append({"_omitted_items": len(opportunities) - max_items, "_total_items": len(opportunities)})
+        return compact_items
+
+    def _trim_opportunity_cards_text(self, text: str, budget: int) -> str:
+        clean_text = str(text or "").strip()
+        if len(clean_text) <= budget:
+            return clean_text
+        lines = clean_text.splitlines()
+        kept_lines: List[str] = []
+        used = 0
+        for line in lines:
+            next_used = used + len(line) + 1
+            if next_used > budget:
+                break
+            kept_lines.append(line)
+            used = next_used
+        kept_lines.append("[后续真实工具文本过长已省略；不要补齐缺失机会行]")
+        return "\n".join(kept_lines)
+
+    def _fallback_opportunity_answer_if_needed(self, answer: str, tool_observations: List[dict]) -> str:
+        if not self._answer_has_invalid_opportunity_expansion(answer):
+            return answer
+        fallback = self._fallback_opportunity_answer_from_observations(tool_observations)
+        return fallback or answer
+
+    def _answer_has_invalid_opportunity_expansion(self, answer: str) -> bool:
+        text = str(answer or "")
+        if not text:
+            return False
+        markers = ("待补全", "待补充", "估算区间", "基于机会得分分布", "结果压缩截断")
+        return any(marker in text for marker in markers)
+
+    def _fallback_opportunity_answer_from_observations(self, tool_observations: List[dict]) -> str:
+        for observation in reversed(tool_observations or []):
+            if str(observation.get("tool_name") or "") != "opportunity_discovery":
+                continue
+            payload = self._load_tool_json_payload(observation.get("llm_result"))
+            if payload is None:
+                payload = self._load_tool_json_payload(observation.get("raw_result"))
+            if payload is None:
+                continue
+            opportunity_payload = self._extract_opportunity_payload(payload.get("payload") if isinstance(payload.get("payload"), dict) else payload)
+            cards_text = str(opportunity_payload.get("opportunity_cards_text") or "").strip()
+            if not cards_text:
+                continue
+            opportunity_count = self._opportunity_count(opportunity_payload)
+            lines = [
+                "下面只展示 opportunity_discovery 工具真实返回的机会卡片，不补齐不存在的排名。",
+                "",
+                cards_text,
+            ]
+            if opportunity_count:
+                lines.extend(
+                    [
+                        "",
+                        "说明：当前可深入分析的机会编号只限于上表真实返回的 %d 个机会；如果要完整 10 个，需要重新调用 opportunity_discovery(limit=10) 并以新返回结果为准。" % opportunity_count,
+                    ]
+                )
+            return "\n".join(lines)
+        return ""
 
     def _compact_tool_payload_for_llm(
         self,

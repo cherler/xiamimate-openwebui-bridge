@@ -376,6 +376,90 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertNotIn("unused_payload", rendered)
         self.assertLessEqual(len(rendered), 5000)
 
+    def test_opportunity_discovery_preserves_cards_text_for_llm(self) -> None:
+        pipe = self.make_pipeline()
+        cards_text = "\n".join(
+            [
+                "### 完整10大机会卡片",
+                "| 排名 | 机会主题 | 得分 | 类目路径 | 窗口销量估算 | 样本ASIN数 | 日数据行数 | 销量增长 | 趋势增长 | 竞争Offer | 置信度 |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            ]
+            + [
+                "| #%d | 真实机会%d | %.2f | Home & Kitchen > Storage > Box %d | %d | %d | %d | %d%% | %d%% | %.2f | medium |"
+                % (index, index, 0.9 - index * 0.01, index, 1000 + index, 10 + index, 30 + index, index * 2, index * 3, 1.2 + index / 10)
+                for index in range(1, 11)
+            ]
+            + [
+                "",
+                "字段解释：",
+                "- 样本ASIN数：进入本次机会评分的真实 ASIN 数。",
+                "- 竞争Offer：Keepa offer_count 的窗口均值，表示同一 ASIN 下的在售报价/卖家报价数量。",
+            ]
+        )
+        payload = {
+            "instruction": "优先原样使用 opportunity_cards_text 展示。",
+            "opportunity_count": 10,
+            "opportunity_cards_text": cards_text,
+            "opportunities_for_llm": [
+                {
+                    "rank": index,
+                    "title": "真实机会%d" % index,
+                    "category_id": 1000 + index,
+                    "category_path": "Home & Kitchen > Storage > Box %d" % index,
+                    "opportunity_score": 0.9 - index * 0.01,
+                    "candidate_count": 10 + index,
+                    "row_count": 30 + index,
+                    "next_action": {"tool": "resolve_candidates", "category_id": 1000 + index},
+                    "large_unused_field": "drop-me" * 200,
+                }
+                for index in range(1, 11)
+            ],
+            "metric_definitions": {"sales_window_sum": "窗口销量估算不是美元金额。"},
+            "diagnostics": {"trace": "x" * 2000},
+        }
+
+        rendered = pipe._format_tool_result_for_llm("opportunity_discovery", json.dumps(payload, ensure_ascii=False), budget=7000)
+        compacted = json.loads(rendered)
+
+        self.assertEqual(compacted["result_format"], "opportunity_cards_text_preserved")
+        self.assertEqual(compacted["payload"]["opportunity_count"], 10)
+        self.assertIn("完整10大机会卡片", compacted["payload"]["opportunity_cards_text"])
+        self.assertIn("| #10 | 真实机会10", compacted["payload"]["opportunity_cards_text"])
+        self.assertIn("样本ASIN数", compacted["payload"]["opportunity_cards_text"])
+        self.assertIn("竞争Offer", compacted["payload"]["opportunity_cards_text"])
+        self.assertIn("真实机会3", rendered)
+        self.assertNotIn("待补全", rendered)
+        self.assertNotIn("估算区间", rendered)
+        self.assertNotIn("结果已压缩截断", rendered)
+        self.assertNotIn("large_unused_field", rendered)
+        self.assertLessEqual(len(rendered), 7000)
+
+    def test_invalid_opportunity_expansion_falls_back_to_real_cards(self) -> None:
+        pipe = self.make_pipeline()
+        raw_result = json.dumps(
+            {
+                "opportunity_count": 2,
+                "opportunity_cards_text": "| 排名 | 机会主题 | 类目路径 |\n| --- | --- | --- |\n| #1 | 真实机会1 | Home & Kitchen |\n| #2 | 真实机会2 | Sports & Outdoors |",
+                "opportunities_for_llm": [
+                    {"rank": 1, "title": "真实机会1", "category_id": 11, "category_path": "Home & Kitchen"},
+                    {"rank": 2, "title": "真实机会2", "category_id": 22, "category_path": "Sports & Outdoors"},
+                ],
+            },
+            ensure_ascii=False,
+        )
+        observation = pipe._build_tool_observation({"name": "opportunity_discovery", "parameters": {}}, raw_result)
+
+        answer = pipe._fallback_opportunity_answer_if_needed(
+            "#3~#10 详情因结果压缩截断，基于机会得分分布提供估算区间。",
+            [observation],
+        )
+
+        self.assertIn("真实机会1", answer)
+        self.assertIn("真实机会2", answer)
+        self.assertIn("不补齐不存在的排名", answer)
+        self.assertIn("真实返回的 2 个机会", answer)
+        self.assertNotIn("估算区间", answer)
+
     def test_resolve_candidates_aliases_support_category_recall_controls(self) -> None:
         pipe = self.make_pipeline()
 
