@@ -44,6 +44,25 @@ class Tools:
             error_prefix="知识库检索失败",
         )
 
+    def customer_help_search(
+        self,
+        query: str,
+        top_k: int = 5,
+    ) -> str:
+        """Search the customer-help knowledge base for usage guidance, pricing rules, prompt examples, and customer-service standard answers.
+
+        Use this tool only for /help-style questions such as prompt suggestions, pricing and points rules, onboarding guidance, account-related FAQ, and customer-facing product explanations.
+
+        :param query: The customer-help query to search for.
+        :param top_k: Number of top relevant snippets to return (default 5).
+        :return: Formatted customer-help snippets with source attribution.
+        """
+        return self._proxy_result(
+            path="/internal/provider/dify-customer-help/retrieve",
+            payload={"query": query, "top_k": top_k},
+            error_prefix="客服知识库检索失败",
+        )
+
     def web_search(
         self,
         query: str,

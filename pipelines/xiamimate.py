@@ -94,6 +94,18 @@ TOOL_ONLY_SYSTEM_PROMPT = AGENT_SYSTEM_PROMPT + """
 - 优先给出下一步所需的最小工具调用，再基于工具结果汇总结论。
 """
 
+HELP_SYSTEM_PROMPT = """你是 XiaMimate 的客服帮助助手，专门处理 /help 模式问题。
+
+工作规则：
+1. 必须先调用 customer_help_search 工具检索客服知识库，再基于检索结果回答；不要直接依赖自身记忆回答。
+2. 只允许使用 customer_help_search 这一个工具，不要调用别的工具。
+3. 不要把检索原文整段照抄给用户，不要输出文件名、相关度、分块编号，除非用户明确要求来源。
+4. 回答结构优先是：直接回答用户问题；如果合适，再补 1 到 3 条下一步建议；只有在知识里确实有现成示例时，才精选最相关的 1 到 3 条可复制示例。
+5. 多意图问题要合并整理，去重后输出，不要把不同分块的重复内容机械堆叠。
+6. 如果知识不足以支持回答，要明确说“当前客服知识库里没有足够信息”，并建议用户换一个更具体的问法。
+7. 保持客服口吻，简洁、明确、可执行，不要展示内部检索过程。
+"""
+
 TOOL_RESULT_TEMPLATE = """以下是工具执行结果，请基于这些结果继续回答用户原问题。
 
 工具名: {tool_name}
@@ -105,6 +117,7 @@ TOOL_RESULT_TEMPLATE = """以下是工具执行结果，请基于这些结果继
 如果仍需继续调用工具，只调用真正必要的工具，不要重复调用相同工具。"""
 
 ALLOWED_AGENT_TOOLS = {
+    "customer_help_search",
     "search_knowledge_base",
     "web_search",
     "resolve_candidates",
@@ -126,6 +139,7 @@ ALLOWED_AGENT_TOOLS = {
 
 COMMAND_TO_MODE = {
     "/agent": "agent",
+    "/help": "help",
     "/report": "report",
     "/web": "web",
     "/wf": "workflow",
@@ -234,20 +248,20 @@ TOOL_BILLING_EVENT = {
 
 WORKFLOW_SUGGESTION_PROMPTS = [
     {
-        "title": ["/report 示例", "宠物自动喂食器在 TikTok 美国市场的前景"],
-        "content": "/report standard 帮我调研一下宠物自动喂食器在 TikTok 美国市场的前景",
+        "title": ["/help 示例", "新手卖家提示词"],
+        "content": "/help 新手卖家第一次使用虾米选品，给我 5 条可以直接复制的提示词，并说明分别适合什么场景。",
+    },
+    {
+        "title": ["/tool 示例", "humidifier 原生工具验证路径"],
+        "content": "/tool 请用原生工具帮我拆解 humidifier 在 Amazon 美国站的选品验证路径：先解析候选池，再说明应该继续看 stats、trends、benchmark、top ASIN 还是补池。",
+    },
+    {
+        "title": ["/report quick", "pet hair remover 快速判断"],
+        "content": "/report quick 请快速判断 pet hair remover 在 Amazon 美国站是否值得继续看，并给出 3 个最关键验证指标。",
     },
     {
         "title": ["/web 示例", "TikTok Shop 美国站最新政策"],
-        "content": "/web 帮我搜索并总结 2026 年 TikTok Shop 美国站最新入驻与合规政策变化",
-    },
-    {
-        "title": ["工具调研示例", "portable blender 在 Amazon 美国市场是否值得做"],
-        "content": "帮我分析 portable blender 在 Amazon 美国市场是否值得做，并给出建议调用的工具和验证路径。",
-    },
-    {
-        "title": ["规则问答示例", "TikTok Shop 美国站注册规则"],
-        "content": "TikTok Shop 美国站的注册规则和资料要求是什么？",
+        "content": "/web 请搜索最近 30 天 TikTok Shop 美国站入驻、履约、广告和合规政策变化，并按卖家影响排序。",
     },
 ]
 
@@ -394,7 +408,7 @@ class Pipeline:
                 continue
             seen_ids.add(pipeline_id)
             label = self._label_for_profile(profile)
-            description = "虾米选品的智能体模式，支持 /report 报告编排，并兼容 /workflow 旧入口。当前模型：%s。" % label
+            description = "虾米选品的智能体模式，支持 /help 知识库帮助、/report 报告编排，并兼容 /workflow 旧入口。当前模型：%s。" % label
             pipelines.append(
                 {
                     "id": pipeline_id,
@@ -470,6 +484,8 @@ class Pipeline:
 
         if mode == "workflow":
             return self._run_workflow(query=normalized_user_message, body=body, model=response_model)
+        if mode == "help":
+            return self._run_help(query=normalized_user_message, body=body, model=response_model)
         if mode == "report":
             return self._run_report(query=normalized_user_message, body=body, model=response_model)
         if mode == "web":
@@ -497,6 +513,33 @@ class Pipeline:
                 "/workflow 帮我调研一下宠物自动喂食器在 TikTok 美国市场的前景"
             ),
         )
+
+    def _run_help(self, query: str, body: dict, model: str) -> Union[dict, Iterator[bytes]]:
+        normalized_query = (query or "").strip()
+        if not normalized_query:
+            content = (
+                "请在 /help 后面写出你要查询的帮助主题，例如：\n"
+                "/help 新手卖家第一次使用虾米选品，给我 5 条可以直接复制的提示词。\n"
+                "/help /report quick、standard、deep、research 分别适合什么场景？\n"
+                "/help 更省积分的提问方式有哪些？"
+            )
+        else:
+            try:
+                answer = self._run_agent_loop(
+                    messages=[{"role": "user", "content": normalized_query}],
+                    body=body,
+                    billing_context={},
+                    model_name=model,
+                    mode="help",
+                    charge_llm=False,
+                )
+                content = str(answer or "").strip() or "当前客服知识库里没有足够信息，请换一个更具体的问法再试。"
+            except Exception as exc:
+                content = "客服知识库检索失败：%s" % str(exc)[:2000]
+
+        if body.get("stream"):
+            return self._stream_text_response(content=content, model=model)
+        return self._chat_response(content=content, model=model)
 
     def _run_report(self, query: str, body: dict, model: str) -> Union[dict, Iterator[bytes]]:
         profile, normalized_query = self._parse_report_profile(query)
@@ -755,26 +798,9 @@ class Pipeline:
             for round_index in range(6):
                 payload = self._prepare_agent_payload(messages=conversation, body=body, mode=mode, model_name=model_name)
                 payload["stream"] = False
-                minimax_charge = self._charge_billing_event(
-                    billing_context=billing_context,
-                    event_type="llm_request",
-                    description="LLM 请求",
-                    meta={
-                        "mode": "agent",
-                        "model": payload.get("model"),
-                        "message_count": len(payload.get("messages") or []),
-                        "stream": True,
-                    },
-                )
                 try:
                     response = self._post_agent_payload(payload, model_name=model_name)
                 except RuntimeError as exc:
-                    self._refund_billing_event(
-                        billing_context=billing_context,
-                        charge=minimax_charge,
-                        description="LLM 请求失败，已退款",
-                        meta={"mode": "agent", "stream": True, "error": str(exc)[:500]},
-                    )
                     if tool_observations:
                         final_answer = self._fallback_answer_from_tool_observations(tool_observations, error=str(exc))
                         for chunk in emit_reasoning_chunks(self._format_agent_progress("模型整理失败，返回工具结果摘要")):
@@ -795,6 +821,13 @@ class Pipeline:
                 tool_calls = native_tool_calls or text_tool_calls
 
                 if not tool_calls:
+                    if mode == "agent" and not used_tools:
+                        self._charge_standalone_llm_request(
+                            billing_context=billing_context,
+                            payload=payload,
+                            mode=mode,
+                            stream=True,
+                        )
                     cleaned = self._clean_agent_content(content, model_name=model_name)
                     if cleaned:
                         final_answer = cleaned
@@ -936,7 +969,7 @@ class Pipeline:
         effective_model = str(body.get("model", model_id) or model_id or "")
         model_mode = effective_model.split(".")[-1].lower() if effective_model else ""
 
-        mode = requested_mode or command_mode or (model_mode if model_mode in {"agent", "tool", "workflow", "report"} else "agent")
+        mode = requested_mode or command_mode or (model_mode if model_mode in {"agent", "tool", "workflow", "report", "help"} else "agent")
         query = (command_query if command_mode else (user_message or last_user_text or "")).strip()
         return mode, query, command_mode is not None
 
@@ -1300,8 +1333,10 @@ class Pipeline:
         entry_type = str(row.get("entry_type") or "").strip().lower()
         event_type = str(row.get("event_type") or "").strip().lower()
         known_descriptions = {
-            "MiniMax agent request": "按 LLM 请求次数计费。",
-            "MiniMax agent request failed": "LLM 请求失败，系统已自动退款。",
+            "MiniMax agent request": "仅未触发工具的独立 LLM 请求计费。",
+            "MiniMax agent request failed": "独立 LLM 请求失败，系统已自动退款。",
+            "LLM 请求": "仅未触发工具的独立 LLM 请求计费。",
+            "LLM 请求失败，已退款": "独立 LLM 请求失败，系统已自动退款。",
             "快速报告": "一次快速报告计费，内部步骤只保留审计记录，不重复收费。",
             "标准报告": "一次标准报告计费，内部步骤只保留审计记录，不重复收费。",
             "深度报告": "一次深度报告计费，内部步骤只保留审计记录，不重复收费。",
@@ -1332,7 +1367,7 @@ class Pipeline:
                 "report_standard_run": "一次标准报告计费，内部检索和工具调用只保留记录，不重复收费。",
                 "report_deep_run": "一次深度报告计费，内部检索和工具调用只保留记录，不重复收费。",
                 "report_research_run": "一次研究报告计费，内部检索和工具调用只保留记录，不重复收费。",
-                "llm_request": "按 LLM 请求次数计费。",
+                "llm_request": "仅未触发工具的独立 LLM 请求计费。",
                 "kb_retrieve": "按知识库检索次数计费。",
                 "dify_knowledge_retrieve": "按知识库检索次数计费。",
                 "product_api_call": "按商品 API 检索次数计费。",
@@ -4264,11 +4299,12 @@ class Pipeline:
         level = max(1, int(heading_level or 2))
         return "%s %s\n```%s\n%s\n```" % ("#" * level, title, renderer, spec_text)
 
-    def _build_agent_tool_definitions(self) -> List[dict]:
+    def _build_agent_tool_definitions(self, mode: str = "agent") -> List[dict]:
         definitions = []
         if self.agent_tools is None:
             return definitions
-        for tool_name in sorted(ALLOWED_AGENT_TOOLS):
+        allowed_tools = {"customer_help_search"} if mode == "help" else ALLOWED_AGENT_TOOLS
+        for tool_name in sorted(allowed_tools):
             method = getattr(self.agent_tools, tool_name, None)
             if method is None:
                 continue
@@ -4336,7 +4372,7 @@ class Pipeline:
             memory_profile=body.get("_xiamimate_memory_profile") if isinstance(body, dict) else None,
         )
         if "tools" in getattr(provider, "allowed_params", set()):
-            payload["tools"] = self._build_agent_tool_definitions()
+            payload["tools"] = self._build_agent_tool_definitions(mode=mode)
             payload.setdefault("tool_choice", "auto")
 
         user_value = payload.get("user")
@@ -4404,34 +4440,22 @@ class Pipeline:
         billing_context: dict,
         model_name: str,
         mode: str = "agent",
+        charge_llm: bool = True,
     ) -> str:
         conversation = deepcopy(messages or [])
         tool_observations: List[dict] = []
         tool_result_cache: Dict[Tuple[str, str], dict] = {}
+        used_tools = False
 
         for _ in range(6):
             payload = self._prepare_agent_payload(messages=conversation, body=body, mode=mode, model_name=model_name)
             payload["stream"] = False
-            minimax_charge = self._charge_billing_event(
-                billing_context=billing_context,
-                event_type="llm_request",
-                description="LLM 请求",
-                meta={
-                    "mode": "agent",
-                    "model": payload.get("model"),
-                    "message_count": len(payload.get("messages") or []),
-                },
-            )
             try:
                 response = self._post_agent_payload(payload, model_name=model_name)
             except RuntimeError as exc:
-                self._refund_billing_event(
-                    billing_context=billing_context,
-                    charge=minimax_charge,
-                    description="LLM 请求失败，已退款",
-                    meta={"mode": "agent", "error": str(exc)[:500]},
-                )
                 if tool_observations:
+                    if mode == "help":
+                        return self._fallback_help_answer_from_tool_observations(tool_observations, error=str(exc))
                     return self._fallback_answer_from_tool_observations(tool_observations, error=str(exc))
                 raise
             content = self._extract_assistant_content(response)
@@ -4441,6 +4465,13 @@ class Pipeline:
             tool_calls = native_tool_calls or text_tool_calls
 
             if not tool_calls:
+                if charge_llm and mode == "agent" and not used_tools:
+                    self._charge_standalone_llm_request(
+                        billing_context=billing_context,
+                        payload=payload,
+                        mode=mode,
+                        stream=False,
+                    )
                 cleaned = self._clean_agent_content(content, model_name=model_name)
                 if cleaned:
                     return self._fallback_opportunity_answer_if_needed(cleaned, tool_observations)
@@ -4448,6 +4479,7 @@ class Pipeline:
                     return self._fallback_opportunity_answer_if_needed("已完成分析，但未生成可展示的结果，请重试。", tool_observations)
                 return self._fallback_opportunity_answer_if_needed(str(content or "").strip(), tool_observations)
 
+            used_tools = True
             conversation.append(assistant_message)
             tool_calls = [self._attach_internal_tool_context(tool_call, body) for tool_call in tool_calls]
 
@@ -4465,6 +4497,8 @@ class Pipeline:
                     new_tool_calls.append(tool_call)
 
             if cached_tool_calls and not new_tool_calls:
+                if mode == "help":
+                    return self._fallback_help_answer_from_tool_observations(tool_observations)
                 return self._fallback_opportunity_answer_from_observations(tool_observations) or self._fallback_answer_from_tool_observations(tool_observations)
 
             tool_results = []
@@ -4514,6 +4548,26 @@ class Pipeline:
                 conversation.append({"role": "user", "content": "\n\n".join(tool_results)})
 
         raise RuntimeError("Agent 工具调用轮次超过上限，已中止。")
+
+    def _charge_standalone_llm_request(
+        self,
+        billing_context: dict,
+        payload: dict,
+        mode: str,
+        stream: bool,
+    ) -> dict:
+        return self._charge_billing_event(
+            billing_context=billing_context,
+            event_type="llm_request",
+            description="LLM 请求",
+            meta={
+                "mode": mode,
+                "model": payload.get("model"),
+                "message_count": len(payload.get("messages") or []),
+                "stream": bool(stream),
+                "billing_scope": "standalone_llm_only",
+            },
+        )
 
     def _ensure_billing_context(self, body: dict) -> dict:
         data = self._chat_backend_request(
@@ -6747,7 +6801,23 @@ class Pipeline:
         messages.insert(insert_index, {"role": "system", "content": content})
 
     def _agent_system_prompt_for_mode(self, mode: str) -> str:
-        return TOOL_ONLY_SYSTEM_PROMPT if mode == "tool" else AGENT_SYSTEM_PROMPT
+        if mode == "tool":
+            return TOOL_ONLY_SYSTEM_PROMPT
+        if mode == "help":
+            return HELP_SYSTEM_PROMPT
+        return AGENT_SYSTEM_PROMPT
+
+    def _fallback_help_answer_from_tool_observations(self, tool_observations: List[dict], error: str = "") -> str:
+        latest_result = str((tool_observations[-1] or {}).get("llm_result") or "").strip() if tool_observations else ""
+        if latest_result.startswith("客服知识库检索失败"):
+            message = latest_result[:2000]
+        elif "未找到" in latest_result:
+            message = "当前客服知识库里没有找到足够相关的内容。请换一个更具体的问法，例如只问价格规则、/report 计费、提示词示例或新手上手步骤。"
+        else:
+            message = "客服知识库已经检索到相关内容，但模型整理最终答复时失败了。请重试一次，或把问题拆得更具体一些再问。"
+        if error:
+            message = "%s\n\n备注：%s" % (message, str(error).strip()[:300])
+        return message
 
     def _user_id(self, body: dict) -> str:
         user = body.get("user")
