@@ -580,20 +580,133 @@ class Pipeline:
         )
 
     def _run_web_search(self, query: str, body: dict, model: str) -> Union[dict, Iterator[bytes]]:
-        return self._run_dify_chatflow(
-            query=query,
-            body=body,
-            model=model,
-            event_type="web_search",
-            charge_description="网络搜索",
-            run_path="/internal/provider/dify-web-search/run",
-            run_stream_path="/internal/provider/dify-web-search/run-stream",
-            mode_tag="web",
-            guidance=(
-                "请在 /web 后直接写出要联网搜索的问题，例如：\n"
-                "/web 帮我搜索并总结 2026 年 TikTok Shop 美国站最新入驻政策变化"
-            ),
+        query = (query or "").strip()
+        guidance = (
+            "请在 /web 后直接写出要联网搜索的问题，例如：\n"
+            "/web 帮我搜索并总结 2026 年 TikTok Shop 美国站最新入驻政策变化"
         )
+        if not query:
+            if body.get("stream"):
+                return self._stream_text_response(content=guidance, model=model)
+            return self._chat_response(content=guidance, model=model)
+
+        if not self.valves.CHAT_BACKEND_SERVICE_SECRET:
+            message = "CHAT_BACKEND_SERVICE_SECRET 未配置。"
+            if body.get("stream"):
+                return self._stream_text_response(content=message, model=model)
+            return self._chat_response(content=message, model=model)
+
+        try:
+            billing_context = self._ensure_billing_context(body)
+            web_charge = self._charge_billing_event(
+                billing_context=billing_context,
+                event_type="web_search",
+                description="网络搜索",
+                meta={"mode": "web", "provider": "tavily", "stream": bool(body.get("stream")), "query_preview": query[:200]},
+            )
+        except RuntimeError as exc:
+            message = self._error_text(str(exc))
+            if body.get("stream"):
+                return self._stream_text_response(content=message, model=model)
+            return self._chat_response(content=message, model=model)
+
+        if body.get("stream"):
+            return self._run_tavily_web_search_stream(
+                query=query,
+                body=body,
+                model=model,
+                billing_context=billing_context,
+                web_charge=web_charge,
+            )
+
+        try:
+            response = self._run_tavily_web_search_request(query=query, body=body, billing_context=billing_context)
+        except RuntimeError as exc:
+            self._refund_billing_event(
+                billing_context=billing_context,
+                charge=web_charge,
+                description="网络搜索失败，已退款",
+                meta={"mode": "web", "provider": "tavily", "error": str(exc)[:500]},
+            )
+            return self._chat_response(content=self._error_text(str(exc)), model=model)
+
+        return self._chat_response(content=self._format_tavily_web_search_answer(response), model=model)
+
+    def _run_tavily_web_search_request(self, query: str, body: dict, billing_context: dict) -> dict:
+        return self._chat_backend_request(
+            method="POST",
+            path="/internal/provider/web-search/tavily",
+            body={
+                "query": query,
+                "user": billing_context["user_id"],
+                "search_mode": self._body_context_value(body, "search_mode") or "auto",
+                "target_platform": self._body_context_value(body, "target_platform"),
+                "target_market": self._body_context_value(body, "target_market") or self._body_context_value(body, "marketplace"),
+                "max_results": 5,
+                "include_answer": True,
+            },
+            internal=True,
+            timeout=self.valves.DIFY_REQUEST_TIMEOUT,
+        )
+
+    def _format_tavily_web_search_answer(self, response: dict) -> str:
+        if not isinstance(response, dict):
+            return str(response or "")
+        result_text = str(response.get("result_text") or "").strip()
+        if result_text:
+            return result_text
+        answer = str(response.get("answer") or "").strip()
+        if answer:
+            return answer
+        return json.dumps(response, ensure_ascii=False, indent=2)
+
+    def _run_tavily_web_search_stream(
+        self,
+        query: str,
+        body: dict,
+        model: str,
+        billing_context: dict,
+        web_charge: dict,
+    ) -> Iterator[bytes]:
+        response_id = "%s-%s" % (model, uuid.uuid4())
+        created = int(time.time())
+        answer_started = False
+
+        def emit_text_chunk(content: str) -> bytes:
+            return self._stream_content_chunk(response_id=response_id, created=created, model=model, content=content)
+
+        try:
+            yield self._stream_reasoning_open_chunk(response_id=response_id, created=created, model=model)
+            yield self._stream_reasoning_text_chunk(
+                response_id=response_id,
+                created=created,
+                model=model,
+                content=self._format_dify_progress("web", 20, "正在直连 Tavily 搜索网络信息"),
+            )
+            response = self._run_tavily_web_search_request(query=query, body=body, billing_context=billing_context)
+            yield self._stream_reasoning_text_chunk(
+                response_id=response_id,
+                created=created,
+                model=model,
+                content=self._format_dify_progress("web", 100, "Tavily 搜索完成，正在整理结果"),
+            )
+            yield self._stream_reasoning_close_chunk(response_id=response_id, created=created, model=model)
+            answer_started = True
+            for chunk in self._split_text(self._format_tavily_web_search_answer(response)):
+                yield emit_text_chunk(chunk)
+        except RuntimeError as exc:
+            if not answer_started:
+                self._refund_billing_event(
+                    billing_context=billing_context,
+                    charge=web_charge,
+                    description="网络搜索失败，已退款",
+                    meta={"mode": "web", "provider": "tavily", "error": str(exc)[:500]},
+                )
+            yield self._stream_reasoning_close_chunk(response_id=response_id, created=created, model=model)
+            yield emit_text_chunk("\n" + self._error_text(str(exc)))
+
+        yield self._stream_stop_chunk(response_id=response_id, created=created, model=model)
+        yield b"data: [DONE]\n\n"
 
     def _run_dify_chatflow(
         self,

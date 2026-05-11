@@ -276,6 +276,30 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertIn("candidate_asins", tool_message["content"])
         self.assertFalse(any("以下是工具执行结果" in str(message.get("content") or "") for message in second_messages))
 
+    def test_web_route_uses_tavily_provider(self) -> None:
+        pipe = self.make_pipeline()
+        observed_requests = []
+
+        pipe.valves.CHAT_BACKEND_SERVICE_SECRET = "test-secret"
+        pipe._ensure_billing_context = lambda body: {"user_id": "user-1", "api_key": "test"}
+
+        def chat_backend_request(**kwargs):
+            observed_requests.append(copy.deepcopy(kwargs))
+            return {"result_text": "Tavily result text"}
+
+        pipe._chat_backend_request = chat_backend_request
+
+        response = pipe._run_web_search(
+            query="TikTok Shop US policy updates",
+            body={"stream": False, "user": {"id": "user-1"}},
+            model="xiamimate.agent",
+        )
+
+        self.assertEqual(response["choices"][0]["message"]["content"], "Tavily result text")
+        self.assertEqual(observed_requests[0]["path"], "/internal/provider/web-search/tavily")
+        self.assertEqual(observed_requests[0]["body"]["search_mode"], "auto")
+        self.assertNotIn("dify-web-search", json.dumps(observed_requests[0], ensure_ascii=False))
+
     def test_native_capable_provider_does_not_execute_text_tool_markup(self) -> None:
         pipe = self.make_pipeline()
         observed_payloads = []

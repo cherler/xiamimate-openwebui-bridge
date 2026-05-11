@@ -3,7 +3,7 @@ title: XiaMimate Theme Tools
 author: GitHub Copilot
 date: 2026-04-14
 version: 0.2.0
-description: Native Open WebUI tool wrappers for XiaMimate theme_api, Dify knowledge base retrieval, and Dify web search.
+description: Native Open WebUI tool wrappers for XiaMimate theme_api, Dify knowledge base retrieval, and Tavily web search.
 requirements: requests
 """
 
@@ -67,16 +67,16 @@ class Tools:
         self,
         query: str,
     ) -> str:
-        """Search the live web through the XiaMimate Dify web-search chatflow and return a summarized result.
+        """Search the live web through XiaMimate's direct Tavily web-search provider and return a summarized result.
 
         Use this tool when you need recent external information such as platform policy updates, market news, competitor moves, creator trends, consumer demand signals, or other time-sensitive cross-border e-commerce intelligence.
 
         :param query: The web search query. Be specific about platform, market, and topic.
-        :return: Final summarized result from the Dify web-search app.
+        :return: Search summary and sources from Tavily.
         """
-        return self._proxy_chatflow_result(
-            path="/internal/provider/dify-web-search/run",
-            payload={"query": query, "user": self.service_name},
+        return self._proxy_tavily_result(
+            path="/internal/provider/web-search/tavily",
+            payload={"query": query, "user": self.service_name, "search_mode": "auto", "max_results": 5, "include_answer": True},
             error_prefix="网络搜索失败",
         )
 
@@ -852,6 +852,44 @@ class Tools:
                 if isinstance(value, str) and value.strip():
                     return value
 
+            return json.dumps(data, ensure_ascii=False, indent=2)
+        except requests.RequestException as exc:
+            detail = response.text if response is not None else str(exc)
+            if detail.startswith(error_prefix):
+                return detail[:4000]
+            return "%s:\n%s" % (error_prefix, detail[:4000])
+
+    def _proxy_tavily_result(self, path: str, payload: dict, error_prefix: str) -> str:
+        if not self.chat_backend_base_url:
+            return "CHAT_BACKEND_BASE_URL 未配置。"
+        if not self.service_secret:
+            return "CHAT_BACKEND_SERVICE_SECRET 未配置。"
+
+        response = None
+        try:
+            response = requests.post(
+                "%s%s" % (self.chat_backend_base_url, path),
+                json=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    INTERNAL_SERVICE_SECRET_HEADER_NAME: self.service_secret,
+                    INTERNAL_SERVICE_NAME_HEADER_NAME: self.service_name,
+                },
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            wrapper = response.json()
+            if wrapper.get("success") is not True:
+                detail = str(wrapper.get("message") or "")
+                if detail.startswith(error_prefix):
+                    return detail[:4000]
+                return "%s:\n%s" % (error_prefix, detail[:4000])
+
+            data = wrapper.get("data") or {}
+            for key in ("result_text", "answer", "text", "content"):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
             return json.dumps(data, ensure_ascii=False, indent=2)
         except requests.RequestException as exc:
             detail = response.text if response is not None else str(exc)
