@@ -259,7 +259,7 @@ class Tools:
     ) -> str:
         """Discover product opportunity cards before a user has selected a specific product theme.
 
-        Use this tool for spontaneous blank opportunity discovery, broad category-scoped discovery, or as a pre-report step that returns opportunity cards and next_action requests for product theme analysis.
+        Use this tool only for spontaneous blank opportunity discovery or broad category-scoped discovery when the user has not provided a concrete product keyword, product theme, or ASIN. Do not use it for explicit theme-analysis requests such as "evaluate car vacuum in Temu US"; in those cases call resolve_candidates and the downstream theme-analysis tools instead.
 
         :param marketplace: Marketplace code such as US, UK, DE, or JP.
         :param platform: Platform name. The MVP currently supports Amazon.

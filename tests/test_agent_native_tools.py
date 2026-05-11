@@ -279,15 +279,26 @@ class AgentNativeToolTests(unittest.TestCase):
     def test_web_route_uses_tavily_provider(self) -> None:
         pipe = self.make_pipeline()
         observed_requests = []
+        observed_payloads = []
 
         pipe.valves.CHAT_BACKEND_SERVICE_SECRET = "test-secret"
         pipe._ensure_billing_context = lambda body: {"user_id": "user-1", "api_key": "test"}
 
         def chat_backend_request(**kwargs):
             observed_requests.append(copy.deepcopy(kwargs))
-            return {"result_text": "Tavily result text"}
+            return {
+                "provider": "tavily",
+                "query": "TikTok Shop US policy updates",
+                "result_text": "Tavily result text",
+                "results": [{"title": "Policy update", "domain": "seller-us.tiktok.com", "url": "https://example.com"}],
+            }
+
+        def post_agent_payload(payload: dict, model_name: str) -> dict:
+            observed_payloads.append(copy.deepcopy(payload))
+            return {"choices": [{"message": {"role": "assistant", "content": "分析结论：卖家应关注入驻和履约政策变化。"}}]}
 
         pipe._chat_backend_request = chat_backend_request
+        pipe._post_agent_payload = post_agent_payload
 
         response = pipe._run_web_search(
             query="TikTok Shop US policy updates",
@@ -295,10 +306,13 @@ class AgentNativeToolTests(unittest.TestCase):
             model="xiamimate.agent",
         )
 
-        self.assertEqual(response["choices"][0]["message"]["content"], "Tavily result text")
+        self.assertEqual(response["choices"][0]["message"]["content"], "分析结论：卖家应关注入驻和履约政策变化。")
         self.assertEqual(observed_requests[0]["path"], "/internal/provider/web-search/tavily")
         self.assertEqual(observed_requests[0]["body"]["search_mode"], "auto")
+        self.assertEqual(observed_requests[0]["body"]["time_range"], "month")
         self.assertNotIn("dify-web-search", json.dumps(observed_requests[0], ensure_ascii=False))
+        self.assertIn("Tavily 外部检索证据", observed_payloads[0]["messages"][1]["content"])
+        self.assertIn("请不要输出原始搜索结果列表", observed_payloads[0]["messages"][1]["content"])
 
     def test_native_capable_provider_does_not_execute_text_tool_markup(self) -> None:
         pipe = self.make_pipeline()
@@ -599,6 +613,113 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertEqual(execute_count["value"], 1)
         self.assertIn("Women's Pants", answer)
         self.assertNotIn("不要补齐", answer)
+
+    def test_explicit_theme_request_drops_opportunity_discovery_when_resolve_is_present(self) -> None:
+        pipe = self.make_pipeline()
+        responses = [
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "opportunity_discovery",
+                                        "arguments": json.dumps({"marketplace": "US", "limit": 10}),
+                                    },
+                                },
+                                {
+                                    "id": "call_2",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "resolve_candidates",
+                                        "arguments": json.dumps({"product_query": "car vacuum", "marketplace": "US"}),
+                                    },
+                                },
+                            ],
+                        }
+                    }
+                ]
+            },
+            {"choices": [{"message": {"role": "assistant", "content": "car vacuum 主题分析结果"}}]},
+        ]
+        executed_tools = []
+
+        def post_agent_payload(payload: dict, model_name: str) -> dict:
+            return responses.pop(0)
+
+        def execute_tool_call(tool_call: dict, billing_context: dict, truncate: bool = True) -> str:
+            executed_tools.append(tool_call["name"])
+            return json.dumps({"success": True, "data": {"candidate_asins": ["B001"]}}, ensure_ascii=False)
+
+        pipe._post_agent_payload = post_agent_payload
+        pipe._execute_tool_call = execute_tool_call
+
+        answer = pipe._run_agent_loop(
+            messages=[{"role": "user", "content": "请从用户需求、价格带、竞争强度和差异化空间四个角度，评估 car vacuum 在 Temu 美国站的机会"}],
+            body={},
+            billing_context={"api_key": "test"},
+            model_name="deepseek-v4-pro",
+            mode="agent",
+        )
+
+        self.assertEqual(executed_tools, ["resolve_candidates"])
+        self.assertIn("car vacuum 主题分析结果", answer)
+
+    def test_agent_round_limit_forces_final_synthesis_instead_of_error(self) -> None:
+        pipe = self.make_pipeline()
+        pipe.valves.AGENT_MAX_TOOL_ROUNDS = 2
+        observed_payloads = []
+        executed_tools = []
+
+        def post_agent_payload(payload: dict, model_name: str) -> dict:
+            observed_payloads.append(copy.deepcopy(payload))
+            if len(observed_payloads) <= 2:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_%d" % len(observed_payloads),
+                                        "type": "function",
+                                        "function": {
+                                            "name": "web_search",
+                                            "arguments": json.dumps({"query": "Temu car vacuum policy %d" % len(observed_payloads)}),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            self.assertNotIn("tools", payload)
+            self.assertIn("工具调用预算已用完", payload["messages"][-1]["content"])
+            return {"choices": [{"message": {"role": "assistant", "content": "基于已有证据的最终分析。"}}]}
+
+        def execute_tool_call(tool_call: dict, billing_context: dict, truncate: bool = True) -> str:
+            executed_tools.append(tool_call["name"])
+            return json.dumps({"success": True, "summary": "tool evidence"}, ensure_ascii=False)
+
+        pipe._post_agent_payload = post_agent_payload
+        pipe._execute_tool_call = execute_tool_call
+
+        answer = pipe._run_agent_loop(
+            messages=[{"role": "user", "content": "评估 car vacuum 在 Temu 美国站的机会"}],
+            body={},
+            billing_context={"api_key": "test"},
+            model_name="deepseek-v4-pro",
+            mode="agent",
+        )
+
+        self.assertEqual(executed_tools, ["web_search", "web_search"])
+        self.assertEqual(answer, "基于已有证据的最终分析。")
 
     def test_opportunity_discovery_drops_query_parameter_from_llm_call(self) -> None:
         pipe = self.make_pipeline()

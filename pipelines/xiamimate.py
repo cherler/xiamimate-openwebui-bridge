@@ -54,7 +54,7 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 10. 涉及类目归属、竞品筛选、是否排除某 ASIN 时，必须基于工具结果中的事实字段判断，优先引用 latest_snapshot.leaf_category_name / latest_snapshot.category_path，其次引用 l3_category_name；不要仅凭标题、品牌或自身知识补全类目。
 11. 当用户要求“清洗/筛选/过滤上一步候选池”，且上一步 resolve_candidates 已返回 ASIN、品牌、product_title、leaf_category_name、fine_category_name、category_path、match_score、match_reasons 等字段时，直接基于这些字段筛选；不要为了判断标题或类目路径是否包含某词而调用 top_asin_drilldown。只有用户明确要求补充销量、价格、BSR、评论、预测等候选池没有的字段，才调用下游详情工具。
 12. 当 resolve_candidates 返回 pool_quality.is_sufficient_for_analysis=false 时，按闭环流程处理，不要把当前候选池包装成完整品类结论：先引用 pool_quality.insufficient_coverage_reason 说明覆盖不足；再调用 category_resolve 获取稳定 category_id/category_path；随后用 resolve_candidates(recall_mode=hybrid 或 category, category_id/category_path, include_descendants=true) 重试本地类目池；若 pool_quality 仍不足，调用 expand_candidates 创建补池任务，并调用 candidate_expansion_status 查询 queued/waiting_token/discovering/hydrating/syncing/completed 状态和 data_readiness。只有补池 job 的 data_readiness.analysis_ready=true，或本地池已 sufficient 且 stats/trends 有有效数值时，才继续 category_benchmark、candidate_pool_stats、top_asin_drilldown 和强结论；如果 status=completed 但 data_readiness.readiness_status=history_hydration_pending 或 serving_sync_pending，要说明“ASIN 已补入但分析特征未就绪”，建议等待 hydrate/serving sync 或只给待验证框架，不要把空 stats 当成市场事实。
-13. 当用户不知道选什么、要求找机会、问某大类下有什么细分方向时，优先调用 opportunity_discovery 输出机会卡片；机会卡片是继续分析入口。按机会编号深入分析时，沿用 opportunities_for_llm 中该编号的 next_action.request 继续调用 resolve_candidates，并以返回的 rank/title/category_path 作为上下文。
+13. 只有当用户还没有给出明确商品主题/关键词/ASIN、在问“找机会/发现机会/某大类下有哪些细分方向/不知道分析什么”时，才调用 opportunity_discovery 输出机会卡片；机会卡片是继续分析入口，按机会编号深入分析时，沿用 opportunities_for_llm 中该编号的 next_action.request 继续调用 resolve_candidates，并以返回的 rank/title/category_path 作为上下文。若用户已经给出明确主题（例如“评估 car vacuum 在 Temu 美国站的机会”“分析 humidifier 在 Amazon US 是否值得做”），不要调用 opportunity_discovery，即使用户句子里出现“机会”二字，也应走主题分析：resolve_candidates -> candidate_pool_stats/candidate_pool_trends/category_benchmark/top_asin_drilldown，并按需要补充 search_knowledge_base 或 web_search。
 14. 当用户明确询问销量预测、未来增长或“为什么模型看好/看空”时，优先调用 product_forecast_explain；不要把 candidate_pool_weak_forecast 的弱信号包装成正式模型预测。
 15. 不要把“用户问法”写成固定流程；按 tool_contract.capability 选择能回答问题的工具，按 evidence_contract 区分 tool_fact、derived_metric、default_assumption、hypothesis。涉及启动资金、盈亏平衡、单件利润、预算周期等计算时，调用 launch_budget_calculator，让工具产出公式和数值；最终答复可以自由组织，但必须把明确事实、计算结果、默认假设和商业判断分开。
 
@@ -73,7 +73,7 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 - category_resolve: 解析商品类目名称或完整类目路径，返回 category_id 与本地覆盖度
 - expand_candidates: 创建 Keepa 补池任务，不在请求路径直接消耗 token
 - candidate_expansion_status: 查询 Keepa 补池任务状态、token 等待状态，以及 data_readiness 分析数据就绪度
-- opportunity_discovery: 发现空白机会、大类细分机会或 report 前置机会卡
+- opportunity_discovery: 发现空白机会或大类细分机会；仅用于用户尚未给出明确商品主题/关键词/ASIN 的场景
 - opportunity_discovery_job: 按机会发现 job_id 回取完整机会卡片和结构化证据
 - candidate_pool_stats: 候选池描述统计，优先使用 resolve_candidates 返回的 candidate_pool_id
 - candidate_pool_trends: 候选池趋势诊断
@@ -104,6 +104,17 @@ HELP_SYSTEM_PROMPT = """你是 XiaMimate 的客服帮助助手，专门处理 /h
 5. 多意图问题要合并整理，去重后输出，不要把不同分块的重复内容机械堆叠。
 6. 如果知识不足以支持回答，要明确说“当前客服知识库里没有足够信息”，并建议用户换一个更具体的问法。
 7. 保持客服口吻，简洁、明确、可执行，不要展示内部检索过程。
+"""
+
+WEB_SEARCH_ANALYSIS_SYSTEM_PROMPT = """你是 XiaMimate 的 /web 联网情报分析助手。
+
+工作规则：
+1. 用户不需要原始搜索结果列表；你必须基于给定的 Tavily 外部检索证据，直接回答用户问题。
+2. 不要堆砌 URL，不要逐条复述搜索结果。只在最后的“参考来源”里列出 3 到 5 个关键来源标题和域名。
+3. 对平台政策、卖家影响、市场动态类问题，优先输出：结论摘要、变化/事件分组、卖家影响排序、建议动作、证据边界。
+4. 如果证据之间相关性弱、时间不满足用户窗口、或没有官方来源，必须明确写在证据边界里。
+5. 只能使用输入中的外部检索证据和用户问题做分析，不要编造未出现的事实。
+6. 用中文回答，结论前置，措辞专业但不要写成搜索引擎结果页。
 """
 
 TOOL_RESULT_TEMPLATE = """以下是工具执行结果，请基于这些结果继续回答用户原问题。
@@ -307,6 +318,7 @@ class Pipeline:
         AGENT_MODEL_PROFILES: str = "deepseek,minimax"
         AGENT_MODEL_DEEPSEEK_LABEL: str = "DeepSeek V4 Pro"
         AGENT_MODEL_MINIMAX_LABEL: str = "MiniMax M2.7"
+        AGENT_MAX_TOOL_ROUNDS: int = 12
         XIAMIMATE_MODEL_PREFIX: str = "xiamimate"
 
     def __init__(self):
@@ -327,6 +339,7 @@ class Pipeline:
                 "AGENT_MODEL_PROFILES": os.getenv("AGENT_MODEL_PROFILES", "deepseek,minimax"),
                 "AGENT_MODEL_DEEPSEEK_LABEL": os.getenv("AGENT_MODEL_DEEPSEEK_LABEL", "DeepSeek V4 Pro"),
                 "AGENT_MODEL_MINIMAX_LABEL": os.getenv("AGENT_MODEL_MINIMAX_LABEL", "MiniMax M2.7"),
+                "AGENT_MAX_TOOL_ROUNDS": int(os.getenv("AGENT_MAX_TOOL_ROUNDS", "12")),
                 "XIAMIMATE_MODEL_PREFIX": os.getenv("XIAMIMATE_MODEL_PREFIX", "xiamimate"),
             }
         )
@@ -489,7 +502,7 @@ class Pipeline:
         if mode == "report":
             return self._run_report(query=normalized_user_message, body=body, model=response_model)
         if mode == "web":
-            return self._run_web_search(query=normalized_user_message, body=body, model=response_model)
+            return self._run_web_search(query=normalized_user_message, body=body, model=response_model, model_name=agent_model_name)
         if mode in {"agent", "tool"}:
             return self._run_agent(
                 messages=normalized_messages,
@@ -579,7 +592,7 @@ class Pipeline:
             request_payload={"profile": profile},
         )
 
-    def _run_web_search(self, query: str, body: dict, model: str) -> Union[dict, Iterator[bytes]]:
+    def _run_web_search(self, query: str, body: dict, model: str, model_name: str = "") -> Union[dict, Iterator[bytes]]:
         query = (query or "").strip()
         guidance = (
             "请在 /web 后直接写出要联网搜索的问题，例如：\n"
@@ -615,12 +628,14 @@ class Pipeline:
                 query=query,
                 body=body,
                 model=model,
+                model_name=model_name,
                 billing_context=billing_context,
                 web_charge=web_charge,
             )
 
         try:
             response = self._run_tavily_web_search_request(query=query, body=body, billing_context=billing_context)
+            answer = self._run_tavily_web_search_analysis(query=query, search_response=response, body=body, model_name=model_name)
         except RuntimeError as exc:
             self._refund_billing_event(
                 billing_context=billing_context,
@@ -630,7 +645,7 @@ class Pipeline:
             )
             return self._chat_response(content=self._error_text(str(exc)), model=model)
 
-        return self._chat_response(content=self._format_tavily_web_search_answer(response), model=model)
+        return self._chat_response(content=answer, model=model)
 
     def _run_tavily_web_search_request(self, query: str, body: dict, billing_context: dict) -> dict:
         return self._chat_backend_request(
@@ -644,9 +659,65 @@ class Pipeline:
                 "target_market": self._body_context_value(body, "target_market") or self._body_context_value(body, "marketplace"),
                 "max_results": 5,
                 "include_answer": True,
+                "time_range": self._body_context_value(body, "time_range") or "month",
             },
             internal=True,
             timeout=self.valves.DIFY_REQUEST_TIMEOUT,
+        )
+
+    def _run_tavily_web_search_analysis(self, query: str, search_response: dict, body: dict, model_name: str) -> str:
+        evidence_text = self._format_tavily_web_search_evidence(search_response)
+        if not evidence_text:
+            return "没有拿到可用于分析的外部搜索证据，请换一个更具体的问题再试。"
+
+        provider = self._get_provider(model_name)
+        payload = provider.filter_payload(body)
+        payload["model"] = model_name or self._model_name_for_profile(self._default_agent_profile())
+        payload["stream"] = False
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
+        payload["messages"] = [
+            {"role": "system", "content": WEB_SEARCH_ANALYSIS_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    "当前日期: %s\n\n"
+                    "用户问题:\n%s\n\n"
+                    "Tavily 外部检索证据:\n%s\n\n"
+                    "请不要输出原始搜索结果列表；请综合分析并按卖家影响排序。"
+                )
+                % (datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d"), query, evidence_text),
+            },
+        ]
+        user_value = payload.get("user")
+        if isinstance(user_value, dict):
+            payload["user"] = self._user_id(body)
+
+        response = self._post_agent_payload(payload, model_name=model_name)
+        answer = self._clean_agent_content(self._extract_assistant_content(response), model_name=model_name)
+        if answer:
+            return answer
+        return self._format_tavily_web_search_answer(search_response)
+
+    def _format_tavily_web_search_evidence(self, response: dict) -> str:
+        if not isinstance(response, dict):
+            return str(response or "").strip()
+        compact = {
+            "provider": response.get("provider"),
+            "capability": response.get("capability"),
+            "query": response.get("query"),
+            "query_plan": response.get("query_plan") or {},
+            "answer": response.get("answer"),
+            "result_text": response.get("result_text"),
+            "source_meta": response.get("source_meta") or {},
+            "degradation_status": response.get("degradation_status"),
+            "degradation_reason": response.get("degradation_reason"),
+            "results": response.get("results") or [],
+        }
+        return json.dumps(
+            self._compact_json_value(compact, max_depth=5, max_items=10, max_scalar_items=50, max_string=1200),
+            ensure_ascii=False,
+            indent=2,
         )
 
     def _format_tavily_web_search_answer(self, response: dict) -> str:
@@ -665,6 +736,7 @@ class Pipeline:
         query: str,
         body: dict,
         model: str,
+        model_name: str,
         billing_context: dict,
         web_charge: dict,
     ) -> Iterator[bytes]:
@@ -688,11 +760,18 @@ class Pipeline:
                 response_id=response_id,
                 created=created,
                 model=model,
-                content=self._format_dify_progress("web", 100, "Tavily 搜索完成，正在整理结果"),
+                content=self._format_dify_progress("web", 70, "Tavily 搜索完成，正在生成分析结论"),
+            )
+            answer = self._run_tavily_web_search_analysis(query=query, search_response=response, body=body, model_name=model_name)
+            yield self._stream_reasoning_text_chunk(
+                response_id=response_id,
+                created=created,
+                model=model,
+                content=self._format_dify_progress("web", 100, "分析结论已生成"),
             )
             yield self._stream_reasoning_close_chunk(response_id=response_id, created=created, model=model)
             answer_started = True
-            for chunk in self._split_text(self._format_tavily_web_search_answer(response)):
+            for chunk in self._split_text(answer):
                 yield emit_text_chunk(chunk)
         except RuntimeError as exc:
             if not answer_started:
@@ -908,7 +987,7 @@ class Pipeline:
             for chunk in emit_reasoning_chunks(self._format_agent_progress("正在分析问题")):
                 yield chunk
 
-            for round_index in range(6):
+            for round_index in range(self._agent_max_tool_rounds()):
                 payload = self._prepare_agent_payload(messages=conversation, body=body, mode=mode, model_name=model_name)
                 payload["stream"] = False
                 try:
@@ -932,6 +1011,10 @@ class Pipeline:
                 native_tool_calls = self._extract_response_tool_calls(response)
                 text_tool_calls = [] if native_tool_calls or self._provider_uses_native_tool_calls(model_name) else self._extract_tool_calls(content, model_name=model_name)
                 tool_calls = native_tool_calls or text_tool_calls
+                tool_calls = self._filter_tool_calls_for_user_intent(tool_calls, conversation)
+                if native_tool_calls:
+                    native_tool_calls = tool_calls
+                    assistant_message = self._filter_assistant_message_tool_calls(assistant_message, tool_calls)
 
                 if not tool_calls:
                     if mode == "agent" and not used_tools:
@@ -1056,7 +1139,21 @@ class Pipeline:
                     conversation.append({"role": "user", "content": "\n\n".join(tool_results)})
 
             if not answer_started:
-                raise RuntimeError("Agent 工具调用轮次超过上限，已中止。")
+                final_answer = self._final_answer_after_tool_round_limit(
+                    conversation=conversation,
+                    body=body,
+                    model_name=model_name,
+                    mode=mode,
+                    tool_observations=tool_observations,
+                )
+                for chunk in emit_reasoning_chunks(self._format_agent_progress("工具调用已达上限，正在基于已有证据生成最终答复")):
+                    yield chunk
+                close_chunk = close_reasoning_chunk()
+                if close_chunk is not None:
+                    yield close_chunk
+                for chunk in self._split_text(final_answer):
+                    answer_started = True
+                    yield emit_text_chunk(chunk)
         except RuntimeError as exc:
             close_chunk = close_reasoning_chunk()
             if close_chunk is not None:
@@ -4494,6 +4591,65 @@ class Pipeline:
 
         return payload
 
+    def _agent_max_tool_rounds(self) -> int:
+        try:
+            return max(1, min(50, int(self.valves.AGENT_MAX_TOOL_ROUNDS)))
+        except Exception:
+            return 12
+
+    def _prepare_agent_final_synthesis_payload(
+        self,
+        *,
+        conversation: List[dict],
+        body: dict,
+        mode: str,
+        model_name: str,
+    ) -> dict:
+        synthesis_messages = deepcopy(conversation or [])
+        synthesis_messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "工具调用预算已用完。请停止调用任何工具，必须仅基于上面已经返回的工具结果，"
+                    "直接回答用户的原始问题。\n"
+                    "要求：结论前置；把工具事实、推理判断和证据边界分开；如果证据不足，明确说明哪些结论待验证；"
+                    "不要输出内部工具调用标记，不要要求继续调用工具。"
+                ),
+            }
+        )
+        payload = self._prepare_agent_payload(messages=synthesis_messages, body=body, mode=mode, model_name=model_name)
+        payload["stream"] = False
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
+        return payload
+
+    def _final_answer_after_tool_round_limit(
+        self,
+        *,
+        conversation: List[dict],
+        body: dict,
+        model_name: str,
+        mode: str,
+        tool_observations: List[dict],
+    ) -> str:
+        limit_message = "Agent 工具调用轮次达到上限，已停止继续调用工具并基于现有证据生成答复。"
+        if not tool_observations:
+            raise RuntimeError(limit_message)
+        try:
+            payload = self._prepare_agent_final_synthesis_payload(
+                conversation=conversation,
+                body=body,
+                mode=mode,
+                model_name=model_name,
+            )
+            response = self._post_agent_payload(payload, model_name=model_name)
+            content = self._clean_agent_content(self._extract_assistant_content(response), model_name=model_name)
+            if content:
+                return self._fallback_opportunity_answer_if_needed(content, tool_observations)
+        except RuntimeError as exc:
+            limit_message = "%s 最终整理模型调用失败: %s" % (limit_message, str(exc))
+        return self._fallback_answer_from_tool_observations(tool_observations, error=limit_message)
+
     def _provider_uses_native_tool_calls(self, model_name: str) -> bool:
         provider = self._get_provider(model_name)
         return "tools" in getattr(provider, "allowed_params", set())
@@ -4523,6 +4679,94 @@ class Pipeline:
         if str(tool_call.get("name") or "").strip() == "opportunity_discovery":
             return self._latest_tool_observation(tool_observations, "opportunity_discovery")
         return None
+
+    def _filter_tool_calls_for_user_intent(self, tool_calls: List[Dict[str, Any]], messages: List[dict]) -> List[Dict[str, Any]]:
+        if not tool_calls:
+            return []
+        if not any(str(call.get("name") or "").strip() == "opportunity_discovery" for call in tool_calls):
+            return tool_calls
+        if not self._looks_like_explicit_theme_analysis_request(self._extract_last_user_text(messages)):
+            return tool_calls
+
+        product_analysis_calls = [call for call in tool_calls if str(call.get("name") or "").strip() != "opportunity_discovery"]
+        if any(self._is_product_theme_tool_call(call) for call in product_analysis_calls):
+            return product_analysis_calls
+        return tool_calls
+
+    def _filter_assistant_message_tool_calls(self, assistant_message: dict, tool_calls: List[Dict[str, Any]]) -> dict:
+        raw_tool_calls = assistant_message.get("tool_calls") if isinstance(assistant_message, dict) else None
+        if not isinstance(raw_tool_calls, list):
+            return assistant_message
+
+        keep_ids = {
+            str(call.get("tool_call_id"))
+            for call in tool_calls or []
+            if call.get("tool_call_id") not in (None, "")
+        }
+        updated = deepcopy(assistant_message)
+        if not keep_ids:
+            updated.pop("tool_calls", None)
+            return updated
+        filtered = [raw_call for raw_call in raw_tool_calls if str(raw_call.get("id") or "") in keep_ids]
+        if filtered:
+            updated["tool_calls"] = filtered
+        else:
+            updated.pop("tool_calls", None)
+        return updated
+
+    def _looks_like_explicit_theme_analysis_request(self, text: str) -> bool:
+        content = str(text or "").strip()
+        if not content:
+            return False
+
+        lowered = content.lower()
+        blank_discovery_patterns = (
+            r"不知道.*(?:选什么|分析什么|做什么)",
+            r"(?:帮我|给我)?(?:找|发现|挖掘|推荐).{0,12}(?:机会|方向|品类|类目|关键词)",
+            r"(?:哪些|有什么|有哪些).{0,12}(?:机会|方向|细分)",
+            r"(?:空白机会|机会发现|细分方向)",
+        )
+        if any(re.search(pattern, content, flags=re.IGNORECASE) for pattern in blank_discovery_patterns):
+            return False
+
+        explicit_patterns = (
+            r"(?:评估|分析|判断|研究|看看|看一下|拆解)\s+[^，。！？\n]{2,90}?\s+在\s+[^，。！？\n]{2,80}?(?:机会|是否|值不值得|可行|空间|市场)",
+            r"\b[a-z][a-z0-9][a-z0-9 &+\-/]{1,70}\b\s+在\s+[^，。！？\n]{2,80}?(?:机会|是否|值不值得|可行|空间|市场)",
+            r"(?:评估|分析|判断|研究|拆解)\s+\b[a-z][a-z0-9][a-z0-9 &+\-/]{1,70}\b",
+        )
+        if any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in explicit_patterns):
+            return True
+
+        return False
+
+    def _is_product_theme_tool_call(self, tool_call: Dict[str, Any]) -> bool:
+        name = str(tool_call.get("name") or "").strip()
+        parameters = tool_call.get("parameters") if isinstance(tool_call.get("parameters"), dict) else {}
+        product_theme_tools = {
+            "resolve_candidates",
+            "candidate_pool_stats",
+            "candidate_pool_trends",
+            "candidate_pool_weak_forecast",
+            "product_forecast_explain",
+            "top_asin_drilldown",
+            "asin_history_timeseries",
+            "category_benchmark",
+            "launch_budget_calculator",
+        }
+        if name not in product_theme_tools:
+            return False
+        evidence_keys = {
+            "product_query",
+            "product_theme",
+            "candidate_pool_id",
+            "candidate_asins",
+            "asins",
+            "category_id",
+            "category_path",
+            "benchmark_category_id",
+            "benchmark_category_path",
+        }
+        return any(parameters.get(key) not in (None, "", [], {}) for key in evidence_keys)
 
     def _attach_internal_tool_context(self, tool_call: Dict[str, Any], body: dict) -> Dict[str, Any]:
         if str(tool_call.get("name") or "").strip() != "opportunity_discovery":
@@ -4560,7 +4804,7 @@ class Pipeline:
         tool_result_cache: Dict[Tuple[str, str], dict] = {}
         used_tools = False
 
-        for _ in range(6):
+        for _ in range(self._agent_max_tool_rounds()):
             payload = self._prepare_agent_payload(messages=conversation, body=body, mode=mode, model_name=model_name)
             payload["stream"] = False
             try:
@@ -4576,6 +4820,10 @@ class Pipeline:
             native_tool_calls = self._extract_response_tool_calls(response)
             text_tool_calls = [] if native_tool_calls or self._provider_uses_native_tool_calls(model_name) else self._extract_tool_calls(content, model_name=model_name)
             tool_calls = native_tool_calls or text_tool_calls
+            tool_calls = self._filter_tool_calls_for_user_intent(tool_calls, conversation)
+            if native_tool_calls:
+                native_tool_calls = tool_calls
+                assistant_message = self._filter_assistant_message_tool_calls(assistant_message, tool_calls)
 
             if not tool_calls:
                 if charge_llm and mode == "agent" and not used_tools:
@@ -4660,7 +4908,13 @@ class Pipeline:
             if tool_results:
                 conversation.append({"role": "user", "content": "\n\n".join(tool_results)})
 
-        raise RuntimeError("Agent 工具调用轮次超过上限，已中止。")
+        return self._final_answer_after_tool_round_limit(
+            conversation=conversation,
+            body=body,
+            model_name=model_name,
+            mode=mode,
+            tool_observations=tool_observations,
+        )
 
     def _charge_standalone_llm_request(
         self,
