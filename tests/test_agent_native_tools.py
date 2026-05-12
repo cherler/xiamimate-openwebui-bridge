@@ -484,7 +484,7 @@ class AgentNativeToolTests(unittest.TestCase):
             ]
         )
         payload = {
-            "instruction": "优先原样使用 opportunity_cards_text 展示。",
+            "instruction": "将 opportunity_cards_text 作为工具证据块展示。",
             "opportunity_discovery_job_id": "odisc_test",
             "result_ref": {"type": "opportunity_discovery_job", "job_id": "odisc_test"},
             "opportunity_count": 10,
@@ -520,7 +520,9 @@ class AgentNativeToolTests(unittest.TestCase):
         rendered = pipe._format_tool_result_for_llm("opportunity_discovery", json.dumps(payload, ensure_ascii=False), budget=7000)
         compacted = json.loads(rendered)
 
-        self.assertEqual(compacted["result_format"], "opportunity_cards_text_preserved")
+        self.assertEqual(compacted["result_format"], "opportunity_evidence_block")
+        self.assertIn("工具证据块", compacted["instruction"])
+        self.assertIn("不要把证据表改写成平铺列表", compacted["instruction"])
         self.assertEqual(compacted["payload"]["opportunity_discovery_job_id"], "odisc_test")
         self.assertEqual(compacted["payload"]["result_ref"]["job_id"], "odisc_test")
         self.assertEqual(compacted["payload"]["opportunity_count"], 10)

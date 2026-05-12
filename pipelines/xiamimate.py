@@ -54,7 +54,7 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 10. 涉及类目归属、竞品筛选、是否排除某 ASIN 时，必须基于工具结果中的事实字段判断，优先引用 latest_snapshot.leaf_category_name / latest_snapshot.category_path，其次引用 l3_category_name；不要仅凭标题、品牌或自身知识补全类目。
 11. 当用户要求“清洗/筛选/过滤上一步候选池”，且上一步 resolve_candidates 已返回 ASIN、品牌、product_title、leaf_category_name、fine_category_name、category_path、match_score、match_reasons 等字段时，直接基于这些字段筛选；不要为了判断标题或类目路径是否包含某词而调用 top_asin_drilldown。只有用户明确要求补充销量、价格、BSR、评论、预测等候选池没有的字段，才调用下游详情工具。
 12. 当 resolve_candidates 返回 pool_quality.is_sufficient_for_analysis=false 时，按闭环流程处理，不要把当前候选池包装成完整品类结论：先引用 pool_quality.insufficient_coverage_reason 说明覆盖不足；再调用 category_resolve 获取稳定 category_id/category_path；随后用 resolve_candidates(recall_mode=hybrid 或 category, category_id/category_path, include_descendants=true) 重试本地类目池；若 pool_quality 仍不足，调用 expand_candidates 创建补池任务，并调用 candidate_expansion_status 查询 queued/waiting_token/discovering/hydrating/syncing/completed 状态和 data_readiness。只有补池 job 的 data_readiness.analysis_ready=true，或本地池已 sufficient 且 stats/trends 有有效数值时，才继续 category_benchmark、candidate_pool_stats、top_asin_drilldown 和强结论；如果 status=completed 但 data_readiness.readiness_status=history_hydration_pending 或 serving_sync_pending，要说明“ASIN 已补入但分析特征未就绪”，建议等待 hydrate/serving sync 或只给待验证框架，不要把空 stats 当成市场事实。
-13. 只有当用户还没有给出明确商品主题/关键词/ASIN、在问“找机会/发现机会/某大类下有哪些细分方向/不知道分析什么”时，才调用 opportunity_discovery 输出机会卡片；机会卡片是继续分析入口，按机会编号深入分析时，沿用 opportunities_for_llm 中该编号的 next_action.request 继续调用 resolve_candidates，并以返回的 rank/title/category_path 作为上下文。若用户已经给出明确主题（例如“评估 car vacuum 在 Temu 美国站的机会”“分析 humidifier 在 Amazon US 是否值得做”），不要调用 opportunity_discovery，即使用户句子里出现“机会”二字，也应走主题分析：resolve_candidates -> candidate_pool_stats/candidate_pool_trends/category_benchmark/top_asin_drilldown，并按需要补充 search_knowledge_base 或 web_search。
+13. 只有当用户还没有给出明确商品主题/关键词/ASIN、在问“找机会/发现机会/某大类下有哪些细分方向/不知道分析什么”时，才调用 opportunity_discovery 输出机会卡片；机会卡片是继续分析入口，按机会编号深入分析时，沿用 opportunities_for_llm 中该编号的 next_action.request 继续调用 resolve_candidates，并以返回的 rank/title/category_path 作为上下文。若用户已经给出明确主题（例如“评估 car vacuum 在 Temu 美国站的机会”“分析 humidifier 在 Amazon US 是否值得做”），不要调用 opportunity_discovery，即使用户句子里出现“机会”二字，也应走主题分析：resolve_candidates -> candidate_pool_stats/candidate_pool_trends/category_benchmark/top_asin_drilldown，并按需要补充 search_knowledge_base 或 web_search。机会发现最终答复必须把 payload.opportunity_cards_text 中的总览表、字段解释和公式明细作为工具证据块展示，可自拟标题、摘要和解读，但不要改写成平铺列表，不要丢列、改数值或补未返回的数值；同时遵守 payload.llm_summary_guidance/display_rules：保留同名主题隐藏提示；有 personalized_opportunity_score 时保留个性化分或说明排序口径；趋势展示优先使用 trend_momentum_display/trend_signal_status，不能把趋势缺失或近期为 0 简化成普通 -100%；next_action.requires_category_resolve=true 时必须提醒先 category_resolve 再做类目召回。
 14. 当用户明确询问销量预测、未来增长或“为什么模型看好/看空”时，优先调用 product_forecast_explain；不要把 candidate_pool_weak_forecast 的弱信号包装成正式模型预测。
 15. 不要把“用户问法”写成固定流程；按 tool_contract.capability 选择能回答问题的工具，按 evidence_contract 区分 tool_fact、derived_metric、default_assumption、hypothesis。涉及启动资金、盈亏平衡、单件利润、预算周期等计算时，调用 launch_budget_calculator，让工具产出公式和数值；最终答复可以自由组织，但必须把明确事实、计算结果、默认假设和商业判断分开。
 
@@ -6330,6 +6330,8 @@ class Pipeline:
                 "opportunity_count",
                 "opportunity_cards_text",
                 "opportunities_for_llm",
+                "field_formula_details",
+                "llm_summary_guidance",
                 "metric_definitions",
                 "display_rules",
                 "tool_contract",
@@ -6357,11 +6359,12 @@ class Pipeline:
 
         envelope = {
             "tool_name": "opportunity_discovery",
-            "result_format": "opportunity_cards_text_preserved",
+            "result_format": "opportunity_evidence_block",
             "original_chars": original_chars,
             "instruction": (
-                "opportunity_cards_text 是面向用户的机会发现展示文本。"
+                "opportunity_cards_text 是机会发现的工具证据块，应以表格和字段解释形态展示。"
                 "opportunities_for_llm 包含可继续分析的结构化机会入口。"
+                "最终答复可自行组织标题、摘要和解读，但不要把证据表改写成平铺列表，不要丢列、改数值或补未返回的数值；同时必须保留 llm_summary_guidance/display_rules 中要求的同名隐藏提示、个性化分、趋势状态和 category_resolve 前置提醒。"
             ),
             "payload": compact_payload,
         }
