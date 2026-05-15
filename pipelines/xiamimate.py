@@ -2037,6 +2037,7 @@ class Pipeline:
         return rendered
 
     def _prepare_workflow_answer_parts(self, answer_text: str) -> Tuple[str, Optional[str]]:
+        answer_text = self._strip_outer_markdown_fence(answer_text)
         visible_text, payload = self._extract_structured_workflow_payload(answer_text)
         if not payload:
             return answer_text, None
@@ -2050,6 +2051,17 @@ class Pipeline:
         if visible_text:
             return visible_text.rstrip(), payload_comment
         return "", payload_comment
+
+    def _strip_outer_markdown_fence(self, answer_text: str) -> str:
+        text = str(answer_text or "")
+        match = re.match(
+            r"\A\s*```[ \t]*(?:markdown|md)[ \t]*\r?\n(?P<body>[\s\S]*?)\r?\n```[ \t]*\s*\Z",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return text
+        return match.group("body")
 
     def _extract_structured_workflow_payload(self, answer_text: str) -> Tuple[str, Optional[dict]]:
         text = str(answer_text or "")
