@@ -202,6 +202,13 @@ REPORT_PROFILE_LABELS = {
 STRUCTURED_PAYLOAD_START = "<!-- XM_PAYLOAD_START"
 STRUCTURED_PAYLOAD_END = "XM_PAYLOAD_END -->"
 
+REPORT_GATE_REFUND_REASONS = {
+    "input_guard_failed",
+    "candidate_pool_quality_insufficient",
+    "core_evidence_guard_failed",
+    "formal_report_not_generated",
+}
+
 CHART_PANEL_GROUP_LABELS = {
     "overview": "机会总览",
     "internal_evidence": "站内证据",
@@ -578,6 +585,12 @@ class Pipeline:
         mode_tag: str,
         guidance: str,
     ) -> Union[dict, Iterator[bytes]]:
+        if not self._report_profile_is_available(profile):
+            message = self._report_profile_unavailable_message(profile)
+            if body.get("stream"):
+                return self._stream_text_response(content=message, model=model)
+            return self._chat_response(content=message, model=model)
+
         report_label = REPORT_PROFILE_LABELS[profile]
         return self._run_dify_chatflow(
             query=query,
@@ -591,6 +604,18 @@ class Pipeline:
             guidance=guidance,
             request_payload={"profile": profile},
         )
+
+    def _report_profile_is_available(self, profile: str) -> bool:
+        normalized = str(profile or "").strip().lower()
+        if normalized != "research":
+            return True
+        return bool((os.getenv("DIFY_REPORT_RESEARCH_APP_API_KEY") or "").strip())
+
+    def _report_profile_unavailable_message(self, profile: str) -> str:
+        normalized = str(profile or "").strip().lower()
+        if normalized == "research":
+            return "当前 /report research 功能待开发，暂未上线。本次不会扣除积分。"
+        return "当前所选报告档位暂不可用。本次不会扣除积分。"
 
     def _run_web_search(self, query: str, body: dict, model: str, model_name: str = "") -> Union[dict, Iterator[bytes]]:
         query = (query or "").strip()
@@ -802,6 +827,7 @@ class Pipeline:
         request_payload: Optional[dict] = None,
     ) -> Union[dict, Iterator[bytes]]:
         query = (query or "").strip()
+        report_profile = str((request_payload or {}).get("profile") or "").strip()
         if not query:
             if body.get("stream"):
                 return self._stream_text_response(content=guidance, model=model)
@@ -821,7 +847,7 @@ class Pipeline:
                 description=charge_description,
                 meta={
                     "mode": mode_tag,
-                    "report_profile": (request_payload or {}).get("profile"),
+                    "report_profile": report_profile,
                     "stream": bool(body.get("stream")),
                     "query_preview": query[:200],
                 },
@@ -842,6 +868,8 @@ class Pipeline:
                 run_stream_path=run_stream_path,
                 mode_tag=mode_tag,
                 refund_description="%s失败，已退款" % charge_description,
+                gate_refund_description="%s门控失败，已退款" % charge_description,
+                report_profile=report_profile,
                 request_payload=request_payload,
             )
 
@@ -868,6 +896,15 @@ class Pipeline:
 
         answer = self._extract_workflow_answer(response)
         if answer:
+            if mode_tag == "report":
+                self._refund_report_gate_failure(
+                    billing_context=billing_context,
+                    charge=flow_charge,
+                    answer_text=answer,
+                    report_profile=report_profile,
+                    description="%s门控失败，已退款" % charge_description,
+                    mode_tag=mode_tag,
+                )
             return self._chat_response(content=self._prepare_workflow_answer(answer), model=model)
 
         return self._chat_response(content=json.dumps(response, ensure_ascii=False, indent=2), model=model)
@@ -1673,6 +1710,8 @@ class Pipeline:
         run_stream_path: str,
         mode_tag: str,
         refund_description: str,
+        gate_refund_description: str,
+        report_profile: str,
         request_payload: Optional[dict] = None,
     ) -> Iterator[bytes]:
         response_id = "%s-%s" % (model, uuid.uuid4())
@@ -1683,6 +1722,7 @@ class Pipeline:
         emitted_progress = set()
         reasoning_open = False
         buffered_answer_mode = mode_tag in {"workflow", "report"}
+        refund_applied = False
 
         def emit_text_chunk(content: str) -> bytes:
             return self._stream_content_chunk(
@@ -1795,6 +1835,15 @@ class Pipeline:
                         final_answer = self._extract_workflow_answer(event)
                         if buffered_answer_mode:
                             buffered_answer = final_answer or "".join(answer_chunks).strip()
+                            if mode_tag == "report" and buffered_answer and not refund_applied:
+                                refund_applied = self._refund_report_gate_failure(
+                                    billing_context=billing_context,
+                                    charge=flow_charge,
+                                    answer_text=buffered_answer,
+                                    report_profile=report_profile,
+                                    description=gate_refund_description,
+                                    mode_tag="%s_stream" % mode_tag,
+                                )
                             prepared_answer, _payload_comment = self._prepare_workflow_answer_parts(buffered_answer) if buffered_answer else ("", None)
                             if prepared_answer and not answer_started:
                                 answer_started = True
@@ -1832,6 +1881,15 @@ class Pipeline:
 
                 if not answer_started:
                     raw_answer = "".join(answer_chunks).strip() or "执行已完成，但未返回可展示的结果。"
+                    if mode_tag == "report" and raw_answer and not refund_applied:
+                        refund_applied = self._refund_report_gate_failure(
+                            billing_context=billing_context,
+                            charge=flow_charge,
+                            answer_text=raw_answer,
+                            report_profile=report_profile,
+                            description=gate_refund_description,
+                            mode_tag="%s_stream" % mode_tag,
+                        )
                     final_answer, _payload_comment = self._prepare_workflow_answer_parts(raw_answer) if buffered_answer_mode else (raw_answer, None)
                     final_stage = self._format_dify_progress(mode_tag, 100, "执行完成，正在整理最终结果")
                     if final_stage not in emitted_progress:
@@ -1845,7 +1903,7 @@ class Pipeline:
                         yield emit_text_chunk(text_chunk)
 
         except requests.RequestException as exc:
-            if not answer_started:
+            if not answer_started and not refund_applied:
                 self._refund_billing_event(
                     billing_context=billing_context,
                     charge=flow_charge,
@@ -1858,7 +1916,7 @@ class Pipeline:
             detail = self._error_text(str(exc))
             yield emit_text_chunk("\n" + detail)
         except RuntimeError as exc:
-            if not answer_started:
+            if not answer_started and not refund_applied:
                 self._refund_billing_event(
                     billing_context=billing_context,
                     charge=flow_charge,
@@ -2016,6 +2074,74 @@ class Pipeline:
         if not isinstance(payload, dict):
             return visible_text or text, None
         return visible_text or text[:start].strip(), payload
+
+    def _coerce_optional_bool(self, value: Any) -> Optional[bool]:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and value in (0, 1):
+            return bool(value)
+        normalized = str(value or "").strip().lower()
+        if normalized in {"true", "1", "yes", "y", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "off"}:
+            return False
+        return None
+
+    def _report_gate_refund_meta(self, answer_text: str, report_profile: str) -> Optional[dict]:
+        _visible_text, payload = self._extract_structured_workflow_payload(answer_text)
+        if not isinstance(payload, dict):
+            return None
+
+        if str(payload.get("schema_version") or "").strip() != "xm.report-delivery.v1":
+            return None
+
+        payload_profile = str(payload.get("report_profile") or "").strip()
+        if payload_profile and report_profile and payload_profile != report_profile:
+            return None
+
+        delivery_status = str(payload.get("delivery_status") or "").strip()
+        refund_reason = str(payload.get("refund_reason") or "").strip()
+        report_generated = self._coerce_optional_bool(payload.get("report_generated"))
+        refund_recommended = self._coerce_optional_bool(payload.get("refund_recommended"))
+        if delivery_status != "gated_failed":
+            return None
+        if report_generated is not False or refund_recommended is not True:
+            return None
+        if refund_reason not in REPORT_GATE_REFUND_REASONS:
+            return None
+
+        refund_meta = {
+            "schema_version": "xm.report-delivery.v1",
+            "report_profile": payload_profile or report_profile,
+            "delivery_status": delivery_status,
+            "refund_reason": refund_reason,
+        }
+        for key in ("gate_stage", "failure_category"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                refund_meta[key] = value
+        return refund_meta
+
+    def _refund_report_gate_failure(
+        self,
+        billing_context: dict,
+        charge: dict,
+        answer_text: str,
+        report_profile: str,
+        description: str,
+        mode_tag: str,
+    ) -> bool:
+        refund_meta = self._report_gate_refund_meta(answer_text, report_profile=report_profile)
+        if not refund_meta:
+            return False
+        refund_meta["mode"] = mode_tag
+        self._refund_billing_event(
+            billing_context=billing_context,
+            charge=charge,
+            description=description,
+            meta=refund_meta,
+        )
+        return True
 
     def _build_structured_payload_comment(self, payload: dict) -> str:
         return "%s\n%s\n%s" % (
