@@ -209,6 +209,11 @@ REPORT_GATE_REFUND_REASONS = {
     "formal_report_not_generated",
 }
 
+REPORT_REFUND_VISIBILITY_NOTE = (
+    "退款流水可在 账户管理 -> 完整账单 查看；需要单独核对时，可切换到“退款”筛选，"
+    "对应记录会展示退款原因、变动后余额和积分来源。"
+)
+
 CHART_PANEL_GROUP_LABELS = {
     "overview": "机会总览",
     "internal_evidence": "站内证据",
@@ -2045,12 +2050,28 @@ class Pipeline:
         payload = self._augment_asin_history_payload(payload)
         payload = self._augment_selection_report_payload(payload, fallback_summary=visible_text)
         rendered = self._render_structured_workflow_payload(payload, fallback_summary=visible_text)
+        rendered = self._append_report_refund_visibility_note(rendered, payload)
         payload_comment = self._build_structured_payload_comment(payload)
         if rendered:
             return rendered.rstrip(), payload_comment
         if visible_text:
-            return visible_text.rstrip(), payload_comment
+            return self._append_report_refund_visibility_note(visible_text, payload).rstrip(), payload_comment
         return "", payload_comment
+
+    def _append_report_refund_visibility_note(self, text: str, payload: dict) -> str:
+        rendered = str(text or "").rstrip()
+        if not isinstance(payload, dict):
+            return rendered
+        if str(payload.get("schema_version") or "").strip() != "xm.report-delivery.v1":
+            return rendered
+        if str(payload.get("delivery_status") or "").strip() != "gated_failed":
+            return rendered
+        if self._coerce_optional_bool(payload.get("refund_recommended")) is not True:
+            return rendered
+        if REPORT_REFUND_VISIBILITY_NOTE in rendered:
+            return rendered
+        note = "\n\n> %s" % REPORT_REFUND_VISIBILITY_NOTE
+        return (rendered + note).strip() if rendered else REPORT_REFUND_VISIBILITY_NOTE
 
     def _strip_outer_markdown_fence(self, answer_text: str) -> str:
         text = str(answer_text or "")
