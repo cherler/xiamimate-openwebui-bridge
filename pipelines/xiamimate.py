@@ -331,6 +331,9 @@ class Pipeline:
         AGENT_MODEL_DEEPSEEK_LABEL: str = "DeepSeek V4 Pro"
         AGENT_MODEL_MINIMAX_LABEL: str = "MiniMax M2.7"
         AGENT_MAX_TOOL_ROUNDS: int = 12
+        HELP_FAST_TOP_K: int = 4
+        HELP_CACHE_TTL_SECONDS: int = 900
+        HELP_CACHE_MAX_ENTRIES: int = 128
         XIAMIMATE_MODEL_PREFIX: str = "xiamimate"
 
     def __init__(self):
@@ -352,9 +355,13 @@ class Pipeline:
                 "AGENT_MODEL_DEEPSEEK_LABEL": os.getenv("AGENT_MODEL_DEEPSEEK_LABEL", "DeepSeek V4 Pro"),
                 "AGENT_MODEL_MINIMAX_LABEL": os.getenv("AGENT_MODEL_MINIMAX_LABEL", "MiniMax M2.7"),
                 "AGENT_MAX_TOOL_ROUNDS": int(os.getenv("AGENT_MAX_TOOL_ROUNDS", "12")),
+                "HELP_FAST_TOP_K": int(os.getenv("HELP_FAST_TOP_K", "4")),
+                "HELP_CACHE_TTL_SECONDS": int(os.getenv("HELP_CACHE_TTL_SECONDS", "900")),
+                "HELP_CACHE_MAX_ENTRIES": int(os.getenv("HELP_CACHE_MAX_ENTRIES", "128")),
                 "XIAMIMATE_MODEL_PREFIX": os.getenv("XIAMIMATE_MODEL_PREFIX", "xiamimate"),
             }
         )
+        self._help_answer_cache: Dict[str, dict] = {}
         self.pipelines = self._build_agent_pipelines()
 
     async def on_startup(self):
@@ -510,7 +517,12 @@ class Pipeline:
         if mode == "workflow":
             return self._run_workflow(query=normalized_user_message, body=body, model=response_model)
         if mode == "help":
-            return self._run_help(query=normalized_user_message, body=body, model=response_model)
+            return self._run_help(
+                query=normalized_user_message,
+                body=body,
+                model=response_model,
+                model_name=agent_model_name,
+            )
         if mode == "report":
             return self._run_report(query=normalized_user_message, body=body, model=response_model)
         if mode == "web":
@@ -539,7 +551,7 @@ class Pipeline:
             ),
         )
 
-    def _run_help(self, query: str, body: dict, model: str) -> Union[dict, Iterator[bytes]]:
+    def _run_help(self, query: str, body: dict, model: str, model_name: str) -> Union[dict, Iterator[bytes]]:
         normalized_query = (query or "").strip()
         if not normalized_query:
             content = (
@@ -549,15 +561,16 @@ class Pipeline:
                 "/help 更省积分的提问方式有哪些？"
             )
         else:
-            try:
-                answer = self._run_agent_loop(
-                    messages=[{"role": "user", "content": normalized_query}],
+            if body.get("stream"):
+                return self._run_help_fast_stream(
+                    query=normalized_query,
                     body=body,
-                    billing_context={},
-                    model_name=model,
-                    mode="help",
-                    charge_llm=False,
+                    model=model,
+                    model_name=model_name,
                 )
+
+            try:
+                answer = self._run_help_fast(query=normalized_query, body=body, model_name=model_name)
                 content = str(answer or "").strip() or "当前客服知识库里没有足够信息，请换一个更具体的问法再试。"
             except Exception as exc:
                 content = "客服知识库检索失败：%s" % str(exc)[:2000]
@@ -585,6 +598,273 @@ class Pipeline:
                 "/report standard 帮我调研一下宠物自动喂食器在 TikTok 美国市场的前景"
             ),
         )
+
+    def _run_help_fast(self, query: str, body: dict, model_name: str) -> str:
+        cached_answer = self._get_cached_help_answer(query=query, model_name=model_name)
+        if cached_answer:
+            return cached_answer
+
+        curated_answer = self._curated_newbie_prompt_help_answer(query=query)
+        if curated_answer:
+            self._store_cached_help_answer(query=query, model_name=model_name, answer=curated_answer)
+            return curated_answer
+
+        knowledge_result = self._retrieve_customer_help_knowledge(query=query)
+        answer = self._synthesize_help_answer(
+            query=query,
+            knowledge_result=knowledge_result,
+            body=body,
+            model_name=model_name,
+        )
+        self._store_cached_help_answer(query=query, model_name=model_name, answer=answer)
+        return answer
+
+    def _run_help_fast_stream(self, query: str, body: dict, model: str, model_name: str) -> Iterator[bytes]:
+        response_id = "%s-%s" % (model, uuid.uuid4())
+        created = int(time.time())
+        reasoning_open = False
+
+        def emit_text_chunk(content: str) -> bytes:
+            return self._stream_content_chunk(
+                response_id=response_id,
+                created=created,
+                model=model,
+                content=content,
+            )
+
+        def emit_reasoning_chunks(content: str) -> List[bytes]:
+            nonlocal reasoning_open
+
+            chunks: List[bytes] = []
+            if not reasoning_open:
+                reasoning_open = True
+                chunks.append(
+                    self._stream_reasoning_open_chunk(
+                        response_id=response_id,
+                        created=created,
+                        model=model,
+                    )
+                )
+            if content:
+                chunks.append(
+                    self._stream_reasoning_text_chunk(
+                        response_id=response_id,
+                        created=created,
+                        model=model,
+                        content=content,
+                    )
+                )
+            return chunks
+
+        def close_reasoning_chunk() -> Optional[bytes]:
+            nonlocal reasoning_open
+
+            if not reasoning_open:
+                return None
+            reasoning_open = False
+            return self._stream_reasoning_close_chunk(
+                response_id=response_id,
+                created=created,
+                model=model,
+            )
+
+        try:
+            cached_answer = self._get_cached_help_answer(query=query, model_name=model_name)
+            if cached_answer:
+                for chunk in self._split_text(cached_answer):
+                    yield emit_text_chunk(chunk)
+                yield self._stream_stop_chunk(response_id=response_id, created=created, model=model)
+                yield b"data: [DONE]\n\n"
+                return
+
+            curated_answer = self._curated_newbie_prompt_help_answer(query=query)
+            if curated_answer:
+                self._store_cached_help_answer(query=query, model_name=model_name, answer=curated_answer)
+                for chunk in self._split_text(curated_answer):
+                    yield emit_text_chunk(chunk)
+                yield self._stream_stop_chunk(response_id=response_id, created=created, model=model)
+                yield b"data: [DONE]\n\n"
+                return
+
+            for chunk in emit_reasoning_chunks(self._format_agent_progress("正在识别帮助主题", percent=10)):
+                yield chunk
+
+            for chunk in emit_reasoning_chunks(self._format_agent_progress("正在检索客服知识库", percent=35)):
+                yield chunk
+            knowledge_result = self._retrieve_customer_help_knowledge(query=query)
+
+            for chunk in emit_reasoning_chunks(self._format_agent_progress("知识库结果已就绪，正在整理最终答复", percent=80)):
+                yield chunk
+            answer = self._synthesize_help_answer(
+                query=query,
+                knowledge_result=knowledge_result,
+                body=body,
+                model_name=model_name,
+            )
+            self._store_cached_help_answer(query=query, model_name=model_name, answer=answer)
+
+            for chunk in emit_reasoning_chunks(self._format_agent_progress("最终答复已生成", percent=100)):
+                yield chunk
+            close_chunk = close_reasoning_chunk()
+            if close_chunk is not None:
+                yield close_chunk
+            for chunk in self._split_text(answer):
+                yield emit_text_chunk(chunk)
+        except Exception as exc:
+            close_chunk = close_reasoning_chunk()
+            if close_chunk is not None:
+                yield close_chunk
+            yield emit_text_chunk("客服知识库检索失败：%s" % str(exc)[:2000])
+
+        yield self._stream_stop_chunk(response_id=response_id, created=created, model=model)
+        yield b"data: [DONE]\n\n"
+
+    def _retrieve_customer_help_knowledge(self, query: str) -> str:
+        if self.agent_tools is None or not hasattr(self.agent_tools, "customer_help_search"):
+            raise RuntimeError("customer_help_search 工具未加载")
+        return str(self.agent_tools.customer_help_search(query=query, top_k=self._help_fast_top_k()) or "").strip()
+
+    def _curated_newbie_prompt_help_answer(self, query: str) -> str:
+        normalized_query = re.sub(r"\s+", " ", str(query or "").strip().lower())
+        if not normalized_query:
+            return ""
+        if "新手" not in normalized_query and "第一次" not in normalized_query:
+            return ""
+        if "提示词" not in normalized_query and "prompt" not in normalized_query:
+            return ""
+        if "5" not in normalized_query and "五" not in normalized_query:
+            return ""
+
+        return """好的！以下是为新手卖家精选的 5 条可直接复制的选品提示词，按从轻到重的使用顺序排列：
+
+### 1. 拆解选品验证路径（/tool）
+
+```
+/tool 请用原生工具帮我拆解 humidifier 在 Amazon 美国站的选品验证路径：先解析候选池，再说明应该继续看 stats、trends、benchmark、top ASIN 还是补池。
+```
+
+适合场景：你心里已经有一个大致品类方向（比如 humidifier），但还不确定该从哪里下手、该看哪些数据指标。这条提示词会让系统一步步拆解验证路径，帮你建立“先看什么、后看什么”的分析框架。
+
+### 2. 快速判断品类是否值得继续（/report quick）
+
+```
+/report quick 请快速判断 pet hair remover 在 Amazon 美国站是否值得继续看，并给出 3 个最关键验证指标。
+```
+
+适合场景：你有好几个候选品类，想快速筛掉明显没机会的，锁定值得深挖的方向。quick 报告速度快、结论精炼，适合做早期漏斗过滤。
+
+### 3. 深度调研市场机会（/report standard）
+
+```
+/report standard 请调研 kitchen organizer 在 Amazon 美国市场的机会，并输出适合新卖家的切入建议、目标价格带和差异化方向。
+```
+
+适合场景：你已经锁定某个品类、想认真评估是否值得投入。standard 报告会给出完整的市场机会判断，还会针对新卖家身份给出价格带建议和差异化方向，非常适合做立项前的深度功课。
+
+### 4. 追踪平台政策变化（/web）
+
+```
+/web 请搜索最近 30 天 TikTok Shop 美国站入驻、履约、广告和合规政策变化，并按卖家影响排序。
+```
+
+适合场景：你想了解最新平台入驻条件、物流履约规则或广告合规动态，尤其是 TikTok Shop 这类政策变化频繁的渠道。这条提示词会从外部抓取最新信息并按影响程度排序，帮你避开合规风险。
+
+### 5. 查询更多提示词模板（/help）
+
+```
+/help 我是新手卖家，正在做 Amazon 美国站选品，给我推荐适合我当前阶段的提示词。
+```
+
+适合场景：上面的 4 条用完之后，你还想要更多针对自己情况的提示词。直接告诉 /help 你的身份和阶段，系统会从知识库里匹配最相关的示例，不用自己从零想 prompt。
+
+使用建议：新手建议按 1 -> 2 -> 3 的顺序推进，先用 /tool 理清思路，再用 /report quick 快速筛选，方向明确后再上 /report standard 做深度调研；/web 则随时用来补充外部最新信息。"""
+
+    def _synthesize_help_answer(self, query: str, knowledge_result: str, body: dict, model_name: str) -> str:
+        if not knowledge_result:
+            return "当前客服知识库里没有足够信息，请换一个更具体的问法再试。"
+
+        if "未找到与" in knowledge_result and "客服知识库内容" in knowledge_result:
+            return "当前客服知识库里没有找到足够相关的内容。请换一个更具体的问法，例如只问价格规则、/report 计费、提示词示例或新手上手步骤。"
+
+        synthesis_messages = [
+            {"role": "user", "content": query},
+            {
+                "role": "user",
+                "content": (
+                    "下面是 customer_help_search 检索到的客服知识库结果。不要再调用任何工具，"
+                    "只能基于这些结果直接回答用户问题。\n\n"
+                    "%s"
+                )
+                % knowledge_result,
+            },
+        ]
+        payload = self._prepare_agent_payload(messages=synthesis_messages, body=body, mode="help", model_name=model_name)
+        payload["stream"] = False
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
+        response = self._post_agent_payload(payload, model_name=model_name)
+        content = self._clean_agent_content(self._extract_assistant_content(response), model_name=model_name)
+        if content:
+            return content
+        return self._fallback_help_answer_from_tool_observations([{"llm_result": knowledge_result}])
+
+    def _help_fast_top_k(self) -> int:
+        try:
+            return max(1, min(8, int(self.valves.HELP_FAST_TOP_K)))
+        except Exception:
+            return 4
+
+    def _help_cache_ttl_seconds(self) -> int:
+        try:
+            return max(30, min(86400, int(self.valves.HELP_CACHE_TTL_SECONDS)))
+        except Exception:
+            return 900
+
+    def _help_cache_max_entries(self) -> int:
+        try:
+            return max(8, min(1024, int(self.valves.HELP_CACHE_MAX_ENTRIES)))
+        except Exception:
+            return 128
+
+    def _normalize_help_cache_key(self, query: str, model_name: str) -> str:
+        normalized_query = re.sub(r"\s+", " ", str(query or "").strip().lower())
+        normalized_model_name = str(model_name or "").strip().lower()
+        return "%s::%s" % (normalized_model_name, normalized_query)
+
+    def _prune_help_answer_cache(self) -> None:
+        now = time.time()
+        ttl_seconds = self._help_cache_ttl_seconds()
+        self._help_answer_cache = {
+            key: value
+            for key, value in self._help_answer_cache.items()
+            if now - float(value.get("created_at") or 0) <= ttl_seconds
+        }
+        max_entries = self._help_cache_max_entries()
+        if len(self._help_answer_cache) <= max_entries:
+            return
+        sorted_items = sorted(
+            self._help_answer_cache.items(),
+            key=lambda item: float((item[1] or {}).get("created_at") or 0),
+            reverse=True,
+        )
+        self._help_answer_cache = dict(sorted_items[:max_entries])
+
+    def _get_cached_help_answer(self, query: str, model_name: str) -> str:
+        self._prune_help_answer_cache()
+        cache_key = self._normalize_help_cache_key(query=query, model_name=model_name)
+        cached = self._help_answer_cache.get(cache_key) or {}
+        return str(cached.get("answer") or "").strip()
+
+    def _store_cached_help_answer(self, query: str, model_name: str, answer: str) -> None:
+        normalized_answer = str(answer or "").strip()
+        if not normalized_answer:
+            return
+        cache_key = self._normalize_help_cache_key(query=query, model_name=model_name)
+        self._help_answer_cache[cache_key] = {
+            "answer": normalized_answer,
+            "created_at": time.time(),
+        }
+        self._prune_help_answer_cache()
 
     def _run_report_profile(
         self,
@@ -1032,7 +1312,7 @@ class Pipeline:
             )
 
         try:
-            for chunk in emit_reasoning_chunks(self._format_agent_progress("正在分析问题")):
+            for chunk in emit_reasoning_chunks(self._format_agent_progress("正在分析问题", percent=10)):
                 yield chunk
 
             for round_index in range(self._agent_max_tool_rounds()):
@@ -1043,7 +1323,7 @@ class Pipeline:
                 except RuntimeError as exc:
                     if tool_observations:
                         final_answer = self._fallback_answer_from_tool_observations(tool_observations, error=str(exc))
-                        for chunk in emit_reasoning_chunks(self._format_agent_progress("模型整理失败，返回工具结果摘要")):
+                        for chunk in emit_reasoning_chunks(self._format_agent_progress("模型整理失败，返回工具结果摘要", percent=100)):
                             yield chunk
                         close_chunk = close_reasoning_chunk()
                         if close_chunk is not None:
@@ -1081,7 +1361,7 @@ class Pipeline:
                         final_answer = str(content or "").strip()
                     final_answer = self._fallback_opportunity_answer_if_needed(final_answer, tool_observations)
                     status_line = "正在生成最终答复" if round_index == 0 else "工具执行完成，正在生成最终答复"
-                    for chunk in emit_reasoning_chunks(self._format_agent_progress(status_line)):
+                    for chunk in emit_reasoning_chunks(self._format_agent_progress(status_line, percent=100)):
                         yield chunk
 
                     close_chunk = close_reasoning_chunk()
@@ -1121,7 +1401,7 @@ class Pipeline:
 
                 if cached_tool_calls and not new_tool_calls:
                     final_answer = self._fallback_opportunity_answer_from_observations(tool_observations) or self._fallback_answer_from_tool_observations(tool_observations)
-                    for chunk in emit_reasoning_chunks(self._format_agent_progress("工具结果已就绪，正在生成最终答复")):
+                    for chunk in emit_reasoning_chunks(self._format_agent_progress("工具结果已就绪，正在生成最终答复", percent=90)):
                         yield chunk
                     close_chunk = close_reasoning_chunk()
                     if close_chunk is not None:
@@ -1152,7 +1432,7 @@ class Pipeline:
                         )
 
                 tool_names = ", ".join(tool_call["name"] for tool_call in new_tool_calls)
-                for chunk in emit_reasoning_chunks(self._format_agent_progress("正在调用工具: %s" % tool_names)):
+                for chunk in emit_reasoning_chunks(self._format_agent_progress("正在调用工具: %s" % tool_names, percent=45)):
                     yield chunk
 
                 for tool_call in new_tool_calls:
@@ -1179,7 +1459,7 @@ class Pipeline:
                         )
                     tool_status = "失败" if self._tool_result_has_error(result) else "完成"
                     for chunk in emit_reasoning_chunks(
-                        self._format_agent_progress("工具 %s 已%s" % (tool_call["name"], tool_status))
+                        self._format_agent_progress("工具 %s 已%s" % (tool_call["name"], tool_status), percent=75)
                     ):
                         yield chunk
 
@@ -1194,7 +1474,7 @@ class Pipeline:
                     mode=mode,
                     tool_observations=tool_observations,
                 )
-                for chunk in emit_reasoning_chunks(self._format_agent_progress("工具调用已达上限，正在基于已有证据生成最终答复")):
+                for chunk in emit_reasoning_chunks(self._format_agent_progress("工具调用已达上限，正在基于已有证据生成最终答复", percent=100)):
                     yield chunk
                 close_chunk = close_reasoning_chunk()
                 if close_chunk is not None:
@@ -2228,8 +2508,15 @@ class Pipeline:
                 parts.append(content)
         return "".join(parts)
 
-    def _format_agent_progress(self, description: str) -> str:
-        return "⏳ /agent · %s\n" % description
+    def _format_agent_progress(self, description: str, percent: Optional[int] = None) -> str:
+        if percent is None:
+            return "⏳ /agent · %s\n" % description
+
+        normalized_percent = max(0, min(100, int(percent)))
+        total_slots = 10
+        filled = max(0, min(total_slots, round((normalized_percent / 100) * total_slots)))
+        bar = "#" * filled + "." * (total_slots - filled)
+        return "⏳ /agent 进度 [%s] %d%% · %s\n" % (bar, normalized_percent, description)
 
     def _workflow_progress_percent(self, finished_count: int) -> int:
         percent = 8 + int((finished_count * 88) / max(1, WORKFLOW_ESTIMATED_STEPS))
