@@ -568,8 +568,14 @@ class Pipeline:
 
     def _run_report(self, query: str, body: dict, model: str) -> Union[dict, Iterator[bytes]]:
         profile, normalized_query = self._parse_report_profile(query)
+        resolved_query = self._resolve_report_query_from_context(normalized_query, body.get("messages") or [])
+        if resolved_query is None:
+            message = self._report_opportunity_reference_guidance(normalized_query, profile=profile)
+            if body.get("stream"):
+                return self._stream_text_response(content=message, model=model)
+            return self._chat_response(content=message, model=model)
         return self._run_report_profile(
-            query=normalized_query,
+            query=resolved_query,
             body=body,
             model=model,
             profile=profile,
@@ -1235,6 +1241,248 @@ class Pipeline:
         if normalized in REPORT_PROFILE_EVENT_TYPES:
             return normalized, remainder.strip()
         return "standard", stripped
+
+    def _resolve_report_query_from_context(self, query: str, messages: List[dict]) -> Optional[str]:
+        normalized_query = (query or "").strip()
+        rank = self._extract_opportunity_reference_rank(normalized_query)
+        if rank is None:
+            rank = self._extract_short_bare_opportunity_rank(normalized_query)
+        if rank is None:
+            return normalized_query
+
+        opportunity = self._find_referenced_opportunity(rank, messages)
+        if not opportunity:
+            return None
+
+        report_query = self._report_query_from_opportunity(opportunity)
+        if not report_query:
+            return None
+
+        suffix = self._strip_opportunity_reference_words(normalized_query)
+        if suffix:
+            return "%s。补充要求：%s" % (report_query, suffix)
+        return report_query
+
+    def _extract_opportunity_reference_rank(self, text: str) -> Optional[int]:
+        normalized_text = str(text or "")
+        patterns = (
+            r"机会\s*(?:编号|#|＃)?\s*(\d{1,3})",
+            r"(?:编号|#|＃)\s*(\d{1,3})",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, normalized_text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            try:
+                rank = int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+            if rank > 0:
+                return rank
+        return None
+
+    def _extract_short_bare_opportunity_rank(self, text: str) -> Optional[int]:
+        normalized_text = str(text or "").strip()
+        match = re.fullmatch(r"(\d{1,3})(?:\s*[\.、\)）:：]\s*|\s+)?(.*)", normalized_text, flags=re.DOTALL)
+        if not match:
+            return None
+        try:
+            rank = int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+        if rank <= 0:
+            return None
+
+        suffix = str(match.group(2) or "").strip()
+        compact_suffix = re.sub(r"[，。,.；;：:\s]+", "", suffix)
+        if not compact_suffix:
+            return rank
+        if re.search(r"\d", compact_suffix):
+            return None
+        if len(compact_suffix) > 12:
+            return None
+        if re.match(r"^(天|日|周|月|年|页|万|元|美元|美金|个|件|款|次|%|％)", compact_suffix):
+            return None
+        return rank
+
+    def _find_referenced_opportunity(self, rank: int, messages: List[dict]) -> Optional[dict]:
+        for message in reversed(messages or []):
+            if message.get("role") != "assistant":
+                continue
+            text = self._extract_message_text(message)
+            if not text:
+                continue
+
+            opportunity = self._find_opportunity_in_structured_text(rank, text)
+            if opportunity:
+                return opportunity
+
+            opportunity = self._find_opportunity_in_markdown_table(rank, text)
+            if opportunity:
+                return opportunity
+
+            opportunity = self._find_opportunity_in_numbered_text(rank, text)
+            if opportunity:
+                return opportunity
+        return None
+
+    def _find_opportunity_in_structured_text(self, rank: int, text: str) -> Optional[dict]:
+        for json_text in self._iter_json_blocks(text):
+            try:
+                payload = json.loads(json_text)
+            except ValueError:
+                continue
+            opportunity = self._find_opportunity_in_json_value(rank, payload)
+            if opportunity:
+                return opportunity
+        return None
+
+    def _iter_json_blocks(self, text: str) -> Iterator[str]:
+        for match in re.finditer(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", str(text or ""), flags=re.IGNORECASE | re.DOTALL):
+            yield match.group(1)
+        stripped = str(text or "").strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            yield stripped
+
+    def _find_opportunity_in_json_value(self, rank: int, value: Any) -> Optional[dict]:
+        if isinstance(value, list):
+            for item in value:
+                opportunity = self._find_opportunity_in_json_value(rank, item)
+                if opportunity:
+                    return opportunity
+            return None
+
+        if not isinstance(value, dict):
+            return None
+
+        raw_rank = value.get("rank") or value.get("opportunity_rank") or value.get("index") or value.get("number")
+        try:
+            value_rank = int(str(raw_rank).lstrip("#＃"))
+        except (TypeError, ValueError):
+            value_rank = None
+        if value_rank == rank:
+            return value
+
+        for key in ("opportunities_for_llm", "opportunities", "items", "data", "payload", "result"):
+            child = value.get(key)
+            if isinstance(child, str):
+                child_payload = self._load_tool_json_payload(child)
+                if child_payload is None:
+                    continue
+                child = child_payload
+            opportunity = self._find_opportunity_in_json_value(rank, child)
+            if opportunity:
+                return opportunity
+        return None
+
+    def _find_opportunity_in_markdown_table(self, rank: int, text: str) -> Optional[dict]:
+        header_cells: List[str] = []
+        for raw_line in str(text or "").splitlines():
+            line = raw_line.strip()
+            if not line.startswith("|") or "|" not in line[1:]:
+                continue
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            if not cells or all(re.fullmatch(r"[-: ]+", cell or "") for cell in cells):
+                continue
+            if any("排名" in cell or "机会" in cell or "类目" in cell for cell in cells):
+                header_cells = cells
+                continue
+
+            rank_index = self._markdown_table_rank_index(cells, header_cells)
+            if rank_index is None:
+                continue
+            cell_rank = self._parse_rank_cell(cells[rank_index])
+            if cell_rank != rank:
+                continue
+
+            title_index = self._markdown_table_column_index(header_cells, ("机会主题", "主题", "标题", "品类", "产品"), default=rank_index + 1)
+            category_index = self._markdown_table_column_index(header_cells, ("类目路径", "类目", "category"), default=None)
+            return {
+                "rank": rank,
+                "title": cells[title_index].strip() if title_index is not None and title_index < len(cells) else "",
+                "category_path": cells[category_index].strip() if category_index is not None and category_index < len(cells) else "",
+            }
+        return None
+
+    def _markdown_table_rank_index(self, cells: List[str], header_cells: List[str]) -> Optional[int]:
+        if header_cells:
+            for index, header in enumerate(header_cells):
+                if "排名" in header or "编号" in header or header.strip().lower() in {"rank", "#"}:
+                    return index if index < len(cells) else None
+        for index, cell in enumerate(cells[:3]):
+            if self._parse_rank_cell(cell) is not None:
+                return index
+        return None
+
+    def _markdown_table_column_index(self, header_cells: List[str], names: Tuple[str, ...], default: Optional[int]) -> Optional[int]:
+        for index, header in enumerate(header_cells or []):
+            normalized_header = header.strip().lower()
+            if any(name.lower() in normalized_header for name in names):
+                return index
+        return default
+
+    def _parse_rank_cell(self, cell: str) -> Optional[int]:
+        match = re.search(r"(?:#|＃)?\s*(\d{1,3})", str(cell or ""))
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+
+    def _find_opportunity_in_numbered_text(self, rank: int, text: str) -> Optional[dict]:
+        pattern = re.compile(
+            r"^\s*(?:机会\s*)?(?:编号\s*)?(?:#|＃)?%d[\.、\)）:：\s]+(.+)$" % rank,
+            flags=re.MULTILINE,
+        )
+        match = pattern.search(str(text or ""))
+        if not match:
+            return None
+        title = re.split(r"[|｜]", match.group(1).strip(), maxsplit=1)[0].strip()
+        return {"rank": rank, "title": title, "category_path": ""}
+
+    def _report_query_from_opportunity(self, opportunity: dict) -> str:
+        if not isinstance(opportunity, dict):
+            return ""
+        next_action = opportunity.get("next_action") if isinstance(opportunity.get("next_action"), dict) else {}
+        request_payload = next_action.get("request") if isinstance(next_action.get("request"), dict) else {}
+        title = str(
+            request_payload.get("product_query")
+            or request_payload.get("query")
+            or opportunity.get("title")
+            or opportunity.get("opportunity_title")
+            or ""
+        ).strip()
+        category_path = str(request_payload.get("category_path") or opportunity.get("category_path") or "").strip()
+        category_id = str(request_payload.get("category_id") or opportunity.get("category_id") or "").strip()
+        parts = []
+        if title:
+            parts.append(title)
+        if category_path:
+            parts.append("类目路径：%s" % category_path)
+        elif category_id:
+            parts.append("类目ID：%s" % category_id)
+        return "；".join(parts).strip()
+
+    def _strip_opportunity_reference_words(self, query: str) -> str:
+        text = re.sub(r"机会\s*(?:编号|#|＃)?\s*\d{1,3}", "", str(query or ""), flags=re.IGNORECASE)
+        text = re.sub(r"(?:编号|#|＃)\s*\d{1,3}", "", text, flags=re.IGNORECASE)
+        if self._extract_short_bare_opportunity_rank(text) is not None:
+            text = re.sub(r"^\s*\d{1,3}(?:\s*[\.、\)）:：]\s*|\s+)?", "", text, count=1)
+        text = re.sub(r"\b(?:quick|standard|deep|research)\b", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"[，。,.；;：:\s]+", " ", text).strip()
+        removable = {"请", "帮我", "帮忙", "使用", "用", "分析", "分析一下", "一下", "这个", "这条", "机会", "报告"}
+        tokens = [token for token in text.split() if token not in removable]
+        return " ".join(tokens).strip()
+
+    def _report_opportunity_reference_guidance(self, query: str, profile: str) -> str:
+        profile_text = str(profile or "quick").strip() or "quick"
+        return (
+            "我识别到你想分析上文的 `%s`，但当前对话里没有找到对应的机会卡片明细。\n\n"
+            "请把机会主题放到 `/report %s` 后面，例如：\n\n"
+            "`/report %s Power Strips，分析一下`\n\n"
+            "或者先让 /agent 重新展示机会列表，再按完整命令继续。"
+        ) % ((query or "").strip(), profile_text, profile_text)
 
     def _parse_mode_command(self, text: str) -> Tuple[Optional[str], str]:
         stripped = (text or "").lstrip()

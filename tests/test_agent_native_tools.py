@@ -762,6 +762,100 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertIn("当前可继续分析的机会编号共有 2 个", answer)
         self.assertNotIn("估算区间", answer)
 
+    def test_report_query_resolves_opportunity_reference_from_markdown_table(self) -> None:
+        pipe = self.make_pipeline()
+        messages = [
+            {
+                "role": "assistant",
+                "content": "| 排名 | 机会主题 | 类目路径 |\n| --- | --- | --- |\n| #6 | Power Strips | Electronics > Power |\n| #7 | Air Fresheners | Home & Kitchen > Home Fragrance |",
+            },
+            {"role": "user", "content": "/report quick 机会编号7，分析一下"},
+        ]
+
+        query = pipe._resolve_report_query_from_context("机会编号7，分析一下", messages)
+
+        self.assertIsNotNone(query)
+        self.assertIn("Air Fresheners", query)
+        self.assertIn("Home & Kitchen > Home Fragrance", query)
+        self.assertNotIn("机会编号7", query)
+
+    def test_report_query_prefers_opportunity_next_action_request(self) -> None:
+        pipe = self.make_pipeline()
+        payload = {
+            "opportunities_for_llm": [
+                {
+                    "rank": 7,
+                    "title": "Air Fresheners",
+                    "category_path": "Fallback Category",
+                    "next_action": {"request": {"query": "car air freshener", "category_path": "Automotive > Interior Accessories"}},
+                }
+            ]
+        }
+        messages = [
+            {"role": "assistant", "content": "```json\n%s\n```" % json.dumps(payload, ensure_ascii=False)},
+            {"role": "user", "content": "/report quick 机会编号7，分析一下"},
+        ]
+
+        query = pipe._resolve_report_query_from_context("机会编号7，分析一下", messages)
+
+        self.assertIsNotNone(query)
+        self.assertIn("car air freshener", query)
+        self.assertIn("Automotive > Interior Accessories", query)
+        self.assertNotIn("Fallback Category", query)
+
+    def test_report_query_returns_none_for_unresolved_opportunity_reference(self) -> None:
+        pipe = self.make_pipeline()
+
+        query = pipe._resolve_report_query_from_context("机会编号7，分析一下", [{"role": "assistant", "content": "没有机会列表"}])
+
+        self.assertIsNone(query)
+
+    def test_report_query_resolves_short_bare_rank_for_standard_profile(self) -> None:
+        pipe = self.make_pipeline()
+        messages = [
+            {
+                "role": "assistant",
+                "content": "| 排名 | 机会主题 | 类目路径 |\n| --- | --- | --- |\n| #7 | Air Fresheners | Home & Kitchen > Home Fragrance |",
+            },
+            {"role": "user", "content": "/report standard 7"},
+        ]
+        profile, normalized_query = pipe._parse_report_profile("standard 7")
+
+        query = pipe._resolve_report_query_from_context(normalized_query, messages)
+
+        self.assertEqual("standard", profile)
+        self.assertIsNotNone(query)
+        self.assertIn("Air Fresheners", query)
+        self.assertIn("Home & Kitchen > Home Fragrance", query)
+
+    def test_report_query_resolves_short_bare_rank_with_action_words(self) -> None:
+        pipe = self.make_pipeline()
+        messages = [
+            {
+                "role": "assistant",
+                "content": "| 排名 | 机会主题 | 类目路径 |\n| --- | --- | --- |\n| #7 | Air Fresheners | Home & Kitchen > Home Fragrance |",
+            }
+        ]
+
+        query = pipe._resolve_report_query_from_context("7 分析一下", messages)
+
+        self.assertIsNotNone(query)
+        self.assertIn("Air Fresheners", query)
+        self.assertNotIn("补充要求", query)
+
+    def test_report_query_does_not_treat_numeric_units_as_opportunity_rank(self) -> None:
+        pipe = self.make_pipeline()
+        messages = [
+            {
+                "role": "assistant",
+                "content": "| 排名 | 机会主题 | 类目路径 |\n| --- | --- | --- |\n| #7 | Air Fresheners | Home & Kitchen > Home Fragrance |",
+            }
+        ]
+
+        query = pipe._resolve_report_query_from_context("7天趋势", messages)
+
+        self.assertEqual("7天趋势", query)
+
     def test_ungrounded_opportunity_answer_falls_back_to_real_cards(self) -> None:
         pipe = self.make_pipeline()
         raw_result = json.dumps(
