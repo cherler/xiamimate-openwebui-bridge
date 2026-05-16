@@ -333,7 +333,7 @@
   el.id = 'xm-nav';
   el.innerHTML =
     '<div class="xm-links">' +
-      '<a href="/" class="xm-brand">\uD83E\uDD90 \u867E\u5BC6\u5C0F\u52A9\u624B</a>' +
+      '<a href="/" class="xm-brand">\uD83E\uDD90 \u867E\u7C73\u9009\u54C1</a>' +
       '<a href="/"' + cls('/') + '>\u5BF9\u8BDD</a>' +
       '<a href="/portal/guide"' + cls('/portal/guide') + '>\u4F7F\u7528\u6307\u5357</a>' +
         '<a href="/portal/account' + portalLinkSuffix + '"' + cls('/portal/account') + '>\u8D26\u6237\u7BA1\u7406</a>' +
