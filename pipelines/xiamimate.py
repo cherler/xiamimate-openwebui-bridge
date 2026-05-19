@@ -127,6 +127,186 @@ TOOL_RESULT_TEMPLATE = """以下是工具执行结果，请基于这些结果继
 如果信息已经足够，请直接给出最终答案。
 如果仍需继续调用工具，只调用真正必要的工具，不要重复调用相同工具。"""
 
+AGENT_PLANNER_SYSTEM_PROMPT = """你是 XiaMimate 的 Planner，负责把用户问题转成最小必要执行计划。
+
+你的职责：
+1. 先判断问题场景，再决定是否需要工具。
+2. 能直接回答时直接回答，不要为了显得完整而调用工具。
+3. 需要工具时，只输出本轮最小必要步骤；执行完后可以基于结果再计划下一轮。
+4. 基础知识、入门指导、提示词建议、产品使用说明这类问题，禁止使用选品分析工具；优先直接回答，必要时才使用 customer_help_search、search_knowledge_base、web_search。
+5. web_search 是增强可信度和时效性的补强工具，不是默认前置工具。只有当最新外部信息会实质影响结论、或用户明确要求联网/最新/外部依据时才使用。
+6. 选品机会发现、商品主题分析、ASIN 分析、预算测算分别走各自工具层，不要跨层乱调。
+
+你必须只输出一个 JSON 对象，不要输出 markdown，不要输出解释文字。
+
+JSON 结构：
+{
+  "scene": "foundation_qa|blank_opportunity_discovery|theme_analysis|asin_specific_analysis|budget_analysis|general_agent",
+  "answer_ready": true,
+  "final_answer": "当无需更多工具时直接给用户的最终答案；否则为空字符串",
+  "reasoning_summary": "一句话说明为什么这样规划",
+  "steps": [
+    {
+      "tool_name": "工具名",
+      "goal": "本步骤目标",
+      "required": true,
+      "parameters": {"参数名": "参数值"}
+    }
+  ],
+  "stop_reason": "本轮执行后何时可以停止继续调用工具"
+}
+
+约束：
+- answer_ready=true 时，steps 必须为空。
+- answer_ready=false 时，final_answer 必须为空。
+- 只可从给定 allowed_tools 中选择工具。
+- 不要编造工具参数；拿不准时先选择前置工具，或直接回答并说明边界。
+- 每轮 steps 数量不得超过给定 max_steps_per_round。
+"""
+
+AGENT_SYNTHESIS_SYSTEM_PROMPT = """你是 XiaMimate 的 Answer Synthesizer。
+
+职责：
+1. 严格基于用户问题、planner 摘要和已返回的工具结果作答，不得再调用工具。
+2. 结论前置，避免冗长铺垫。
+3. 基础知识或新手问题优先直接、清楚、专业地回答；不要硬套选品分析框架。
+4. 涉及工具证据时，区分工具事实、推理判断和证据边界。
+5. 若工具证据不足，明确说明还缺什么，不要假装结论已被验证。
+6. 不要输出内部 JSON、tool_call、planner 字段或控制标记。
+"""
+
+TOOL_LAYER_REGISTRY = {
+    "customer_help_search": {
+        "layer": "foundation",
+        "capability": "产品使用、入门指导、提示词示例、计费和客服 FAQ",
+        "scene_tags": ["foundation_qa", "general_agent"],
+    },
+    "search_knowledge_base": {
+        "layer": "foundation",
+        "capability": "跨境平台规则、运营方法、合规要求、领域知识",
+        "scene_tags": ["foundation_qa", "theme_analysis", "blank_opportunity_discovery", "general_agent"],
+    },
+    "web_search": {
+        "layer": "foundation",
+        "capability": "最新外部政策、新闻、市场动态、外部可信度补强",
+        "scene_tags": ["foundation_qa", "theme_analysis", "blank_opportunity_discovery", "general_agent"],
+    },
+    "opportunity_discovery": {
+        "layer": "discovery",
+        "capability": "用户尚未给出具体商品时，发现机会卡片和后续分析入口",
+        "scene_tags": ["blank_opportunity_discovery", "general_agent"],
+    },
+    "opportunity_discovery_job": {
+        "layer": "discovery",
+        "capability": "根据机会发现 job_id 回取历史结果或完整卡片",
+        "scene_tags": ["blank_opportunity_discovery", "general_agent"],
+    },
+    "resolve_candidates": {
+        "layer": "analysis",
+        "capability": "将具体商品词或主题解析成候选 ASIN 池",
+        "scene_tags": ["theme_analysis", "general_agent"],
+    },
+    "category_resolve": {
+        "layer": "analysis",
+        "capability": "解析稳定类目 ID/路径，为召回、benchmark、扩池做锚点",
+        "scene_tags": ["theme_analysis", "general_agent"],
+    },
+    "candidate_pool_stats": {
+        "layer": "analysis",
+        "capability": "候选池基础统计盘面",
+        "scene_tags": ["theme_analysis", "general_agent"],
+    },
+    "candidate_pool_trends": {
+        "layer": "analysis",
+        "capability": "候选池趋势变化",
+        "scene_tags": ["theme_analysis", "general_agent"],
+    },
+    "candidate_pool_weak_forecast": {
+        "layer": "analysis",
+        "capability": "候选池弱信号预测",
+        "scene_tags": ["theme_analysis", "general_agent"],
+    },
+    "product_forecast_explain": {
+        "layer": "analysis",
+        "capability": "正式销量预测及其解释",
+        "scene_tags": ["theme_analysis", "general_agent"],
+    },
+    "top_asin_drilldown": {
+        "layer": "analysis",
+        "capability": "头部 ASIN 下钻分析",
+        "scene_tags": ["theme_analysis", "general_agent"],
+    },
+    "asin_history_timeseries": {
+        "layer": "analysis",
+        "capability": "指定 ASIN 的历史时序表现",
+        "scene_tags": ["asin_specific_analysis", "general_agent"],
+    },
+    "category_benchmark": {
+        "layer": "analysis",
+        "capability": "候选池与类目基准对比",
+        "scene_tags": ["theme_analysis", "general_agent"],
+    },
+    "keepa_asin_lookup": {
+        "layer": "analysis",
+        "capability": "本地没有历史数据时查 Keepa 实时快照",
+        "scene_tags": ["asin_specific_analysis", "theme_analysis", "general_agent"],
+    },
+    "expand_candidates": {
+        "layer": "expansion",
+        "capability": "候选池不足时创建扩池任务",
+        "scene_tags": ["theme_analysis", "general_agent"],
+    },
+    "candidate_expansion_status": {
+        "layer": "expansion",
+        "capability": "查询扩池任务和分析数据就绪状态",
+        "scene_tags": ["theme_analysis", "general_agent"],
+    },
+    "launch_budget_calculator": {
+        "layer": "business",
+        "capability": "启动资金、单件利润、盈亏平衡测算",
+        "scene_tags": ["budget_analysis", "general_agent"],
+    },
+}
+
+SCENE_TOOL_POLICY = {
+    "foundation_qa": {
+        "label": "基础知识与新手指导",
+        "allowed_layers": ["foundation"],
+        "max_rounds": 2,
+        "max_steps_per_round": 2,
+    },
+    "blank_opportunity_discovery": {
+        "label": "空白机会发现",
+        "allowed_layers": ["discovery", "foundation"],
+        "max_rounds": 3,
+        "max_steps_per_round": 2,
+    },
+    "theme_analysis": {
+        "label": "商品主题分析",
+        "allowed_layers": ["analysis", "expansion", "foundation", "business"],
+        "max_rounds": 4,
+        "max_steps_per_round": 3,
+    },
+    "asin_specific_analysis": {
+        "label": "ASIN 定向分析",
+        "allowed_layers": ["analysis", "foundation"],
+        "max_rounds": 3,
+        "max_steps_per_round": 2,
+    },
+    "budget_analysis": {
+        "label": "预算与利润测算",
+        "allowed_layers": ["business", "foundation"],
+        "max_rounds": 2,
+        "max_steps_per_round": 2,
+    },
+    "general_agent": {
+        "label": "通用智能体",
+        "allowed_layers": ["foundation", "discovery", "analysis", "expansion", "business"],
+        "max_rounds": 3,
+        "max_steps_per_round": 2,
+    },
+}
+
 ALLOWED_AGENT_TOOLS = {
     "customer_help_search",
     "search_knowledge_base",
@@ -1260,12 +1440,15 @@ class Pipeline:
     ) -> Iterator[bytes]:
         response_id = "%s-%s" % (model, uuid.uuid4())
         created = int(time.time())
-        conversation = deepcopy(messages or [])
+        source_messages = deepcopy(messages or [])
         answer_started = False
         used_tools = False
         reasoning_open = False
         tool_observations: List[dict] = []
         tool_result_cache: Dict[Tuple[str, str], dict] = {}
+        planner_notes: List[dict] = []
+        scene = self._classify_agent_scene(source_messages, mode=mode)
+        max_rounds = min(self._agent_max_tool_rounds(), int(self._scene_policy(scene, mode).get("max_rounds") or 1))
 
         def emit_text_chunk(content: str) -> bytes:
             return self._stream_content_chunk(
@@ -1315,11 +1498,19 @@ class Pipeline:
             for chunk in emit_reasoning_chunks(self._format_agent_progress("正在分析问题", percent=10)):
                 yield chunk
 
-            for round_index in range(self._agent_max_tool_rounds()):
-                payload = self._prepare_agent_payload(messages=conversation, body=body, mode=mode, model_name=model_name)
-                payload["stream"] = False
+            for round_index in range(max_rounds):
+                for chunk in emit_reasoning_chunks(self._format_agent_progress("正在规划执行路径", percent=25)):
+                    yield chunk
                 try:
-                    response = self._post_agent_payload(payload, model_name=model_name)
+                    plan = self._plan_agent_next_steps(
+                        messages=source_messages,
+                        body=body,
+                        model_name=model_name,
+                        mode=mode,
+                        scene=scene,
+                        tool_observations=tool_observations,
+                        remaining_rounds=max_rounds - round_index,
+                    )
                 except RuntimeError as exc:
                     if tool_observations:
                         final_answer = self._fallback_answer_from_tool_observations(tool_observations, error=str(exc))
@@ -1334,74 +1525,47 @@ class Pipeline:
                         break
                     raise
 
-                content = self._extract_assistant_content(response)
-                assistant_message = self._extract_assistant_message(response)
-                native_tool_calls = self._extract_response_tool_calls(response)
-                text_tool_calls = [] if native_tool_calls or self._provider_uses_native_tool_calls(model_name) else self._extract_tool_calls(content, model_name=model_name)
-                tool_calls = native_tool_calls or text_tool_calls
-                tool_calls = self._filter_tool_calls_for_user_intent(tool_calls, conversation)
-                if native_tool_calls:
-                    native_tool_calls = tool_calls
-                    assistant_message = self._filter_assistant_message_tool_calls(assistant_message, tool_calls)
+                scene = str(plan.get("scene") or scene or "general_agent").strip() or "general_agent"
+                planner_notes.append(self._planner_plan_note(scene, plan))
 
-                if not tool_calls:
+                if plan.get("answer_ready") and str(plan.get("final_answer") or "").strip():
                     if mode == "agent" and not used_tools:
                         self._charge_standalone_llm_request(
                             billing_context=billing_context,
-                            payload=payload,
+                            payload={"model": model_name, "messages": source_messages},
                             mode=mode,
                             stream=True,
                         )
-                    cleaned = self._clean_agent_content(content, model_name=model_name)
-                    if cleaned:
-                        final_answer = cleaned
-                    elif self._agent_stream_contains_internal_markup(content, model_name=model_name):
-                        final_answer = "已完成分析，但未生成可展示的结果，请重试。"
-                    else:
-                        final_answer = str(content or "").strip()
-                    final_answer = self._fallback_opportunity_answer_if_needed(final_answer, tool_observations)
-                    status_line = "正在生成最终答复" if round_index == 0 else "工具执行完成，正在生成最终答复"
-                    for chunk in emit_reasoning_chunks(self._format_agent_progress(status_line, percent=100)):
+                    final_answer = self._fallback_opportunity_answer_if_needed(str(plan.get("final_answer") or "").strip(), tool_observations)
+                    for chunk in emit_reasoning_chunks(self._format_agent_progress("Planner 已确认可直接作答，正在生成最终答复", percent=100)):
                         yield chunk
 
                     close_chunk = close_reasoning_chunk()
                     if close_chunk is not None:
                         yield close_chunk
 
-                    if used_tools or self._agent_stream_contains_internal_markup(content, model_name=model_name):
-                        for chunk in self._split_text(final_answer):
-                            answer_started = True
-                            yield emit_text_chunk(chunk)
-                    else:
-                        for chunk in self._stream_agent_final_answer_chunks(
-                            payload=payload,
-                            fallback_content=final_answer,
-                            model_name=model_name,
-                        ):
-                            answer_started = True
-                            yield emit_text_chunk(chunk)
+                    for chunk in self._split_text(final_answer):
+                        answer_started = True
+                        yield emit_text_chunk(chunk)
                     break
 
-                used_tools = True
-                conversation.append(assistant_message)
-                tool_calls = [self._attach_internal_tool_context(tool_call, body) for tool_call in tool_calls]
-
-                cached_tool_calls = []
-                new_tool_calls = []
-                for tool_call in tool_calls:
-                    cached_observation = self._cached_tool_observation_for_call(
-                        tool_call=tool_call,
-                        tool_result_cache=tool_result_cache,
+                steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
+                if not steps:
+                    final_answer = self._synthesize_planner_executor_answer(
+                        messages=source_messages,
+                        body=body,
+                        model_name=model_name,
+                        planner_notes=planner_notes,
                         tool_observations=tool_observations,
                     )
-                    if cached_observation is not None:
-                        cached_tool_calls.append((tool_call, cached_observation))
-                    else:
-                        new_tool_calls.append(tool_call)
-
-                if cached_tool_calls and not new_tool_calls:
-                    final_answer = self._fallback_opportunity_answer_from_observations(tool_observations) or self._fallback_answer_from_tool_observations(tool_observations)
-                    for chunk in emit_reasoning_chunks(self._format_agent_progress("工具结果已就绪，正在生成最终答复", percent=90)):
+                    if mode == "agent" and not used_tools:
+                        self._charge_standalone_llm_request(
+                            billing_context=billing_context,
+                            payload={"model": model_name, "messages": source_messages},
+                            mode=mode,
+                            stream=True,
+                        )
+                    for chunk in emit_reasoning_chunks(self._format_agent_progress("无需继续执行工具，正在生成最终答复", percent=100)):
                         yield chunk
                     close_chunk = close_reasoning_chunk()
                     if close_chunk is not None:
@@ -1411,70 +1575,78 @@ class Pipeline:
                         yield emit_text_chunk(chunk)
                     break
 
-                tool_results = []
-                for cached_tool_call, cached_observation in cached_tool_calls:
-                    public_cached_tool_call = self._strip_internal_tool_context(cached_tool_call)
-                    if native_tool_calls and cached_tool_call.get("tool_call_id"):
-                        conversation.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": str(cached_tool_call.get("tool_call_id")),
-                                "content": cached_observation["llm_result"],
-                            }
-                        )
-                    else:
-                        tool_results.append(
-                            TOOL_RESULT_TEMPLATE.format(
-                                tool_name=public_cached_tool_call["name"],
-                                arguments=json.dumps(public_cached_tool_call.get("parameters") or {}, ensure_ascii=False),
-                                result=cached_observation["llm_result"],
-                            )
-                        )
-
-                tool_names = ", ".join(tool_call["name"] for tool_call in new_tool_calls)
-                for chunk in emit_reasoning_chunks(self._format_agent_progress("正在调用工具: %s" % tool_names, percent=45)):
+                used_tools = True
+                tool_names = ", ".join(
+                    str(((step or {}).get("tool_call") or {}).get("name") or "").strip()
+                    for step in steps
+                    if isinstance(step, dict)
+                )
+                for chunk in emit_reasoning_chunks(self._format_agent_progress("Planner 已生成执行计划: %s" % tool_names, percent=40)):
                     yield chunk
 
-                for tool_call in new_tool_calls:
+                executed_any = False
+                for step_index, step in enumerate(steps, start=1):
+                    tool_call = self._attach_internal_tool_context((step or {}).get("tool_call") or {}, body)
+                    tool_name = str(tool_call.get("name") or "").strip() or "unknown_tool"
+                    cached_observation = self._cached_tool_observation_for_call(
+                        tool_call=tool_call,
+                        tool_result_cache=tool_result_cache,
+                        tool_observations=tool_observations,
+                    )
+                    if cached_observation is not None:
+                        executed_any = True
+                        for chunk in emit_reasoning_chunks(
+                            self._format_agent_progress(
+                                "步骤 %d/%d：工具 %s 复用已有结果" % (step_index, len(steps), tool_name),
+                                percent=65,
+                            )
+                        ):
+                            yield chunk
+                        continue
+
+                    for chunk in emit_reasoning_chunks(
+                        self._format_agent_progress(
+                            "正在执行步骤 %d/%d：%s" % (step_index, len(steps), tool_name),
+                            percent=55,
+                        )
+                    ):
+                        yield chunk
+
                     public_tool_call = self._strip_internal_tool_context(tool_call)
                     result = self._execute_tool_call(tool_call, billing_context, truncate=False)
                     observation = self._build_tool_observation(tool_call=public_tool_call, result=result)
                     tool_result_cache[self._tool_call_cache_key(tool_call)] = observation
                     tool_observations.append(observation)
-                    if native_tool_calls and tool_call.get("tool_call_id"):
-                        conversation.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": str(tool_call.get("tool_call_id")),
-                                "content": observation["llm_result"],
-                            }
-                        )
-                    else:
-                        tool_results.append(
-                            TOOL_RESULT_TEMPLATE.format(
-                                tool_name=public_tool_call["name"],
-                                arguments=json.dumps(public_tool_call.get("parameters") or {}, ensure_ascii=False),
-                                result=observation["llm_result"],
-                            )
-                        )
+                    executed_any = True
                     tool_status = "失败" if self._tool_result_has_error(result) else "完成"
                     for chunk in emit_reasoning_chunks(
-                        self._format_agent_progress("工具 %s 已%s" % (tool_call["name"], tool_status), percent=75)
+                        self._format_agent_progress(
+                            "步骤 %d/%d：工具 %s 已%s" % (step_index, len(steps), tool_name, tool_status),
+                            percent=75,
+                        )
                     ):
                         yield chunk
 
-                if tool_results:
-                    conversation.append({"role": "user", "content": "\n\n".join(tool_results)})
+                if executed_any:
+                    for chunk in emit_reasoning_chunks(self._format_agent_progress("本轮执行完成，正在判断是否需要补强", percent=85)):
+                        yield chunk
 
             if not answer_started:
-                final_answer = self._final_answer_after_tool_round_limit(
-                    conversation=conversation,
+                final_answer = self._synthesize_planner_executor_answer(
+                    messages=source_messages,
                     body=body,
                     model_name=model_name,
-                    mode=mode,
+                    planner_notes=planner_notes,
                     tool_observations=tool_observations,
                 )
-                for chunk in emit_reasoning_chunks(self._format_agent_progress("工具调用已达上限，正在基于已有证据生成最终答复", percent=100)):
+                if mode == "agent" and not used_tools:
+                    self._charge_standalone_llm_request(
+                        billing_context=billing_context,
+                        payload={"model": model_name, "messages": source_messages},
+                        mode=mode,
+                        stream=True,
+                    )
+                for chunk in emit_reasoning_chunks(self._format_agent_progress("执行轮次结束，正在基于已有证据生成最终答复", percent=100)):
                     yield chunk
                 close_chunk = close_reasoning_chunk()
                 if close_chunk is not None:
@@ -5291,6 +5463,344 @@ class Pipeline:
         except Exception:
             return 12
 
+    def _scene_policy(self, scene: str, mode: str = "agent") -> dict:
+        normalized_scene = str(scene or "general_agent").strip() or "general_agent"
+        policy = deepcopy(SCENE_TOOL_POLICY.get(normalized_scene) or SCENE_TOOL_POLICY["general_agent"])
+        if mode == "tool":
+            policy["max_rounds"] = max(1, min(3, int(policy.get("max_rounds") or 2)))
+        return policy
+
+    def _classify_agent_scene(self, messages: List[dict], mode: str = "agent") -> str:
+        text = self._extract_last_user_text(messages)
+        if mode == "help":
+            return "foundation_qa"
+        if self._looks_like_budget_analysis_request(text):
+            return "budget_analysis"
+        if self._looks_like_foundation_question(text):
+            return "foundation_qa"
+        if self._looks_like_blank_opportunity_discovery_request(text):
+            return "blank_opportunity_discovery"
+        if self._looks_like_asin_specific_request(text):
+            return "asin_specific_analysis"
+        if self._looks_like_explicit_theme_analysis_request(text):
+            return "theme_analysis"
+        return "general_agent"
+
+    def _looks_like_foundation_question(self, text: str) -> bool:
+        content = str(text or "").strip().lower()
+        if not content:
+            return False
+        patterns = (
+            r"跨境电商.*是什么",
+            r"什么是.*跨境电商",
+            r"(?:新手|入门|小白).{0,12}(?:提示词|怎么问|怎么用|怎么开始|教程|指南|步骤)",
+            r"提示词",
+            r"(?:怎么用|如何使用|使用方法|介绍一下|是什么|什么意思|有什么区别)",
+            r"(?:虾米选品|选品工具).{0,12}(?:怎么用|如何用|是什么|介绍)",
+        )
+        if any(re.search(pattern, content, flags=re.IGNORECASE) for pattern in patterns):
+            return True
+        if self._looks_like_explicit_theme_analysis_request(content):
+            return False
+        return False
+
+    def _looks_like_budget_analysis_request(self, text: str) -> bool:
+        content = str(text or "").strip().lower()
+        if not content:
+            return False
+        patterns = (
+            r"(?:启动资金|预算|盈亏平衡|回本|利润|毛利|净利|单件利润)",
+            r"(?:fba|佣金|广告费|备货|成本核算)",
+        )
+        return any(re.search(pattern, content, flags=re.IGNORECASE) for pattern in patterns)
+
+    def _looks_like_asin_specific_request(self, text: str) -> bool:
+        content = str(text or "").strip().upper()
+        if not content:
+            return False
+        return bool(re.search(r"\bB0[A-Z0-9]{8}\b", content))
+
+    def _planner_allowed_tool_names(self, scene: str, mode: str = "agent") -> List[str]:
+        policy = self._scene_policy(scene, mode)
+        allowed_layers = set(policy.get("allowed_layers") or [])
+        names: List[str] = []
+        for tool_name in sorted(ALLOWED_AGENT_TOOLS):
+            metadata = TOOL_LAYER_REGISTRY.get(tool_name) or {}
+            layer = str(metadata.get("layer") or "").strip()
+            if layer and layer not in allowed_layers:
+                continue
+            if mode == "tool" and tool_name == "web_search":
+                continue
+            names.append(tool_name)
+        return names
+
+    def _planner_tool_catalog(self, scene: str, mode: str = "agent") -> List[dict]:
+        catalog: List[dict] = []
+        for tool_name in self._planner_allowed_tool_names(scene, mode):
+            metadata = TOOL_LAYER_REGISTRY.get(tool_name) or {}
+            catalog.append(
+                {
+                    "tool_name": tool_name,
+                    "layer": metadata.get("layer") or "general",
+                    "capability": metadata.get("capability") or self._tool_name_label(tool_name),
+                    "scene_tags": metadata.get("scene_tags") or [],
+                }
+            )
+        return catalog
+
+    def _planner_observation_context(self, tool_observations: List[dict], limit: int = 6) -> List[dict]:
+        items: List[dict] = []
+        for observation in (tool_observations or [])[-max(1, limit) :]:
+            items.append(
+                {
+                    "tool_name": str(observation.get("tool_name") or "").strip(),
+                    "arguments": observation.get("arguments") or {},
+                    "result": self._truncate_text_for_llm(str(observation.get("llm_result") or ""), budget=2400),
+                }
+            )
+        return items
+
+    def _prepare_agent_planner_payload(
+        self,
+        *,
+        messages: List[dict],
+        body: dict,
+        mode: str,
+        model_name: str,
+        scene: str,
+        tool_observations: List[dict],
+        remaining_rounds: int,
+    ) -> dict:
+        provider = self._get_provider(model_name)
+        payload = provider.filter_payload(body)
+        payload["model"] = model_name or self._model_name_for_profile(self._default_agent_profile())
+        payload["stream"] = False
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
+
+        planner_messages = deepcopy(messages or [])
+        planner_messages.insert(0, {"role": "system", "content": AGENT_PLANNER_SYSTEM_PROMPT})
+        self._insert_agent_memory_profile_message(
+            planner_messages,
+            body.get("_xiamimate_memory_profile") if isinstance(body, dict) else None,
+        )
+        planner_messages.append(
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "current_date": datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d"),
+                        "mode": mode,
+                        "scene_hint": scene,
+                        "scene_policy": self._scene_policy(scene, mode),
+                        "allowed_tools": self._planner_tool_catalog(scene, mode),
+                        "previous_tool_observations": self._planner_observation_context(tool_observations),
+                        "remaining_rounds": remaining_rounds,
+                        "planner_note": "如果无需更多工具，请直接给 final_answer；如果需要工具，只给本轮最小必要步骤。",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            }
+        )
+        payload["messages"] = planner_messages
+
+        user_value = payload.get("user")
+        if isinstance(user_value, dict):
+            payload["user"] = self._user_id(body)
+        return payload
+
+    def _extract_json_value_from_text(self, value: Any) -> Optional[Any]:
+        if isinstance(value, (dict, list)):
+            return value
+
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except ValueError:
+            pass
+
+        fenced_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, flags=re.IGNORECASE)
+        if fenced_match:
+            try:
+                return json.loads(fenced_match.group(1).strip())
+            except ValueError:
+                pass
+
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(text[start : end + 1])
+            except ValueError:
+                return None
+        return None
+
+    def _tool_call_allowed_for_scene(self, tool_call: Dict[str, Any], scene: str, mode: str = "agent") -> bool:
+        tool_name = str((tool_call or {}).get("name") or "").strip()
+        if tool_name not in ALLOWED_AGENT_TOOLS:
+            return False
+        if mode == "tool" and tool_name == "web_search":
+            return False
+        metadata = TOOL_LAYER_REGISTRY.get(tool_name) or {}
+        layer = str(metadata.get("layer") or "").strip()
+        allowed_layers = set((self._scene_policy(scene, mode) or {}).get("allowed_layers") or [])
+        if layer and allowed_layers and layer not in allowed_layers:
+            return False
+        return True
+
+    def _normalize_planner_step(self, step: dict, scene: str, mode: str = "agent") -> Optional[dict]:
+        if not isinstance(step, dict):
+            return None
+        tool_name = str(step.get("tool_name") or step.get("name") or "").strip()
+        raw_parameters = step.get("parameters")
+        if not isinstance(raw_parameters, dict):
+            raw_parameters = {}
+        normalized_call = self._normalize_tool_call(name=tool_name, parameters=raw_parameters)
+        if normalized_call is None or not self._tool_call_allowed_for_scene(normalized_call, scene, mode):
+            return None
+        return {
+            "tool_call": normalized_call,
+            "goal": str(step.get("goal") or "").strip(),
+            "required": bool(step.get("required", True)),
+        }
+
+    def _normalize_planner_plan(self, plan_payload: Any, scene: str, mode: str = "agent") -> dict:
+        policy = self._scene_policy(scene, mode)
+        data = plan_payload if isinstance(plan_payload, dict) else {}
+        normalized_scene = str(data.get("scene") or scene or "general_agent").strip() or scene or "general_agent"
+        if normalized_scene not in SCENE_TOOL_POLICY:
+            normalized_scene = scene or "general_agent"
+
+        steps: List[dict] = []
+        raw_steps = data.get("steps") if isinstance(data.get("steps"), list) else []
+        for raw_step in raw_steps[: max(1, int(policy.get("max_steps_per_round") or 1))]:
+            normalized_step = self._normalize_planner_step(raw_step, normalized_scene, mode)
+            if normalized_step is not None:
+                steps.append(normalized_step)
+
+        final_answer = str(data.get("final_answer") or "").strip()
+        answer_ready = bool(data.get("answer_ready"))
+        if answer_ready and not final_answer and steps:
+            answer_ready = False
+        if not answer_ready:
+            final_answer = ""
+        if answer_ready:
+            steps = []
+
+        return {
+            "scene": normalized_scene,
+            "answer_ready": answer_ready,
+            "final_answer": final_answer,
+            "reasoning_summary": str(data.get("reasoning_summary") or "").strip(),
+            "stop_reason": str(data.get("stop_reason") or "").strip(),
+            "steps": steps,
+        }
+
+    def _plan_agent_next_steps(
+        self,
+        *,
+        messages: List[dict],
+        body: dict,
+        model_name: str,
+        mode: str,
+        scene: str,
+        tool_observations: List[dict],
+        remaining_rounds: int,
+    ) -> dict:
+        payload = self._prepare_agent_planner_payload(
+            messages=messages,
+            body=body,
+            mode=mode,
+            model_name=model_name,
+            scene=scene,
+            tool_observations=tool_observations,
+            remaining_rounds=remaining_rounds,
+        )
+        response = self._post_agent_payload(payload, model_name=model_name)
+        content = self._clean_agent_content(self._extract_assistant_content(response), model_name=model_name)
+        plan_payload = self._extract_json_value_from_text(content)
+        return self._normalize_planner_plan(plan_payload, scene=scene, mode=mode)
+
+    def _prepare_planner_executor_synthesis_payload(
+        self,
+        *,
+        messages: List[dict],
+        body: dict,
+        model_name: str,
+        planner_notes: List[dict],
+        tool_observations: List[dict],
+    ) -> dict:
+        provider = self._get_provider(model_name)
+        payload = provider.filter_payload(body)
+        payload["model"] = model_name or self._model_name_for_profile(self._default_agent_profile())
+        payload["stream"] = False
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
+
+        synthesis_messages = deepcopy(messages or [])
+        synthesis_messages.insert(0, {"role": "system", "content": AGENT_SYNTHESIS_SYSTEM_PROMPT})
+        self._insert_agent_memory_profile_message(
+            synthesis_messages,
+            body.get("_xiamimate_memory_profile") if isinstance(body, dict) else None,
+        )
+        synthesis_messages.append(
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "planner_notes": planner_notes[-4:],
+                        "tool_observations": self._planner_observation_context(tool_observations, limit=8),
+                        "instruction": "不要再调用工具；只基于这些证据回答用户原问题。",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            }
+        )
+        payload["messages"] = synthesis_messages
+
+        user_value = payload.get("user")
+        if isinstance(user_value, dict):
+            payload["user"] = self._user_id(body)
+        return payload
+
+    def _synthesize_planner_executor_answer(
+        self,
+        *,
+        messages: List[dict],
+        body: dict,
+        model_name: str,
+        planner_notes: List[dict],
+        tool_observations: List[dict],
+    ) -> str:
+        payload = self._prepare_planner_executor_synthesis_payload(
+            messages=messages,
+            body=body,
+            model_name=model_name,
+            planner_notes=planner_notes,
+            tool_observations=tool_observations,
+        )
+        response = self._post_agent_payload(payload, model_name=model_name)
+        content = self._clean_agent_content(self._extract_assistant_content(response), model_name=model_name)
+        if content:
+            return self._fallback_opportunity_answer_if_needed(content, tool_observations)
+        return self._fallback_answer_from_tool_observations(tool_observations)
+
+    def _planner_plan_note(self, scene: str, plan: dict) -> dict:
+        return {
+            "scene": scene,
+            "reasoning_summary": str((plan or {}).get("reasoning_summary") or "").strip(),
+            "stop_reason": str((plan or {}).get("stop_reason") or "").strip(),
+            "planned_tools": [
+                str(((step or {}).get("tool_call") or {}).get("name") or "").strip()
+                for step in (plan or {}).get("steps") or []
+                if isinstance(step, dict)
+            ],
+        }
+
     def _prepare_agent_final_synthesis_payload(
         self,
         *,
@@ -5408,6 +5918,19 @@ class Pipeline:
             updated.pop("tool_calls", None)
         return updated
 
+    def _looks_like_blank_opportunity_discovery_request(self, text: str) -> bool:
+        content = str(text or "").strip()
+        if not content:
+            return False
+        blank_discovery_patterns = (
+            r"不知道.*(?:选什么|分析什么|做什么)",
+            r"(?:帮我|给我)?(?:找|发现|挖掘|推荐).{0,18}(?:机会|方向|品类|类目|关键词|商品|产品|选品)",
+            r"(?:帮我|给我|先)?(?:选择|挑选|选).{0,18}(?:一个|几款|几种)?(?:商品|产品|选品)",
+            r"(?:哪些|有什么|有哪些).{0,16}(?:机会|方向|细分|品类|类目|商品|产品)",
+            r"(?:空白机会|机会发现|细分方向|商品推荐|产品推荐|选品推荐)",
+        )
+        return any(re.search(pattern, content, flags=re.IGNORECASE) for pattern in blank_discovery_patterns)
+
     def _looks_like_explicit_theme_analysis_request(self, text: str) -> bool:
         content = str(text or "").strip()
         if not content:
@@ -5493,122 +6016,108 @@ class Pipeline:
         mode: str = "agent",
         charge_llm: bool = True,
     ) -> str:
-        conversation = deepcopy(messages or [])
+        source_messages = deepcopy(messages or [])
         tool_observations: List[dict] = []
         tool_result_cache: Dict[Tuple[str, str], dict] = {}
         used_tools = False
+        planner_notes: List[dict] = []
+        scene = self._classify_agent_scene(source_messages, mode=mode)
+        max_rounds = min(self._agent_max_tool_rounds(), int(self._scene_policy(scene, mode).get("max_rounds") or 1))
 
-        for _ in range(self._agent_max_tool_rounds()):
-            payload = self._prepare_agent_payload(messages=conversation, body=body, mode=mode, model_name=model_name)
-            payload["stream"] = False
+        for round_index in range(max_rounds):
             try:
-                response = self._post_agent_payload(payload, model_name=model_name)
+                plan = self._plan_agent_next_steps(
+                    messages=source_messages,
+                    body=body,
+                    model_name=model_name,
+                    mode=mode,
+                    scene=scene,
+                    tool_observations=tool_observations,
+                    remaining_rounds=max_rounds - round_index,
+                )
             except RuntimeError as exc:
                 if tool_observations:
-                    if mode == "help":
-                        return self._fallback_help_answer_from_tool_observations(tool_observations, error=str(exc))
                     return self._fallback_answer_from_tool_observations(tool_observations, error=str(exc))
                 raise
-            content = self._extract_assistant_content(response)
-            assistant_message = self._extract_assistant_message(response)
-            native_tool_calls = self._extract_response_tool_calls(response)
-            text_tool_calls = [] if native_tool_calls or self._provider_uses_native_tool_calls(model_name) else self._extract_tool_calls(content, model_name=model_name)
-            tool_calls = native_tool_calls or text_tool_calls
-            tool_calls = self._filter_tool_calls_for_user_intent(tool_calls, conversation)
-            if native_tool_calls:
-                native_tool_calls = tool_calls
-                assistant_message = self._filter_assistant_message_tool_calls(assistant_message, tool_calls)
 
-            if not tool_calls:
+            scene = str(plan.get("scene") or scene or "general_agent").strip() or "general_agent"
+            planner_notes.append(self._planner_plan_note(scene, plan))
+
+            if plan.get("answer_ready") and str(plan.get("final_answer") or "").strip():
                 if charge_llm and mode == "agent" and not used_tools:
                     self._charge_standalone_llm_request(
                         billing_context=billing_context,
-                        payload=payload,
+                        payload={"model": model_name, "messages": source_messages},
                         mode=mode,
                         stream=False,
                     )
-                cleaned = self._clean_agent_content(content, model_name=model_name)
-                if cleaned:
-                    return self._fallback_opportunity_answer_if_needed(cleaned, tool_observations)
-                if self._agent_stream_contains_internal_markup(content, model_name=model_name):
-                    return self._fallback_opportunity_answer_if_needed("已完成分析，但未生成可展示的结果，请重试。", tool_observations)
-                return self._fallback_opportunity_answer_if_needed(str(content or "").strip(), tool_observations)
+                return self._fallback_opportunity_answer_if_needed(str(plan.get("final_answer") or "").strip(), tool_observations)
+
+            steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
+            if not steps:
+                answer = self._synthesize_planner_executor_answer(
+                    messages=source_messages,
+                    body=body,
+                    model_name=model_name,
+                    planner_notes=planner_notes,
+                    tool_observations=tool_observations,
+                )
+                if charge_llm and mode == "agent" and not used_tools:
+                    self._charge_standalone_llm_request(
+                        billing_context=billing_context,
+                        payload={"model": model_name, "messages": source_messages},
+                        mode=mode,
+                        stream=False,
+                    )
+                return answer
 
             used_tools = True
-            conversation.append(assistant_message)
-            tool_calls = [self._attach_internal_tool_context(tool_call, body) for tool_call in tool_calls]
-
-            cached_tool_calls = []
-            new_tool_calls = []
-            for tool_call in tool_calls:
+            executed_any = False
+            for step in steps:
+                tool_call = self._attach_internal_tool_context((step or {}).get("tool_call") or {}, body)
                 cached_observation = self._cached_tool_observation_for_call(
                     tool_call=tool_call,
                     tool_result_cache=tool_result_cache,
                     tool_observations=tool_observations,
                 )
                 if cached_observation is not None:
-                    cached_tool_calls.append((tool_call, cached_observation))
-                else:
-                    new_tool_calls.append(tool_call)
+                    executed_any = True
+                    continue
 
-            if cached_tool_calls and not new_tool_calls:
-                if mode == "help":
-                    return self._fallback_help_answer_from_tool_observations(tool_observations)
-                return self._fallback_opportunity_answer_from_observations(tool_observations) or self._fallback_answer_from_tool_observations(tool_observations)
-
-            tool_results = []
-            for cached_tool_call, cached_observation in cached_tool_calls:
-                public_cached_tool_call = self._strip_internal_tool_context(cached_tool_call)
-                if native_tool_calls and cached_tool_call.get("tool_call_id"):
-                    conversation.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": str(cached_tool_call.get("tool_call_id")),
-                            "content": cached_observation["llm_result"],
-                        }
-                    )
-                else:
-                    tool_results.append(
-                        TOOL_RESULT_TEMPLATE.format(
-                            tool_name=public_cached_tool_call["name"],
-                            arguments=json.dumps(public_cached_tool_call.get("parameters") or {}, ensure_ascii=False),
-                            result=cached_observation["llm_result"],
-                        )
-                    )
-
-            for tool_call in new_tool_calls:
                 public_tool_call = self._strip_internal_tool_context(tool_call)
                 result = self._execute_tool_call(tool_call, billing_context, truncate=False)
                 observation = self._build_tool_observation(tool_call=public_tool_call, result=result)
                 tool_result_cache[self._tool_call_cache_key(tool_call)] = observation
                 tool_observations.append(observation)
-                if native_tool_calls and tool_call.get("tool_call_id"):
-                    conversation.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": str(tool_call.get("tool_call_id")),
-                            "content": observation["llm_result"],
-                        }
-                    )
-                else:
-                    tool_results.append(
-                        TOOL_RESULT_TEMPLATE.format(
-                            tool_name=public_tool_call["name"],
-                            arguments=json.dumps(public_tool_call.get("parameters") or {}, ensure_ascii=False),
-                            result=observation["llm_result"],
-                        )
-                    )
+                executed_any = True
 
-            if tool_results:
-                conversation.append({"role": "user", "content": "\n\n".join(tool_results)})
+            if not executed_any:
+                break
 
-        return self._final_answer_after_tool_round_limit(
-            conversation=conversation,
+        if tool_observations:
+            return self._synthesize_planner_executor_answer(
+                messages=source_messages,
+                body=body,
+                model_name=model_name,
+                planner_notes=planner_notes,
+                tool_observations=tool_observations,
+            )
+
+        fallback_answer = self._synthesize_planner_executor_answer(
+            messages=source_messages,
             body=body,
             model_name=model_name,
-            mode=mode,
+            planner_notes=planner_notes,
             tool_observations=tool_observations,
         )
+        if charge_llm and mode == "agent" and not used_tools:
+            self._charge_standalone_llm_request(
+                billing_context=billing_context,
+                payload={"model": model_name, "messages": source_messages},
+                mode=mode,
+                stream=False,
+            )
+        return fallback_answer
 
     def _charge_standalone_llm_request(
         self,
