@@ -284,8 +284,8 @@ SCENE_TOOL_POLICY = {
     "theme_analysis": {
         "label": "商品主题分析",
         "allowed_layers": ["analysis", "expansion", "foundation", "business"],
-        "max_rounds": 4,
-        "max_steps_per_round": 3,
+        "max_rounds": 3,
+        "max_steps_per_round": 2,
     },
     "asin_specific_analysis": {
         "label": "ASIN 定向分析",
@@ -1550,6 +1550,8 @@ class Pipeline:
                     break
 
                 steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
+                steps = self._enforce_theme_resolve_first_step(steps, scene, source_messages, body, tool_observations)
+                steps = self._filter_redundant_planner_steps(steps, scene, tool_observations)
                 if not steps:
                     final_answer = self._synthesize_planner_executor_answer(
                         messages=source_messages,
@@ -5560,6 +5562,107 @@ class Pipeline:
             )
         return items
 
+    def _observed_tool_names(self, tool_observations: List[dict]) -> List[str]:
+        names: List[str] = []
+        for observation in tool_observations or []:
+            tool_name = str((observation or {}).get("tool_name") or "").strip()
+            if tool_name and tool_name not in names:
+                names.append(tool_name)
+        return names
+
+    def _scene_single_execution_tools(self, scene: str) -> set:
+        if scene == "theme_analysis":
+            return {
+                "resolve_candidates",
+                "category_resolve",
+                "candidate_pool_stats",
+                "candidate_pool_trends",
+                "candidate_pool_weak_forecast",
+                "top_asin_drilldown",
+                "category_benchmark",
+            }
+        if scene == "blank_opportunity_discovery":
+            return {"opportunity_discovery", "opportunity_discovery_job", "category_resolve"}
+        if scene == "foundation_qa":
+            return {"customer_help_search", "search_knowledge_base", "web_search"}
+        return set()
+
+    def _filter_redundant_planner_steps(self, steps: List[dict], scene: str, tool_observations: List[dict]) -> List[dict]:
+        if not steps:
+            return []
+        single_execution_tools = self._scene_single_execution_tools(scene)
+        if not single_execution_tools:
+            return steps
+
+        already_seen = set(self._observed_tool_names(tool_observations))
+        kept: List[dict] = []
+        planned_seen: set = set()
+        for step in steps:
+            tool_name = str(((step or {}).get("tool_call") or {}).get("name") or "").strip()
+            if tool_name in single_execution_tools and (tool_name in already_seen or tool_name in planned_seen):
+                continue
+            kept.append(step)
+            if tool_name in single_execution_tools:
+                planned_seen.add(tool_name)
+        return kept
+
+    def _infer_theme_product_query(self, messages: List[dict]) -> str:
+        text = self._extract_last_user_text(messages).strip()
+        if not text:
+            return ""
+        patterns = (
+            r"(?:评估|分析|判断|研究|拆解|看看|看一下)\s+([^，。！？\n]{2,90}?)\s+在\s+",
+            r"^\s*([A-Za-z][A-Za-z0-9 &+\-/]{1,70})\s+在\s+",
+            r"(?:评估|分析|判断|研究|拆解)\s+([A-Za-z][A-Za-z0-9 &+\-/]{1,70})",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                return str(match.group(1) or "").strip(" ：:，,。")[:120]
+        return ""
+
+    def _infer_theme_marketplace(self, messages: List[dict], body: dict) -> str:
+        explicit = self._body_context_value(body, "marketplace") or self._body_context_value(body, "target_market")
+        if explicit:
+            return self._normalize_marketplace_value(explicit)
+        text = self._extract_last_user_text(messages).lower()
+        if "amazon us" in text or "amazon 美国" in text or "美国站" in text or "美国市场" in text:
+            return "US"
+        return "US"
+
+    def _build_theme_resolve_step(self, messages: List[dict], body: dict) -> Optional[dict]:
+        product_query = self._infer_theme_product_query(messages)
+        if not product_query:
+            return None
+        tool_call = self._normalize_tool_call(
+            name="resolve_candidates",
+            parameters={
+                "product_query": product_query,
+                "marketplace": self._infer_theme_marketplace(messages, body),
+                "recall_mode": "keyword",
+                "max_candidates": 30,
+            },
+        )
+        if tool_call is None:
+            return None
+        return {"tool_call": tool_call, "goal": "先建立候选池，作为后续主题分析的稳定证据锚点", "required": True}
+
+    def _enforce_theme_resolve_first_step(
+        self,
+        steps: List[dict],
+        scene: str,
+        messages: List[dict],
+        body: dict,
+        tool_observations: List[dict],
+    ) -> List[dict]:
+        if scene != "theme_analysis" or "resolve_candidates" in set(self._observed_tool_names(tool_observations)):
+            return steps
+        for step in steps or []:
+            if str(((step or {}).get("tool_call") or {}).get("name") or "").strip() == "resolve_candidates":
+                return [step]
+        fallback_step = self._build_theme_resolve_step(messages, body)
+        return [fallback_step] if fallback_step is not None else steps
+
     def _prepare_agent_planner_payload(
         self,
         *,
@@ -5594,9 +5697,10 @@ class Pipeline:
                         "scene_hint": scene,
                         "scene_policy": self._scene_policy(scene, mode),
                         "allowed_tools": self._planner_tool_catalog(scene, mode),
+                        "already_observed_tools": self._observed_tool_names(tool_observations),
                         "previous_tool_observations": self._planner_observation_context(tool_observations),
                         "remaining_rounds": remaining_rounds,
-                        "planner_note": "如果无需更多工具，请直接给 final_answer；如果需要工具，只给本轮最小必要步骤。",
+                        "planner_note": "如果已有工具足够回答，请直接给 final_answer；不要重复调用 already_observed_tools 中的工具。如果需要工具，只给本轮最小必要步骤。",
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -6054,6 +6158,8 @@ class Pipeline:
                 return self._fallback_opportunity_answer_if_needed(str(plan.get("final_answer") or "").strip(), tool_observations)
 
             steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
+            steps = self._enforce_theme_resolve_first_step(steps, scene, source_messages, body, tool_observations)
+            steps = self._filter_redundant_planner_steps(steps, scene, tool_observations)
             if not steps:
                 answer = self._synthesize_planner_executor_answer(
                     messages=source_messages,
