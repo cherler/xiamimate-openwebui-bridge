@@ -675,47 +675,53 @@ class AgentNativeToolTests(unittest.TestCase):
 
     def test_explicit_theme_request_drops_opportunity_discovery_when_resolve_is_present(self) -> None:
         pipe = self.make_pipeline()
-        responses = [
-            {
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": "",
-                            "tool_calls": [
-                                {
-                                    "id": "call_1",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "opportunity_discovery",
-                                        "arguments": json.dumps({"marketplace": "US", "limit": 10}),
-                                    },
-                                },
-                                {
-                                    "id": "call_2",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "resolve_candidates",
-                                        "arguments": json.dumps({"product_query": "car vacuum", "marketplace": "US"}),
-                                    },
-                                },
-                            ],
-                        }
-                    }
-                ]
-            },
-            {"choices": [{"message": {"role": "assistant", "content": "car vacuum 主题分析结果"}}]},
-        ]
         executed_tools = []
+        pipe._classify_agent_scene = lambda messages, mode="agent": "theme_analysis"
 
-        def post_agent_payload(payload: dict, model_name: str) -> dict:
-            return responses.pop(0)
+        def plan_agent_next_steps(**kwargs) -> dict:
+            observed = kwargs.get("tool_observations") or []
+            if observed:
+                return {
+                    "scene": "theme_analysis",
+                    "answer_ready": True,
+                    "final_answer": "car vacuum 主题分析结果",
+                    "reasoning_summary": "已有候选池证据，无需再做机会发现。",
+                    "steps": [],
+                    "stop_reason": "已拿到候选池。",
+                }
+            return {
+                "scene": "theme_analysis",
+                "answer_ready": False,
+                "final_answer": "",
+                "reasoning_summary": "显式主题分析应先建候选池。",
+                "steps": [
+                    {
+                        "tool_call": {
+                            "name": "opportunity_discovery",
+                            "parameters": {"marketplace": "US", "limit": 10},
+                        },
+                        "goal": "发现机会",
+                        "required": True,
+                    },
+                    {
+                        "tool_call": {
+                            "name": "resolve_candidates",
+                            "parameters": {"product_query": "car vacuum", "marketplace": "US"},
+                        },
+                        "goal": "建立候选池",
+                        "required": True,
+                    },
+                ],
+                "stop_reason": "拿到候选池后继续分析。",
+            }
+
+        pipe._plan_agent_next_steps = plan_agent_next_steps
+        pipe._synthesize_planner_executor_answer = lambda **kwargs: "car vacuum 主题分析结果"
 
         def execute_tool_call(tool_call: dict, billing_context: dict, truncate: bool = True) -> str:
             executed_tools.append(tool_call["name"])
             return json.dumps({"success": True, "data": {"candidate_asins": ["B001"]}}, ensure_ascii=False)
 
-        pipe._post_agent_payload = post_agent_payload
         pipe._execute_tool_call = execute_tool_call
 
         answer = pipe._run_agent_loop(
@@ -728,6 +734,63 @@ class AgentNativeToolTests(unittest.TestCase):
 
         self.assertEqual(executed_tools, ["resolve_candidates"])
         self.assertIn("car vacuum 主题分析结果", answer)
+
+    def test_theme_analysis_repairs_missing_product_query_for_resolve_candidates_step(self) -> None:
+        pipe = self.make_pipeline()
+        executed_calls = []
+
+        def plan_agent_next_steps(**kwargs) -> dict:
+            return {
+                "scene": "theme_analysis",
+                "answer_ready": False,
+                "final_answer": "",
+                "reasoning_summary": "先解析候选池。",
+                "steps": [
+                    {
+                        "tool_call": {
+                            "name": "resolve_candidates",
+                            "parameters": {"marketplace": "US"},
+                        },
+                        "goal": "建立候选池",
+                        "required": True,
+                    }
+                ],
+                "stop_reason": "拿到候选池后再决定后续工具。",
+            }
+
+        pipe._plan_agent_next_steps = plan_agent_next_steps
+        pipe._synthesize_planner_executor_answer = lambda **kwargs: "humidifier 候选池已成功解析。"
+
+        def execute_tool_call(tool_call: dict, billing_context: dict, truncate: bool = True) -> str:
+            executed_calls.append(copy.deepcopy(tool_call))
+            return json.dumps(
+                {
+                    "success": True,
+                    "data": {"candidate_pool_id": "pool-1", "candidate_asins": ["B001"]},
+                },
+                ensure_ascii=False,
+            )
+
+        pipe._execute_tool_call = execute_tool_call
+
+        answer = pipe._run_agent_loop(
+            messages=[
+                {
+                    "role": "user",
+                    "content": "/tool 请用原生工具帮我拆解 humidifier 在 Amazon 美国站的选品验证路径：先解析候选池，再说明应该继续看 stats、trends、benchmark、top ASIN 还是补池。",
+                }
+            ],
+            body={},
+            billing_context={"api_key": "test"},
+            model_name="deepseek-v4-pro",
+            mode="agent",
+        )
+
+        self.assertEqual(len(executed_calls), 1)
+        self.assertEqual(executed_calls[0]["name"], "resolve_candidates")
+        self.assertEqual(executed_calls[0]["parameters"]["product_query"], "humidifier")
+        self.assertEqual(executed_calls[0]["parameters"]["marketplace"], "US")
+        self.assertIn("humidifier 候选池已成功解析", answer)
 
     def test_agent_round_limit_forces_final_synthesis_instead_of_error(self) -> None:
         pipe = self.make_pipeline()

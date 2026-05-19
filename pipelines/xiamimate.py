@@ -5703,6 +5703,25 @@ class Pipeline:
             return None
         return {"tool_call": tool_call, "goal": "先建立候选池，作为后续主题分析的稳定证据锚点", "required": True}
 
+    def _repair_theme_resolve_step(self, step: dict, messages: List[dict], body: dict) -> Optional[dict]:
+        tool_call = (step or {}).get("tool_call") or {}
+        if str(tool_call.get("name") or "").strip() != "resolve_candidates":
+            return step if isinstance(step, dict) else None
+
+        parameters = tool_call.get("parameters") if isinstance(tool_call.get("parameters"), dict) else {}
+        if str(parameters.get("product_query") or "").strip():
+            return step if isinstance(step, dict) else None
+
+        fallback_step = self._build_theme_resolve_step(messages, body)
+        if fallback_step is None:
+            return step if isinstance(step, dict) else None
+
+        repaired = dict(step or {})
+        repaired["tool_call"] = fallback_step["tool_call"]
+        if not str(repaired.get("goal") or "").strip():
+            repaired["goal"] = fallback_step.get("goal") or ""
+        return repaired
+
     def _enforce_theme_resolve_first_step(
         self,
         steps: List[dict],
@@ -5715,7 +5734,8 @@ class Pipeline:
             return steps
         for step in steps or []:
             if str(((step or {}).get("tool_call") or {}).get("name") or "").strip() == "resolve_candidates":
-                return [step]
+                repaired_step = self._repair_theme_resolve_step(step, messages, body)
+                return [repaired_step] if repaired_step is not None else []
         fallback_step = self._build_theme_resolve_step(messages, body)
         return [fallback_step] if fallback_step is not None else steps
 
