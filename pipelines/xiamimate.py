@@ -678,6 +678,9 @@ class Pipeline:
         agent_profile = self._resolve_agent_profile(model_id=model_id, body=body)
         agent_model_name = self._model_name_for_profile(agent_profile)
         response_model = self._response_model_for_profile(agent_profile, str(body.get("model") or model_id or ""))
+        if self._is_openwebui_internal_task_request(body):
+            return self._run_openwebui_internal_task(body=body, model=response_model, model_name=agent_model_name)
+
         account_command = self._parse_account_command(self._extract_last_user_text(messages) or (user_message or ""))
         if account_command is not None:
             return self._handle_account_command(command=account_command, body=body, model=response_model)
@@ -1684,6 +1687,59 @@ class Pipeline:
         mode = requested_mode or command_mode or (model_mode if model_mode in {"agent", "tool", "workflow", "report", "help"} else "agent")
         query = (command_query if command_mode else (user_message or last_user_text or "")).strip()
         return mode, query, command_mode is not None
+
+    def _openwebui_internal_task_name(self, body: dict) -> str:
+        if not isinstance(body, dict):
+            return ""
+
+        candidates = []
+        metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+        extra_body = body.get("extra_body") if isinstance(body.get("extra_body"), dict) else {}
+        for container in (metadata, extra_body, body):
+            for key in ("task", "task_type", "task_name"):
+                value = container.get(key) if isinstance(container, dict) else None
+                if value not in (None, "", [], {}):
+                    candidates.append(value)
+
+        for value in candidates:
+            normalized = str(value or "").strip().lower()
+            if normalized:
+                return normalized
+        return ""
+
+    def _is_openwebui_internal_task_request(self, body: dict) -> bool:
+        return bool(self._openwebui_internal_task_name(body))
+
+    def _run_openwebui_internal_task(self, body: dict, model: str, model_name: str) -> Union[dict, Iterator[bytes]]:
+        task_name = self._openwebui_internal_task_name(body)
+        if task_name == "function_calling":
+            content = "[]"
+        else:
+            try:
+                payload = self._prepare_openwebui_internal_task_payload(body=body, model_name=model_name)
+                response = self._post_agent_payload(payload, model_name=model_name)
+                content = self._clean_agent_content(self._extract_assistant_content(response), model_name=model_name)
+            except RuntimeError as exc:
+                print("xiamimate openwebui internal task failed", task_name, str(exc)[:500])
+                content = ""
+
+        if body.get("stream"):
+            return self._stream_text_response(content=content, model=model)
+        return self._chat_response(content=content, model=model)
+
+    def _prepare_openwebui_internal_task_payload(self, body: dict, model_name: str) -> dict:
+        provider = self._get_provider(model_name)
+        payload = provider.filter_payload(body)
+        payload["model"] = model_name or self._model_name_for_profile(self._default_agent_profile())
+        payload["stream"] = False
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
+        if not isinstance(payload.get("messages"), list):
+            payload["messages"] = deepcopy(body.get("messages") or [])
+        user_value = payload.get("user")
+        if isinstance(user_value, dict):
+            payload["user"] = self._user_id(body)
+        return payload
 
     def _parse_report_profile(self, text: str) -> Tuple[str, str]:
         stripped = (text or "").strip()

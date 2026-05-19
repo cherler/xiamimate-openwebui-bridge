@@ -169,6 +169,63 @@ class AgentNativeToolTests(unittest.TestCase):
         pipe._refund_billing_event = lambda **kwargs: None
         return pipe
 
+    def test_openwebui_internal_task_bypasses_billing_and_agent_tools(self) -> None:
+        pipe = self.make_pipeline()
+        observed_payloads = []
+        pipe._charge_billing_event = lambda **kwargs: (_ for _ in ()).throw(AssertionError("internal task must not bill"))
+        pipe._ensure_billing_context = lambda body: (_ for _ in ()).throw(AssertionError("internal task must not exchange billing context"))
+        pipe._post_agent_payload = lambda payload, model_name: observed_payloads.append(payload) or {
+            "choices": [{"message": {"content": "新手选品提示词指南"}}]
+        }
+
+        response = pipe.pipe(
+            user_message="",
+            model_id="xiamimate.agent",
+            messages=[{"role": "user", "content": "/help 新手卖家第一次使用虾米选品"}],
+            body={
+                "model": "xiamimate.agent",
+                "metadata": {"task": "title_generation"},
+                "messages": [{"role": "user", "content": "/help 新手卖家第一次使用虾米选品"}],
+                "tools": [{"type": "function", "function": {"name": "web_search"}}],
+                "tool_choice": "auto",
+            },
+        )
+
+        self.assertEqual(response["choices"][0]["message"]["content"], "新手选品提示词指南")
+        self.assertEqual(len(observed_payloads), 1)
+        self.assertNotIn("tools", observed_payloads[0])
+        self.assertNotIn("tool_choice", observed_payloads[0])
+
+    def test_points_command_is_free_and_uses_account_overview(self) -> None:
+        pipe = self.make_pipeline()
+        requested_paths = []
+        pipe._charge_billing_event = lambda **kwargs: (_ for _ in ()).throw(AssertionError("/points must not bill"))
+
+        def chat_backend_request(method: str, path: str, **kwargs) -> dict:
+            requested_paths.append(path)
+            self.assertEqual(method, "GET")
+            self.assertEqual(path, "/v1/me/account-overview")
+            return {
+                "user": {"user_id": "user-1", "display_name": "testuser", "email": "test@example.com"},
+                "points_account": {"balance_points": 16505},
+                "balance_breakdown": {"subscription_balance_points": 15543, "recharge_balance_points": 3, "other_balance_points": 959},
+                "usage_summary": {},
+                "recent_ledger": [],
+            }
+
+        pipe._chat_backend_request = chat_backend_request
+        response = pipe.pipe(
+            user_message="/points",
+            model_id="xiamimate.agent",
+            messages=[{"role": "user", "content": "/points"}],
+            body={"model": "xiamimate.agent", "stream": False, "user": {"id": "user-1", "email": "test@example.com"}},
+        )
+
+        self.assertEqual(requested_paths, ["/v1/me/account-overview"])
+        content = response["choices"][0]["message"]["content"]
+        self.assertIn("积分余额", content)
+        self.assertIn("16505", content)
+
     def test_native_tool_calls_are_returned_as_role_tool_messages_before_final_answer(self) -> None:
         pipe = self.make_pipeline()
         observed_payloads = []
