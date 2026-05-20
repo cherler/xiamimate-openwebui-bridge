@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -134,6 +135,9 @@ class FakeAgentTools:
         selling_price: float | None = None,
         unit_product_cost: float | None = None,
         landed_cost_per_unit: float | None = None,
+        referral_fee_rate: float | None = None,
+        coupon_discount_rate: float | None = None,
+        return_rate: float | None = None,
         monthly_ad_budget: float | None = None,
         launch_units: int | None = None,
         launch_months: int | None = None,
@@ -226,7 +230,7 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertIn("积分余额", content)
         self.assertIn("16505", content)
 
-    def test_native_tool_calls_are_returned_as_role_tool_messages_before_final_answer(self) -> None:
+    def test_native_tool_calls_are_accepted_as_planner_compat_actions(self) -> None:
         pipe = self.make_pipeline()
         observed_payloads = []
         responses = [
@@ -294,44 +298,12 @@ class AgentNativeToolTests(unittest.TestCase):
 
         self.assertIn("最终答案", answer)
         self.assertEqual(len(observed_payloads), 2)
-        self.assertEqual(observed_payloads[0]["tool_choice"], "auto")
-        self.assertTrue(any(tool["function"]["name"] == "resolve_candidates" for tool in observed_payloads[0]["tools"]))
-        self.assertTrue(any(tool["function"]["name"] == "category_resolve" for tool in observed_payloads[0]["tools"]))
-        self.assertTrue(any(tool["function"]["name"] == "expand_candidates" for tool in observed_payloads[0]["tools"]))
-        self.assertTrue(any(tool["function"]["name"] == "candidate_expansion_status" for tool in observed_payloads[0]["tools"]))
-        self.assertTrue(any(tool["function"]["name"] == "opportunity_discovery_job" for tool in observed_payloads[0]["tools"]))
-        self.assertTrue(any(tool["function"]["name"] == "launch_budget_calculator" for tool in observed_payloads[0]["tools"]))
-        resolve_schema = next(
-            tool for tool in observed_payloads[0]["tools"] if tool["function"]["name"] == "resolve_candidates"
-        )["function"]["parameters"]["properties"]
-        opportunity_schema = next(
-            tool for tool in observed_payloads[0]["tools"] if tool["function"]["name"] == "opportunity_discovery"
-        )["function"]["parameters"]["properties"]
-        self.assertIn("recall_mode", resolve_schema)
-        self.assertIn("category_id", resolve_schema)
-        self.assertIn("category_path", resolve_schema)
-        self.assertNotIn("query", opportunity_schema)
-        self.assertNotIn("_memory_profile", opportunity_schema)
-        self.assertIn("category_id", opportunity_schema)
-        self.assertIn("category_path", opportunity_schema)
-        self.assertIn("leaf_category_name / latest_snapshot.category_path", observed_payloads[0]["messages"][0]["content"])
-        self.assertIn("pool_quality.is_sufficient_for_analysis=false", observed_payloads[0]["messages"][0]["content"])
-        self.assertIn("candidate_pool_id", observed_payloads[0]["messages"][0]["content"])
-        self.assertIn("candidate_expansion_status", observed_payloads[0]["messages"][0]["content"])
-        self.assertIn("opportunity_discovery_job", observed_payloads[0]["messages"][0]["content"])
-        self.assertIn("next_action.request", observed_payloads[0]["messages"][0]["content"])
-        self.assertIn("rank/title/category_path", observed_payloads[0]["messages"][0]["content"])
-        self.assertIn("tool_contract.capability", observed_payloads[0]["messages"][0]["content"])
-        self.assertIn("launch_budget_calculator", observed_payloads[0]["messages"][0]["content"])
-
-        second_messages = observed_payloads[1]["messages"]
-        assistant_message = next(message for message in second_messages if message.get("role") == "assistant")
-        tool_message = next(message for message in second_messages if message.get("role") == "tool")
-        self.assertEqual(assistant_message["tool_calls"][0]["id"], "call_1")
-        self.assertEqual(tool_message["tool_call_id"], "call_1")
-        self.assertIn("compacted_json", tool_message["content"])
-        self.assertIn("candidate_asins", tool_message["content"])
-        self.assertFalse(any("以下是工具执行结果" in str(message.get("content") or "") for message in second_messages))
+        self.assertNotIn("tools", observed_payloads[0])
+        self.assertNotIn("tool_choice", observed_payloads[0])
+        next_planner_context = json.loads(observed_payloads[1]["messages"][-1]["content"])
+        self.assertEqual(next_planner_context["already_observed_tools"], ["resolve_candidates"])
+        self.assertEqual(next_planner_context["previous_tool_observations"][0]["tool_name"], "resolve_candidates")
+        self.assertIn("candidate_asins", next_planner_context["previous_tool_observations"][0]["result"])
 
     def test_web_route_uses_tavily_provider(self) -> None:
         pipe = self.make_pipeline()
@@ -405,35 +377,31 @@ class AgentNativeToolTests(unittest.TestCase):
 
         self.assertIn("未生成可展示的结果", answer)
         self.assertEqual(len(observed_payloads), 1)
-        self.assertEqual(observed_payloads[0]["tool_choice"], "auto")
+        self.assertNotIn("tool_choice", observed_payloads[0])
+        self.assertNotIn("tools", observed_payloads[0])
 
-    def test_legacy_text_tool_path_preserves_reasoning_content(self) -> None:
+    def test_legacy_text_tool_markup_is_ignored_by_planner_path(self) -> None:
         pipe = self.make_pipeline()
         text_only_provider = TextToolOnlyProvider()
         pipe._get_provider = lambda model_name=None: text_only_provider
         observed_payloads = []
-        responses = [
-            {
+
+        def post_agent_payload(payload: dict, model_name: str) -> dict:
+            observed_payloads.append(copy.deepcopy(payload))
+            return {
                 "choices": [
                     {
                         "message": {
                             "role": "assistant",
                             "content": '$TOOL_CALLS = [{"name":"resolve_candidates","arguments":{"product_query":"humidifier"}}]',
-                            "reasoning_content": "must be sent back on the next request",
+                            "reasoning_content": "legacy text markup should not drive the planner path",
                         }
                     }
                 ]
-            },
-            {"choices": [{"message": {"role": "assistant", "content": "最终答复。"}}]},
-        ]
-
-        def post_agent_payload(payload: dict, model_name: str) -> dict:
-            observed_payloads.append(copy.deepcopy(payload))
-            return responses.pop(0)
+            }
 
         def execute_tool_call(tool_call: dict, billing_context: dict, truncate: bool = True) -> str:
-            self.assertEqual(tool_call["name"], "resolve_candidates")
-            return json.dumps({"success": True, "data": {"candidate_asins": ["B001"]}}, ensure_ascii=False)
+            raise AssertionError("legacy text markup should not be executed in planner harness mode")
 
         pipe._post_agent_payload = post_agent_payload
         pipe._execute_tool_call = execute_tool_call
@@ -446,9 +414,8 @@ class AgentNativeToolTests(unittest.TestCase):
             mode="tool",
         )
 
-        self.assertEqual(answer, "最终答复。")
-        assistant_message = next(message for message in observed_payloads[1]["messages"] if message.get("role") == "assistant")
-        self.assertEqual(assistant_message["reasoning_content"], "must be sent back on the next request")
+        self.assertEqual(answer, "未生成可展示的结果。")
+        self.assertEqual(len(observed_payloads), 1)
 
     def test_resolve_candidates_compaction_prioritizes_candidate_identity_fields(self) -> None:
         pipe = self.make_pipeline()
@@ -791,6 +758,461 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertEqual(executed_calls[0]["parameters"]["product_query"], "humidifier")
         self.assertEqual(executed_calls[0]["parameters"]["marketplace"], "US")
         self.assertIn("humidifier 候选池已成功解析", answer)
+
+    def test_explicit_resolve_candidates_tool_request_repairs_required_product_query(self) -> None:
+        pipe = self.make_pipeline()
+        executed_calls = []
+
+        def plan_agent_next_steps(**kwargs) -> dict:
+            observed = kwargs.get("tool_observations") or []
+            if observed:
+                return {
+                    "scene": "general_agent",
+                    "answer_ready": True,
+                    "final_answer": "候选池解析完成。",
+                    "reasoning_summary": "已有工具证据。",
+                    "steps": [],
+                    "stop_reason": "done",
+                }
+            return {
+                "scene": "general_agent",
+                "answer_ready": False,
+                "final_answer": "",
+                "reasoning_summary": "用户显式请求工具。",
+                "steps": [
+                    {
+                        "tool_call": {"name": "resolve_candidates", "parameters": {"marketplace": "US"}},
+                        "goal": "解析候选池",
+                        "required": True,
+                    }
+                ],
+                "stop_reason": "tool first",
+            }
+
+        pipe._plan_agent_next_steps = plan_agent_next_steps
+
+        def execute_tool_call(tool_call: dict, billing_context: dict, truncate: bool = True) -> str:
+            executed_calls.append(copy.deepcopy(tool_call))
+            return json.dumps({"success": True, "data": {"candidate_pool_id": "pool-1"}}, ensure_ascii=False)
+
+        pipe._execute_tool_call = execute_tool_call
+
+        answer = pipe._run_agent_loop(
+            messages=[
+                {
+                    "role": "user",
+                    "content": "/tool 请调用 resolve_candidates，解析 humidifier 在 Amazon 美国站的候选池，marketplace=US，recall_mode=keyword，max_candidates=8，并说明 pool_quality 是否足以继续分析。",
+                }
+            ],
+            body={},
+            billing_context={"api_key": "test"},
+            model_name="deepseek-v4-pro",
+            mode="tool",
+        )
+
+        self.assertEqual(answer, "候选池解析完成。")
+        self.assertEqual(len(executed_calls), 1)
+        self.assertEqual(executed_calls[0]["name"], "resolve_candidates")
+        self.assertEqual(executed_calls[0]["parameters"]["product_query"], "humidifier")
+        self.assertEqual(executed_calls[0]["parameters"]["recall_mode"], "keyword")
+        self.assertEqual(executed_calls[0]["parameters"]["max_candidates"], 8)
+
+    def test_explicit_category_resolve_request_bypasses_unrelated_planner_step(self) -> None:
+        pipe = self.make_pipeline()
+        executed_tools = []
+
+        def plan_agent_next_steps(**kwargs) -> dict:
+            observed = kwargs.get("tool_observations") or []
+            if observed:
+                return {
+                    "scene": "general_agent",
+                    "answer_ready": True,
+                    "final_answer": "Humidifiers 类目解析完成。",
+                    "reasoning_summary": "已有 category_resolve 证据。",
+                    "steps": [],
+                    "stop_reason": "done",
+                }
+            return {
+                "scene": "general_agent",
+                "answer_ready": False,
+                "final_answer": "",
+                "reasoning_summary": "planner 错误地先查知识库。",
+                "steps": [
+                    {
+                        "tool_call": {"name": "search_knowledge_base", "parameters": {"query": "Humidifiers 类目"}},
+                        "goal": "查知识库",
+                        "required": True,
+                    }
+                ],
+                "stop_reason": "tool first",
+            }
+
+        pipe._plan_agent_next_steps = plan_agent_next_steps
+
+        def execute_tool_call(tool_call: dict, billing_context: dict, truncate: bool = True) -> str:
+            executed_tools.append(copy.deepcopy(tool_call))
+            return json.dumps({"success": True, "data": {"category_id": 17685839011}}, ensure_ascii=False)
+
+        pipe._execute_tool_call = execute_tool_call
+
+        answer = pipe._run_agent_loop(
+            messages=[
+                {
+                    "role": "user",
+                    "content": "/tool 请调用 category_resolve，把 Humidifiers 解析成 Amazon/Keepa 美国站稳定类目 ID，并返回本地覆盖度。",
+                }
+            ],
+            body={},
+            billing_context={"api_key": "test"},
+            model_name="deepseek-v4-pro",
+            mode="tool",
+        )
+
+        self.assertEqual(answer, "Humidifiers 类目解析完成。")
+        self.assertEqual([call["name"] for call in executed_tools], ["category_resolve"])
+        self.assertEqual(executed_tools[0]["parameters"]["category_query"], "Humidifiers")
+        self.assertEqual(executed_tools[0]["parameters"]["marketplace"], "US")
+
+    def test_explicit_tool_request_overrides_planner_tool_unavailable_answer(self) -> None:
+        pipe = self.make_pipeline()
+        executed_tools = []
+
+        def plan_agent_next_steps(**kwargs) -> dict:
+            observed = kwargs.get("tool_observations") or []
+            if observed:
+                return {
+                    "scene": "theme_analysis",
+                    "answer_ready": True,
+                    "final_answer": "Humidifiers 类目解析完成。",
+                    "reasoning_summary": "已有 category_resolve 证据。",
+                    "steps": [],
+                    "stop_reason": "done",
+                }
+            return {
+                "scene": "budget_analysis",
+                "answer_ready": True,
+                "final_answer": "category_resolve 不在当前可用的 allowed_tools 列表中。",
+                "reasoning_summary": "planner 误判了工具目录。",
+                "steps": [],
+                "stop_reason": "tool unavailable",
+            }
+
+        pipe._plan_agent_next_steps = plan_agent_next_steps
+
+        def execute_tool_call(tool_call: dict, billing_context: dict, truncate: bool = True) -> str:
+            executed_tools.append(copy.deepcopy(tool_call))
+            return json.dumps({"success": True, "data": {"category_id": 17685839011}}, ensure_ascii=False)
+
+        pipe._execute_tool_call = execute_tool_call
+        answer = pipe._run_agent_loop(
+            messages=[
+                {
+                    "role": "user",
+                    "content": "/tool 请调用 category_resolve，把 Humidifiers 解析成 Amazon/Keepa 美国站稳定类目 ID，并返回本地覆盖度。",
+                }
+            ],
+            body={},
+            billing_context={"api_key": "test"},
+            model_name="deepseek-v4-pro",
+            mode="tool",
+        )
+
+        self.assertEqual(answer, "Humidifiers 类目解析完成。")
+        self.assertEqual([call["name"] for call in executed_tools], ["category_resolve"])
+        self.assertEqual(executed_tools[0]["parameters"]["category_query"], "Humidifiers")
+
+    def test_react_action_protocol_executes_one_tool_per_round(self) -> None:
+        pipe = self.make_pipeline()
+        pipe._classify_agent_scene = lambda messages, mode="agent": "general_agent"
+        observed_payloads = []
+        executed_tools = []
+
+        def post_agent_payload(payload: dict, model_name: str) -> dict:
+            observed_payloads.append(copy.deepcopy(payload))
+            if len(observed_payloads) == 1:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "scene": "general_agent",
+                                        "reasoning_summary": "需要先查知识库获取证据。",
+                                        "action": {
+                                            "type": "tool",
+                                            "tool": {
+                                                "tool_name": "search_knowledge_base",
+                                                "goal": "检索提示词知识",
+                                                "parameters": {"query": "新手卖家提示词", "top_k": 3},
+                                            },
+                                            "final_answer": "",
+                                        },
+                                        "stop_reason": "拿到观察后再决定是否作答。",
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                }
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "scene": "general_agent",
+                                    "reasoning_summary": "已有足够证据。",
+                                    "action": {"type": "final", "final_answer": "新手提示词建议已整理。"},
+                                    "stop_reason": "done",
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+
+        def execute_tool_call(tool_call: dict, billing_context: dict, truncate: bool = True) -> str:
+            executed_tools.append(copy.deepcopy(tool_call))
+            return json.dumps({"success": True, "documents": [{"title": "提示词指南"}]}, ensure_ascii=False)
+
+        pipe._post_agent_payload = post_agent_payload
+        pipe._execute_tool_call = execute_tool_call
+
+        answer = pipe._run_agent_loop(
+            messages=[{"role": "user", "content": "给新手卖家 5 条提示词"}],
+            body={},
+            billing_context={"api_key": "test"},
+            model_name="deepseek-v4-pro",
+            mode="agent",
+        )
+
+        self.assertEqual(answer, "新手提示词建议已整理。")
+        self.assertEqual([call["name"] for call in executed_tools], ["search_knowledge_base"])
+        self.assertEqual(executed_tools[0]["parameters"]["query"], "新手卖家提示词")
+
+    def test_agent_harness_owns_tool_registry_and_scene_policy(self) -> None:
+        pipe = self.make_pipeline()
+
+        self.assertIs(xiamimate.TOOL_LAYER_REGISTRY, xiamimate.agent_harness.TOOL_LAYER_REGISTRY)
+        self.assertIs(xiamimate.SCENE_TOOL_POLICY, xiamimate.agent_harness.SCENE_TOOL_POLICY)
+        self.assertIs(xiamimate.ALLOWED_AGENT_TOOLS, xiamimate.agent_harness.ALLOWED_AGENT_TOOLS)
+        self.assertIn("resolve_candidates", pipe.agent_harness.planner_allowed_tool_names("theme_analysis", "agent"))
+        self.assertNotIn("web_search", pipe.agent_harness.planner_allowed_tool_names("foundation_qa", "tool"))
+
+    def test_agent_trace_is_included_in_synthesis_context(self) -> None:
+        pipe = self.make_pipeline()
+        trace = pipe.agent_harness.new_trace(mode="tool", scene="theme_analysis")
+        trace.record("planner_action", scene="theme_analysis", action_type="tool", tool_name="resolve_candidates")
+        trace.record("observation", scene="theme_analysis", tool_name="resolve_candidates", status="ok")
+
+        payload = pipe._prepare_planner_executor_synthesis_payload(
+            messages=[{"role": "user", "content": "分析 humidifier"}],
+            body={},
+            model_name="deepseek-v4-pro",
+            planner_notes=[{"scene": "theme_analysis", "planned_tools": ["resolve_candidates"]}],
+            tool_observations=[
+                {
+                    "tool_name": "resolve_candidates",
+                    "arguments": {"product_query": "humidifier"},
+                    "llm_result": "candidate_pool_id=pool-1",
+                }
+            ],
+            agent_trace=trace,
+        )
+        context = json.loads(payload["messages"][-1]["content"])
+
+        self.assertEqual(context["trace"][0]["trace_id"], trace.trace_id)
+        self.assertEqual(context["trace"][-1]["event_type"], "observation")
+        self.assertEqual(context["tool_observations"][0]["tool_name"], "resolve_candidates")
+
+    def test_agent_trace_jsonl_sink_writes_compact_record(self) -> None:
+        pipe = self.make_pipeline()
+        trace = pipe.agent_harness.new_trace(mode="tool", scene="theme_analysis")
+        trace.record("planner_action", scene="theme_analysis", action_type="tool", tool_name="resolve_candidates")
+        trace.record("observation", scene="theme_analysis", tool_name="resolve_candidates", status="ok")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            trace_path = Path(tmp_dir) / "agent-trace.jsonl"
+            record = pipe.agent_harness.write_trace(trace, str(trace_path), extra={"tool_count": 1})
+            lines = trace_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertIsNotNone(record)
+        self.assertEqual(len(lines), 1)
+        persisted = json.loads(lines[0])
+        self.assertEqual(persisted["trace_id"], trace.trace_id)
+        self.assertEqual(persisted["tool_count"], 1)
+        self.assertEqual(persisted["event_count"], 2)
+        self.assertEqual(persisted["events"][-1]["event_type"], "observation")
+
+    def test_run_agent_loop_persists_trace_when_sink_enabled(self) -> None:
+        pipe = self.make_pipeline()
+        pipe._classify_agent_scene = lambda messages, mode="agent": "foundation_qa"
+        pipe._post_agent_payload = lambda payload, model_name: {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "scene": "foundation_qa",
+                                "reasoning_summary": "基础问题可直接回答。",
+                                "action": {"type": "final", "final_answer": "新手可以先用三个问题开始选品。"},
+                                "stop_reason": "done",
+                            },
+                            ensure_ascii=False,
+                        )
+                    }
+                }
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            trace_path = Path(tmp_dir) / "agent-trace.jsonl"
+            pipe.valves.AGENT_TRACE_SINK_PATH = str(trace_path)
+            answer = pipe._run_agent_loop(
+                messages=[{"role": "user", "content": "新手怎么开始选品？"}],
+                body={},
+                billing_context={"api_key": "test"},
+                model_name="deepseek-v4-pro",
+                mode="agent",
+                charge_llm=False,
+            )
+            persisted = json.loads(trace_path.read_text(encoding="utf-8").splitlines()[0])
+
+        self.assertEqual(answer, "新手可以先用三个问题开始选品。")
+        self.assertEqual(persisted["status"], "finished")
+        self.assertFalse(persisted["stream"])
+        self.assertEqual(persisted["planner_note_count"], 1)
+        self.assertEqual([event["event_type"] for event in persisted["events"]], ["intent", "planner_action", "final"])
+
+    def test_react_runner_records_loop_events_and_observations(self) -> None:
+        pipe = self.make_pipeline()
+        runner = pipe.agent_harness.new_react_runner(mode="tool", scene="theme_analysis")
+        plan = {
+            "action_type": "tool",
+            "reasoning_summary": "需要候选池证据。",
+            "steps": [{"tool_call": {"name": "resolve_candidates", "parameters": {"product_query": "humidifier"}}}],
+        }
+
+        runner.start(max_rounds=2)
+        note = runner.plan_note("theme_analysis", plan)
+        runner.validation("theme_analysis", plan["steps"])
+        runner.observation(
+            "theme_analysis",
+            "resolve_candidates",
+            "ok",
+            observation={"tool_name": "resolve_candidates", "arguments": {"product_query": "humidifier"}, "llm_result": "ok"},
+            cache_key=("resolve_candidates", "{}"),
+        )
+        runner.final("theme_analysis", status="planner_final")
+
+        self.assertEqual(note["planned_tools"], ["resolve_candidates"])
+        self.assertEqual(runner.observation_store.names(), ["resolve_candidates"])
+        self.assertIn(("resolve_candidates", "{}"), runner.observation_store.tool_result_cache)
+        self.assertEqual([event["event_type"] for event in runner.events], ["intent", "planner_action", "validation", "observation", "final"])
+
+    def test_harness_repairs_required_arguments_via_dependency_injection(self) -> None:
+        pipe = self.make_pipeline()
+        repaired = pipe.agent_harness.repair_tool_call_required_arguments(
+            {"name": "resolve_candidates", "parameters": {"marketplace": "US"}},
+            lambda tool_name, parameters: {"product_query": "humidifier"} if tool_name == "resolve_candidates" else {},
+            pipe._normalize_tool_call,
+        )
+
+        self.assertIsNotNone(repaired)
+        self.assertEqual(repaired["name"], "resolve_candidates")
+        self.assertEqual(repaired["parameters"]["product_query"], "humidifier")
+        self.assertEqual(repaired["parameters"]["marketplace"], "US")
+
+    def test_budget_calculator_is_single_execution_in_budget_scene(self) -> None:
+        pipe = self.make_pipeline()
+        steps = [
+            {
+                "tool_call": {
+                    "name": "launch_budget_calculator",
+                    "parameters": {"product_theme": "humidifier", "marketplace": "US"},
+                }
+            }
+        ]
+        observations = [
+            {
+                "tool_name": "launch_budget_calculator",
+                "arguments": {"product_theme": "humidifier", "marketplace": "US"},
+                "llm_result": "预算已测算。",
+            }
+        ]
+
+        filtered = pipe.agent_harness.filter_redundant_planner_steps(steps, "budget_analysis", observations)
+
+        self.assertEqual(filtered, [])
+
+    def test_legacy_planner_steps_are_limited_to_single_react_action(self) -> None:
+        pipe = self.make_pipeline()
+        pipe._classify_agent_scene = lambda messages, mode="agent": "general_agent"
+        observed_payloads = []
+        executed_tools = []
+
+        def post_agent_payload(payload: dict, model_name: str) -> dict:
+            observed_payloads.append(copy.deepcopy(payload))
+            if len(observed_payloads) == 1:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "scene": "general_agent",
+                                        "answer_ready": False,
+                                        "final_answer": "",
+                                        "reasoning_summary": "旧 planner 返回了多个步骤，但 harness 只能执行一个下一步动作。",
+                                        "steps": [
+                                            {"tool_name": "search_knowledge_base", "parameters": {"query": "提示词"}, "goal": "查知识库"},
+                                            {"tool_name": "web_search", "parameters": {"query": "Amazon seller prompt"}, "goal": "联网补充"},
+                                        ],
+                                        "stop_reason": "legacy",
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            }
+                        }
+                    ]
+                }
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "scene": "general_agent",
+                                    "reasoning_summary": "已有第一步观察。",
+                                    "action": {"type": "final", "final_answer": "基于第一步观察作答。"},
+                                    "stop_reason": "done",
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+
+        def execute_tool_call(tool_call: dict, billing_context: dict, truncate: bool = True) -> str:
+            executed_tools.append(tool_call["name"])
+            return json.dumps({"success": True}, ensure_ascii=False)
+
+        pipe._post_agent_payload = post_agent_payload
+        pipe._execute_tool_call = execute_tool_call
+
+        answer = pipe._run_agent_loop(
+            messages=[{"role": "user", "content": "给新手卖家 5 条提示词"}],
+            body={},
+            billing_context={"api_key": "test"},
+            model_name="deepseek-v4-pro",
+            mode="agent",
+        )
+
+        self.assertEqual(answer, "基于第一步观察作答。")
+        self.assertEqual(executed_tools, ["search_knowledge_base"])
 
     def test_agent_round_limit_forces_final_synthesis_instead_of_error(self) -> None:
         pipe = self.make_pipeline()
@@ -1213,7 +1635,16 @@ class AgentNativeToolTests(unittest.TestCase):
 
         normalized = pipe._normalize_tool_call(
             "launch_budget_calculator",
-            {"product": "Women's Pants", "price": 22.94, "landed_cost": 8.3, "ad_budget": 600, "units": 300},
+            {
+                "product": "Women's Pants",
+                "price": 22.94,
+                "landed_cost": 8.3,
+                "commission_rate": "15%",
+                "coupon_rate": 5,
+                "refund_rate": "0.08",
+                "ad_budget": 600,
+                "units": 300,
+            },
         )
 
         self.assertIsNotNone(normalized)
@@ -1221,6 +1652,9 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertEqual(params["product_theme"], "Women's Pants")
         self.assertEqual(params["selling_price"], 22.94)
         self.assertEqual(params["landed_cost_per_unit"], 8.3)
+        self.assertAlmostEqual(params["referral_fee_rate"], 0.15)
+        self.assertAlmostEqual(params["coupon_discount_rate"], 0.05)
+        self.assertAlmostEqual(params["return_rate"], 0.08)
         self.assertEqual(params["monthly_ad_budget"], 600)
         self.assertEqual(params["launch_units"], 300)
 

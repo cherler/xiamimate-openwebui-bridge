@@ -1,0 +1,60 @@
+[
+  {
+    "case_id": "explicit_resolve_candidates_humidifier_stream",
+    "title": "显式 resolve_candidates humidifier stream",
+    "prompt": "/tool 请调用 resolve_candidates，解析 humidifier 在 Amazon 美国站的候选池，marketplace=US，recall_mode=keyword，max_candidates=8，并说明 pool_quality 是否足以继续分析。",
+    "stream": true,
+    "required_terms": ["候选池", "pool_quality"],
+    "forbidden_terms": ["缺少必填参数"]
+  },
+  {
+    "case_id": "explicit_category_resolve_humidifiers_stream",
+    "title": "显式 category_resolve Humidifiers stream",
+    "prompt": "/tool 请调用 category_resolve，把 Humidifiers 解析成 Amazon/Keepa 美国站稳定类目 ID，并返回本地覆盖度。",
+    "stream": true,
+    "required_terms": ["17685839011", "覆盖"],
+    "forbidden_terms": ["工具不可用"]
+  },
+  {
+    "case_id": "explicit_category_resolve_humidifiers_nonstream",
+    "title": "显式 category_resolve Humidifiers non-stream parity",
+    "prompt": "/tool 请调用 category_resolve，把 Humidifiers 解析成 Amazon/Keepa 美国站稳定类目 ID，并返回本地覆盖度。",
+    "stream": false,
+    "required_terms": ["17685839011", "覆盖"],
+    "forbidden_terms": ["工具不可用"]
+  },
+  {
+    "case_id": "foundation_prompt_advice_no_product_pool",
+    "title": "基础提示词建议不触发商品候选池",
+    "prompt": "我是新手卖家，第一次使用虾米选品，请给我 5 条适合开始选品的提问方式。",
+    "stream": true,
+    "required_any_terms": ["提示词", "提问", "选品"],
+    "forbidden_terms": ["candidate_pool_id", "候选池ID", "pool_quality"]
+  },
+  {
+    "case_id": "help_mode_onboarding_stream",
+    "title": "/help 新手使用说明",
+    "prompt": "/help 新手卖家怎么使用虾米选品开始选品？",
+    "stream": true,
+    "required_any_terms": ["虾米选品", "提示词", "选品"],
+    "forbidden_terms": ["candidate_pool_id", "resolve_candidates"]
+  },
+  {
+    "case_id": "points_command_nonstream_billing_free",
+    "title": "/points 非流式积分查询",
+    "prompt": "/points",
+    "stream": false,
+    "min_chars": 40,
+    "required_any_terms": ["积分", "余额", "points"],
+    "forbidden_terms": ["candidate_pool_id", "resolve_candidates"]
+  },
+  {
+    "case_id": "explicit_launch_budget_calculator_stream",
+    "title": "显式 launch_budget_calculator stream",
+    "prompt": "/tool 请调用 launch_budget_calculator，测算 humidifier 在 Amazon US 的启动预算，selling_price=29.99，unit_product_cost=7.5，monthly_ad_budget=1000，launch_units=300，launch_months=3。",
+    "stream": true,
+    "required_any_terms": ["预算", "盈亏", "利润", "启动资金"],
+    "forbidden_terms": ["缺少必填参数", "工具不可用"],
+    "max_term_counts": {"正在执行步骤 1/1：launch_budget_calculator": 1}
+  }
+]

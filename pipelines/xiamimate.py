@@ -34,9 +34,20 @@ def _load_providers():
     _spec.loader.exec_module(_mod)
     return _mod
 
+def _load_agent_harness():
+    _spec = importlib.util.spec_from_file_location(
+        "xiamimate_agent_harness",
+        str(Path(__file__).resolve().parent / "xiamimate" / "xiamimate_agent_harness.py"),
+    )
+    _mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    return _mod
+
 _providers_mod = _load_providers()
 ProviderStrategy = _providers_mod.ProviderStrategy
 get_provider = _providers_mod.get_provider
+agent_harness = _load_agent_harness()
+AGENT_PLANNER_SYSTEM_PROMPT = agent_harness.AGENT_PLANNER_SYSTEM_PROMPT
 
 
 AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
@@ -127,43 +138,6 @@ TOOL_RESULT_TEMPLATE = """以下是工具执行结果，请基于这些结果继
 如果信息已经足够，请直接给出最终答案。
 如果仍需继续调用工具，只调用真正必要的工具，不要重复调用相同工具。"""
 
-AGENT_PLANNER_SYSTEM_PROMPT = """你是 XiaMimate 的 Planner，负责把用户问题转成最小必要执行计划。
-
-你的职责：
-1. 先判断问题场景，再决定是否需要工具。
-2. 能直接回答时直接回答，不要为了显得完整而调用工具。
-3. 需要工具时，只输出本轮最小必要步骤；执行完后可以基于结果再计划下一轮。
-4. 基础知识、入门指导、提示词建议、产品使用说明这类问题，禁止使用选品分析工具；优先直接回答，必要时才使用 customer_help_search、search_knowledge_base、web_search。
-5. web_search 是增强可信度和时效性的补强工具，不是默认前置工具。只有当最新外部信息会实质影响结论、或用户明确要求联网/最新/外部依据时才使用。
-6. 选品机会发现、商品主题分析、ASIN 分析、预算测算分别走各自工具层，不要跨层乱调。
-
-你必须只输出一个 JSON 对象，不要输出 markdown，不要输出解释文字。
-
-JSON 结构：
-{
-  "scene": "foundation_qa|blank_opportunity_discovery|theme_analysis|asin_specific_analysis|budget_analysis|general_agent",
-  "answer_ready": true,
-  "final_answer": "当无需更多工具时直接给用户的最终答案；否则为空字符串",
-  "reasoning_summary": "一句话说明为什么这样规划",
-  "steps": [
-    {
-      "tool_name": "工具名",
-      "goal": "本步骤目标",
-      "required": true,
-      "parameters": {"参数名": "参数值"}
-    }
-  ],
-  "stop_reason": "本轮执行后何时可以停止继续调用工具"
-}
-
-约束：
-- answer_ready=true 时，steps 必须为空。
-- answer_ready=false 时，final_answer 必须为空。
-- 只可从给定 allowed_tools 中选择工具。
-- 不要编造工具参数；拿不准时先选择前置工具，或直接回答并说明边界。
-- 每轮 steps 数量不得超过给定 max_steps_per_round。
-"""
-
 AGENT_SYNTHESIS_SYSTEM_PROMPT = """你是 XiaMimate 的 Answer Synthesizer。
 
 职责：
@@ -175,158 +149,9 @@ AGENT_SYNTHESIS_SYSTEM_PROMPT = """你是 XiaMimate 的 Answer Synthesizer。
 6. 不要输出内部 JSON、tool_call、planner 字段或控制标记。
 """
 
-TOOL_LAYER_REGISTRY = {
-    "customer_help_search": {
-        "layer": "foundation",
-        "capability": "产品使用、入门指导、提示词示例、计费和客服 FAQ",
-        "scene_tags": ["foundation_qa", "general_agent"],
-    },
-    "search_knowledge_base": {
-        "layer": "foundation",
-        "capability": "跨境平台规则、运营方法、合规要求、领域知识",
-        "scene_tags": ["foundation_qa", "theme_analysis", "blank_opportunity_discovery", "general_agent"],
-    },
-    "web_search": {
-        "layer": "foundation",
-        "capability": "最新外部政策、新闻、市场动态、外部可信度补强",
-        "scene_tags": ["foundation_qa", "theme_analysis", "blank_opportunity_discovery", "general_agent"],
-    },
-    "opportunity_discovery": {
-        "layer": "discovery",
-        "capability": "用户尚未给出具体商品时，发现机会卡片和后续分析入口",
-        "scene_tags": ["blank_opportunity_discovery", "general_agent"],
-    },
-    "opportunity_discovery_job": {
-        "layer": "discovery",
-        "capability": "根据机会发现 job_id 回取历史结果或完整卡片",
-        "scene_tags": ["blank_opportunity_discovery", "general_agent"],
-    },
-    "resolve_candidates": {
-        "layer": "analysis",
-        "capability": "将具体商品词或主题解析成候选 ASIN 池",
-        "scene_tags": ["theme_analysis", "general_agent"],
-    },
-    "category_resolve": {
-        "layer": "analysis",
-        "capability": "解析稳定类目 ID/路径，为召回、benchmark、扩池做锚点",
-        "scene_tags": ["theme_analysis", "general_agent"],
-    },
-    "candidate_pool_stats": {
-        "layer": "analysis",
-        "capability": "候选池基础统计盘面",
-        "scene_tags": ["theme_analysis", "general_agent"],
-    },
-    "candidate_pool_trends": {
-        "layer": "analysis",
-        "capability": "候选池趋势变化",
-        "scene_tags": ["theme_analysis", "general_agent"],
-    },
-    "candidate_pool_weak_forecast": {
-        "layer": "analysis",
-        "capability": "候选池弱信号预测",
-        "scene_tags": ["theme_analysis", "general_agent"],
-    },
-    "product_forecast_explain": {
-        "layer": "analysis",
-        "capability": "正式销量预测及其解释",
-        "scene_tags": ["theme_analysis", "general_agent"],
-    },
-    "top_asin_drilldown": {
-        "layer": "analysis",
-        "capability": "头部 ASIN 下钻分析",
-        "scene_tags": ["theme_analysis", "general_agent"],
-    },
-    "asin_history_timeseries": {
-        "layer": "analysis",
-        "capability": "指定 ASIN 的历史时序表现",
-        "scene_tags": ["asin_specific_analysis", "general_agent"],
-    },
-    "category_benchmark": {
-        "layer": "analysis",
-        "capability": "候选池与类目基准对比",
-        "scene_tags": ["theme_analysis", "general_agent"],
-    },
-    "keepa_asin_lookup": {
-        "layer": "analysis",
-        "capability": "本地没有历史数据时查 Keepa 实时快照",
-        "scene_tags": ["asin_specific_analysis", "theme_analysis", "general_agent"],
-    },
-    "expand_candidates": {
-        "layer": "expansion",
-        "capability": "候选池不足时创建扩池任务",
-        "scene_tags": ["theme_analysis", "general_agent"],
-    },
-    "candidate_expansion_status": {
-        "layer": "expansion",
-        "capability": "查询扩池任务和分析数据就绪状态",
-        "scene_tags": ["theme_analysis", "general_agent"],
-    },
-    "launch_budget_calculator": {
-        "layer": "business",
-        "capability": "启动资金、单件利润、盈亏平衡测算",
-        "scene_tags": ["budget_analysis", "general_agent"],
-    },
-}
-
-SCENE_TOOL_POLICY = {
-    "foundation_qa": {
-        "label": "基础知识与新手指导",
-        "allowed_layers": ["foundation"],
-        "max_rounds": 2,
-        "max_steps_per_round": 2,
-    },
-    "blank_opportunity_discovery": {
-        "label": "空白机会发现",
-        "allowed_layers": ["discovery", "foundation"],
-        "max_rounds": 3,
-        "max_steps_per_round": 2,
-    },
-    "theme_analysis": {
-        "label": "商品主题分析",
-        "allowed_layers": ["analysis", "expansion", "foundation", "business"],
-        "max_rounds": 3,
-        "max_steps_per_round": 2,
-    },
-    "asin_specific_analysis": {
-        "label": "ASIN 定向分析",
-        "allowed_layers": ["analysis", "foundation"],
-        "max_rounds": 3,
-        "max_steps_per_round": 2,
-    },
-    "budget_analysis": {
-        "label": "预算与利润测算",
-        "allowed_layers": ["business", "foundation"],
-        "max_rounds": 2,
-        "max_steps_per_round": 2,
-    },
-    "general_agent": {
-        "label": "通用智能体",
-        "allowed_layers": ["foundation", "discovery", "analysis", "expansion", "business"],
-        "max_rounds": 3,
-        "max_steps_per_round": 2,
-    },
-}
-
-ALLOWED_AGENT_TOOLS = {
-    "customer_help_search",
-    "search_knowledge_base",
-    "web_search",
-    "resolve_candidates",
-    "category_resolve",
-    "expand_candidates",
-    "candidate_expansion_status",
-    "opportunity_discovery",
-    "opportunity_discovery_job",
-    "candidate_pool_stats",
-    "candidate_pool_trends",
-    "candidate_pool_weak_forecast",
-    "product_forecast_explain",
-    "launch_budget_calculator",
-    "top_asin_drilldown",
-    "asin_history_timeseries",
-    "category_benchmark",
-    "keepa_asin_lookup",
-}
+TOOL_LAYER_REGISTRY = agent_harness.TOOL_LAYER_REGISTRY
+SCENE_TOOL_POLICY = agent_harness.SCENE_TOOL_POLICY
+ALLOWED_AGENT_TOOLS = agent_harness.ALLOWED_AGENT_TOOLS
 
 COMMAND_TO_MODE = {
     "/agent": "agent",
@@ -511,6 +336,7 @@ class Pipeline:
         AGENT_MODEL_DEEPSEEK_LABEL: str = "DeepSeek V4 Pro"
         AGENT_MODEL_MINIMAX_LABEL: str = "MiniMax M2.7"
         AGENT_MAX_TOOL_ROUNDS: int = 12
+        AGENT_TRACE_SINK_PATH: str = ""
         HELP_FAST_TOP_K: int = 4
         HELP_CACHE_TTL_SECONDS: int = 900
         HELP_CACHE_MAX_ENTRIES: int = 128
@@ -520,6 +346,7 @@ class Pipeline:
         self.type = "manifold"
         self.id = os.getenv("XIAMIMATE_MODEL_PREFIX", "xiamimate")
         self.name = "XiaMimate: "
+        self.agent_harness = agent_harness.AgentHarness()
         self.agent_tools = self._load_agent_tools()
         self.valves = self.Valves(
             **{
@@ -535,6 +362,7 @@ class Pipeline:
                 "AGENT_MODEL_DEEPSEEK_LABEL": os.getenv("AGENT_MODEL_DEEPSEEK_LABEL", "DeepSeek V4 Pro"),
                 "AGENT_MODEL_MINIMAX_LABEL": os.getenv("AGENT_MODEL_MINIMAX_LABEL", "MiniMax M2.7"),
                 "AGENT_MAX_TOOL_ROUNDS": int(os.getenv("AGENT_MAX_TOOL_ROUNDS", "12")),
+                "AGENT_TRACE_SINK_PATH": os.getenv("AGENT_TRACE_SINK_PATH", ""),
                 "HELP_FAST_TOP_K": int(os.getenv("HELP_FAST_TOP_K", "4")),
                 "HELP_CACHE_TTL_SECONDS": int(os.getenv("HELP_CACHE_TTL_SECONDS", "900")),
                 "HELP_CACHE_MAX_ENTRIES": int(os.getenv("HELP_CACHE_MAX_ENTRIES", "128")),
@@ -1447,11 +1275,16 @@ class Pipeline:
         answer_started = False
         used_tools = False
         reasoning_open = False
-        tool_observations: List[dict] = []
-        tool_result_cache: Dict[Tuple[str, str], dict] = {}
-        planner_notes: List[dict] = []
         scene = self._classify_agent_scene(source_messages, mode=mode)
+        react_runner = self.agent_harness.new_react_runner(mode=mode, scene=scene)
+        agent_trace = react_runner.trace
+        trace_status = "finished"
+        tool_store = react_runner.observation_store
+        tool_observations: List[dict] = tool_store.observations
+        tool_result_cache: Dict[Tuple[str, str], dict] = tool_store.tool_result_cache
+        planner_notes: List[dict] = react_runner.planner_notes
         max_rounds = min(self._agent_max_tool_rounds(), int(self._scene_policy(scene, mode).get("max_rounds") or 1))
+        react_runner.start(max_rounds=max_rounds)
 
         def emit_text_chunk(content: str) -> bytes:
             return self._stream_content_chunk(
@@ -1529,9 +1362,14 @@ class Pipeline:
                     raise
 
                 scene = str(plan.get("scene") or scene or "general_agent").strip() or "general_agent"
-                planner_notes.append(self._planner_plan_note(scene, plan))
+                explicit_tool_name = ""
+                if not tool_observations:
+                    explicit_tool_name = self._explicit_tool_name_from_text(self._extract_last_user_text(source_messages))
+                    if explicit_tool_name:
+                        scene = self._scene_for_explicit_tool(explicit_tool_name, scene)
+                react_runner.plan_note(scene, plan)
 
-                if plan.get("answer_ready") and str(plan.get("final_answer") or "").strip():
+                if not explicit_tool_name and plan.get("answer_ready") and str(plan.get("final_answer") or "").strip():
                     if mode == "agent" and not used_tools:
                         self._charge_standalone_llm_request(
                             billing_context=billing_context,
@@ -1540,6 +1378,7 @@ class Pipeline:
                             stream=True,
                         )
                     final_answer = self._fallback_opportunity_answer_if_needed(str(plan.get("final_answer") or "").strip(), tool_observations)
+                    react_runner.final(scene, status="planner_final")
                     for chunk in emit_reasoning_chunks(self._format_agent_progress("Planner 已确认可直接作答，正在生成最终答复", percent=100)):
                         yield chunk
 
@@ -1553,15 +1392,42 @@ class Pipeline:
                     break
 
                 steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
-                steps = self._enforce_theme_resolve_first_step(steps, scene, source_messages, body, tool_observations)
+                if explicit_tool_name and not tool_observations:
+                    matching_explicit_steps = [
+                        step
+                        for step in steps
+                        if str(((step or {}).get("tool_call") or {}).get("name") or "").strip() == explicit_tool_name
+                    ]
+                    if matching_explicit_steps:
+                        steps = [matching_explicit_steps[0]]
+                    else:
+                        explicit_step = self._explicit_tool_request_step(source_messages, body, scene, mode=mode)
+                        if explicit_step is not None:
+                            steps = [explicit_step]
+                if plan.get("planner_protocol") != "native_tool_calls" and not (explicit_tool_name and explicit_tool_name != "resolve_candidates"):
+                    steps = self._enforce_theme_resolve_first_step(steps, scene, source_messages, body, tool_observations)
+                steps = self._repair_planner_steps_required_arguments(steps, source_messages, body)
                 steps = self._filter_redundant_planner_steps(steps, scene, tool_observations)
+                react_runner.validation(scene, steps)
                 if not steps:
+                    if not tool_observations and str(plan.get("action_type") or "").strip() in {"", "none"}:
+                        final_answer = self._fallback_answer_from_tool_observations(tool_observations)
+                        for chunk in emit_reasoning_chunks(self._format_agent_progress("未生成可执行工具或可见答复，返回兜底提示", percent=100)):
+                            yield chunk
+                        close_chunk = close_reasoning_chunk()
+                        if close_chunk is not None:
+                            yield close_chunk
+                        for chunk in self._split_text(final_answer):
+                            answer_started = True
+                            yield emit_text_chunk(chunk)
+                        break
                     final_answer = self._synthesize_planner_executor_answer(
                         messages=source_messages,
                         body=body,
                         model_name=model_name,
                         planner_notes=planner_notes,
                         tool_observations=tool_observations,
+                        agent_trace=agent_trace,
                     )
                     if mode == "agent" and not used_tools:
                         self._charge_standalone_llm_request(
@@ -1620,10 +1486,15 @@ class Pipeline:
                     public_tool_call = self._strip_internal_tool_context(tool_call)
                     result = self._execute_tool_call(tool_call, billing_context, truncate=False)
                     observation = self._build_tool_observation(tool_call=public_tool_call, result=result)
-                    tool_result_cache[self._tool_call_cache_key(tool_call)] = observation
-                    tool_observations.append(observation)
                     executed_any = True
                     tool_status = "失败" if self._tool_result_has_error(result) else "完成"
+                    react_runner.observation(
+                        scene,
+                        tool_name,
+                        "error" if self._tool_result_has_error(result) else "ok",
+                        observation=observation,
+                        cache_key=self._tool_call_cache_key(tool_call),
+                    )
                     for chunk in emit_reasoning_chunks(
                         self._format_agent_progress(
                             "步骤 %d/%d：工具 %s 已%s" % (step_index, len(steps), tool_name, tool_status),
@@ -1643,6 +1514,8 @@ class Pipeline:
                     model_name=model_name,
                     planner_notes=planner_notes,
                     tool_observations=tool_observations,
+                    agent_trace=agent_trace,
+                    limit_reached=bool(tool_observations),
                 )
                 if mode == "agent" and not used_tools:
                     self._charge_standalone_llm_request(
@@ -1660,16 +1533,31 @@ class Pipeline:
                     answer_started = True
                     yield emit_text_chunk(chunk)
         except RuntimeError as exc:
+            trace_status = "error"
             close_chunk = close_reasoning_chunk()
             if close_chunk is not None:
                 yield close_chunk
             yield emit_text_chunk("\n" + self._error_text(str(exc)))
 
+        self._persist_agent_trace(
+            agent_trace,
+            status=trace_status,
+            extra={"tool_count": len(tool_observations), "planner_note_count": len(planner_notes), "stream": True},
+        )
         close_chunk = close_reasoning_chunk()
         if close_chunk is not None:
             yield close_chunk
         yield self._stream_stop_chunk(response_id=response_id, created=created, model=model)
         yield b"data: [DONE]\n\n"
+
+    def _persist_agent_trace(self, agent_trace: Optional[Any], status: str = "finished", extra: Optional[dict] = None) -> None:
+        sink_path = str(getattr(self.valves, "AGENT_TRACE_SINK_PATH", "") or "").strip()
+        if not sink_path or agent_trace is None:
+            return
+        try:
+            self.agent_harness.write_trace(agent_trace, sink_path, status=status, extra=extra or {})
+        except Exception as exc:
+            print("xiamimate.agent failed to persist trace", str(exc)[:300])
 
     def _resolve_mode(
         self,
@@ -5522,11 +5410,7 @@ class Pipeline:
             return 12
 
     def _scene_policy(self, scene: str, mode: str = "agent") -> dict:
-        normalized_scene = str(scene or "general_agent").strip() or "general_agent"
-        policy = deepcopy(SCENE_TOOL_POLICY.get(normalized_scene) or SCENE_TOOL_POLICY["general_agent"])
-        if mode == "tool":
-            policy["max_rounds"] = max(1, min(3, int(policy.get("max_rounds") or 2)))
-        return policy
+        return self.agent_harness.scene_policy(scene, mode)
 
     def _classify_agent_scene(self, messages: List[dict], mode: str = "agent") -> str:
         text = self._extract_last_user_text(messages)
@@ -5579,88 +5463,26 @@ class Pipeline:
         return bool(re.search(r"\bB0[A-Z0-9]{8}\b", content))
 
     def _planner_allowed_tool_names(self, scene: str, mode: str = "agent") -> List[str]:
-        policy = self._scene_policy(scene, mode)
-        allowed_layers = set(policy.get("allowed_layers") or [])
-        names: List[str] = []
-        for tool_name in sorted(ALLOWED_AGENT_TOOLS):
-            metadata = TOOL_LAYER_REGISTRY.get(tool_name) or {}
-            layer = str(metadata.get("layer") or "").strip()
-            if layer and layer not in allowed_layers:
-                continue
-            if mode == "tool" and tool_name == "web_search":
-                continue
-            names.append(tool_name)
-        return names
+        return self.agent_harness.planner_allowed_tool_names(scene, mode)
 
     def _planner_tool_catalog(self, scene: str, mode: str = "agent") -> List[dict]:
-        catalog: List[dict] = []
-        for tool_name in self._planner_allowed_tool_names(scene, mode):
-            metadata = TOOL_LAYER_REGISTRY.get(tool_name) or {}
-            catalog.append(
-                {
-                    "tool_name": tool_name,
-                    "layer": metadata.get("layer") or "general",
-                    "capability": metadata.get("capability") or self._tool_name_label(tool_name),
-                    "scene_tags": metadata.get("scene_tags") or [],
-                }
-            )
-        return catalog
+        return self.agent_harness.planner_tool_catalog(scene, mode, tool_label=self._tool_name_label)
 
     def _planner_observation_context(self, tool_observations: List[dict], limit: int = 6) -> List[dict]:
-        items: List[dict] = []
-        for observation in (tool_observations or [])[-max(1, limit) :]:
-            items.append(
-                {
-                    "tool_name": str(observation.get("tool_name") or "").strip(),
-                    "arguments": observation.get("arguments") or {},
-                    "result": self._truncate_text_for_llm(str(observation.get("llm_result") or ""), budget=2400),
-                }
-            )
-        return items
+        return self.agent_harness.planner_observation_context(
+            tool_observations,
+            lambda text, budget: self._truncate_text_for_llm(text, budget=budget),
+            limit=limit,
+        )
 
     def _observed_tool_names(self, tool_observations: List[dict]) -> List[str]:
-        names: List[str] = []
-        for observation in tool_observations or []:
-            tool_name = str((observation or {}).get("tool_name") or "").strip()
-            if tool_name and tool_name not in names:
-                names.append(tool_name)
-        return names
+        return self.agent_harness.observed_tool_names(tool_observations)
 
     def _scene_single_execution_tools(self, scene: str) -> set:
-        if scene == "theme_analysis":
-            return {
-                "resolve_candidates",
-                "category_resolve",
-                "candidate_pool_stats",
-                "candidate_pool_trends",
-                "candidate_pool_weak_forecast",
-                "top_asin_drilldown",
-                "category_benchmark",
-            }
-        if scene == "blank_opportunity_discovery":
-            return {"opportunity_discovery", "opportunity_discovery_job", "category_resolve"}
-        if scene == "foundation_qa":
-            return {"customer_help_search", "search_knowledge_base", "web_search"}
-        return set()
+        return self.agent_harness.scene_single_execution_tools(scene)
 
     def _filter_redundant_planner_steps(self, steps: List[dict], scene: str, tool_observations: List[dict]) -> List[dict]:
-        if not steps:
-            return []
-        single_execution_tools = self._scene_single_execution_tools(scene)
-        if not single_execution_tools:
-            return steps
-
-        already_seen = set(self._observed_tool_names(tool_observations))
-        kept: List[dict] = []
-        planned_seen: set = set()
-        for step in steps:
-            tool_name = str(((step or {}).get("tool_call") or {}).get("name") or "").strip()
-            if tool_name in single_execution_tools and (tool_name in already_seen or tool_name in planned_seen):
-                continue
-            kept.append(step)
-            if tool_name in single_execution_tools:
-                planned_seen.add(tool_name)
-        return kept
+        return self.agent_harness.filter_redundant_planner_steps(steps, scene, tool_observations)
 
     def _infer_theme_product_query(self, messages: List[dict]) -> str:
         text = self._extract_last_user_text(messages).strip()
@@ -5677,6 +5499,103 @@ class Pipeline:
                 return str(match.group(1) or "").strip(" ：:，,。")[:120]
         return ""
 
+    def _explicit_tool_name_from_text(self, text: str) -> str:
+        return self.agent_harness.explicit_tool_name_from_text(text)
+
+    def _extract_explicit_tool_subject(self, text: str, tool_name: str) -> str:
+        return agent_harness.extract_explicit_tool_subject(text, tool_name)
+
+    def _infer_tool_required_arguments(self, tool_name: str, messages: List[dict], body: dict, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        normalized_tool = str(tool_name or "").strip()
+        latest_text = self._extract_last_user_text(messages)
+        inferred: Dict[str, Any] = self._extract_explicit_tool_parameters_from_text(latest_text, normalized_tool)
+        explicit_subject = self._extract_explicit_tool_subject(latest_text, normalized_tool)
+
+        if normalized_tool == "resolve_candidates":
+            product_query = str(parameters.get("product_query") or "").strip()
+            if not product_query:
+                product_query = self._infer_theme_product_query(messages) or explicit_subject
+            if product_query:
+                inferred["product_query"] = product_query
+            if not str(parameters.get("marketplace") or "").strip():
+                inferred["marketplace"] = self._infer_theme_marketplace(messages, body)
+            if not str(parameters.get("recall_mode") or "").strip():
+                inferred["recall_mode"] = "keyword"
+
+        elif normalized_tool == "category_resolve":
+            category_query = str(parameters.get("category_query") or "").strip()
+            if not category_query:
+                category_query = explicit_subject
+            if category_query:
+                inferred["category_query"] = category_query
+            if not str(parameters.get("marketplace") or "").strip():
+                inferred["marketplace"] = self._infer_theme_marketplace(messages, body)
+
+        elif normalized_tool == "expand_candidates":
+            product_query = str(parameters.get("product_query") or "").strip()
+            if not product_query:
+                product_query = self._infer_theme_product_query(messages) or explicit_subject
+            if product_query:
+                inferred["product_query"] = product_query
+            if not str(parameters.get("marketplace") or "").strip():
+                inferred["marketplace"] = self._infer_theme_marketplace(messages, body)
+
+        elif normalized_tool == "launch_budget_calculator":
+            product_theme = str(parameters.get("product_theme") or "").strip()
+            if not product_theme:
+                product_theme = self._infer_theme_product_query(messages) or explicit_subject
+            if product_theme:
+                inferred["product_theme"] = product_theme
+            if not str(parameters.get("marketplace") or "").strip():
+                inferred["marketplace"] = self._infer_theme_marketplace(messages, body)
+
+        return inferred
+
+    def _extract_explicit_tool_parameters_from_text(self, text: str, tool_name: str) -> Dict[str, Any]:
+        return self.agent_harness.extract_explicit_tool_parameters_from_text(text, tool_name, self._normalize_tool_call)
+
+    def _tool_call_has_required_arguments(self, tool_call: Dict[str, Any]) -> bool:
+        return agent_harness.tool_call_has_required_arguments(tool_call)
+
+    def _repair_tool_call_required_arguments(
+        self,
+        tool_call: Dict[str, Any],
+        messages: List[dict],
+        body: dict,
+    ) -> Optional[Dict[str, Any]]:
+        return self.agent_harness.repair_tool_call_required_arguments(
+            tool_call,
+            lambda tool_name, parameters: self._infer_tool_required_arguments(tool_name, messages, body, parameters),
+            self._normalize_tool_call,
+        )
+
+    def _repair_planner_steps_required_arguments(self, steps: List[dict], messages: List[dict], body: dict) -> List[dict]:
+        repaired_steps: List[dict] = []
+        for step in steps or []:
+            repaired_call = self._repair_tool_call_required_arguments((step or {}).get("tool_call") or {}, messages, body)
+            if repaired_call is None:
+                continue
+            repaired_step = dict(step or {})
+            repaired_step["tool_call"] = repaired_call
+            repaired_steps.append(repaired_step)
+        return repaired_steps
+
+    def _explicit_tool_request_step(self, messages: List[dict], body: dict, scene: str, mode: str = "agent") -> Optional[dict]:
+        latest_text = self._extract_last_user_text(messages)
+        tool_name = self._explicit_tool_name_from_text(latest_text)
+        if not tool_name:
+            return None
+        initial_call = self._normalize_tool_call(name=tool_name, parameters={})
+        if initial_call is None or not self._tool_call_allowed_for_scene(initial_call, scene, mode):
+            return None
+        repaired_call = self._repair_tool_call_required_arguments(initial_call, messages, body)
+        if repaired_call is None:
+            return None
+        return {"tool_call": repaired_call, "goal": "按用户显式请求直接调用目标工具", "required": True}
+
+    def _scene_for_explicit_tool(self, tool_name: str, current_scene: str) -> str:
+        return self.agent_harness.scene_for_explicit_tool(tool_name, current_scene)
+
     def _infer_theme_marketplace(self, messages: List[dict], body: dict) -> str:
         explicit = self._body_context_value(body, "marketplace") or self._body_context_value(body, "target_market")
         if explicit:
@@ -5688,6 +5607,8 @@ class Pipeline:
 
     def _build_theme_resolve_step(self, messages: List[dict], body: dict) -> Optional[dict]:
         product_query = self._infer_theme_product_query(messages)
+        if not product_query:
+            product_query = self._extract_explicit_tool_subject(self._extract_last_user_text(messages), "resolve_candidates")
         if not product_query:
             return None
         tool_call = self._normalize_tool_call(
@@ -5708,9 +5629,11 @@ class Pipeline:
         if str(tool_call.get("name") or "").strip() != "resolve_candidates":
             return step if isinstance(step, dict) else None
 
-        parameters = tool_call.get("parameters") if isinstance(tool_call.get("parameters"), dict) else {}
-        if str(parameters.get("product_query") or "").strip():
-            return step if isinstance(step, dict) else None
+        repaired_call = self._repair_tool_call_required_arguments(tool_call, messages, body)
+        if repaired_call is not None:
+            repaired = dict(step or {})
+            repaired["tool_call"] = repaired_call
+            return repaired
 
         fallback_step = self._build_theme_resolve_step(messages, body)
         if fallback_step is None:
@@ -5776,7 +5699,7 @@ class Pipeline:
                         "already_observed_tools": self._observed_tool_names(tool_observations),
                         "previous_tool_observations": self._planner_observation_context(tool_observations),
                         "remaining_rounds": remaining_rounds,
-                        "planner_note": "如果已有工具足够回答，请直接给 final_answer；不要重复调用 already_observed_tools 中的工具。如果需要工具，只给本轮最小必要步骤。",
+                        "planner_note": "如果已有工具足够回答，请返回 action.type=final 和 final_answer；不要重复调用 already_observed_tools 中的工具。如果需要工具，只返回一个 action.type=tool 的下一步动作，不要一次性规划完整路线。",
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -5819,23 +5742,14 @@ class Pipeline:
         return None
 
     def _tool_call_allowed_for_scene(self, tool_call: Dict[str, Any], scene: str, mode: str = "agent") -> bool:
-        tool_name = str((tool_call or {}).get("name") or "").strip()
-        if tool_name not in ALLOWED_AGENT_TOOLS:
-            return False
-        if mode == "tool" and tool_name == "web_search":
-            return False
-        metadata = TOOL_LAYER_REGISTRY.get(tool_name) or {}
-        layer = str(metadata.get("layer") or "").strip()
-        allowed_layers = set((self._scene_policy(scene, mode) or {}).get("allowed_layers") or [])
-        if layer and allowed_layers and layer not in allowed_layers:
-            return False
-        return True
+        return self.agent_harness.tool_call_allowed_for_scene(tool_call, scene, mode)
 
     def _normalize_planner_step(self, step: dict, scene: str, mode: str = "agent") -> Optional[dict]:
         if not isinstance(step, dict):
             return None
-        tool_name = str(step.get("tool_name") or step.get("name") or "").strip()
-        raw_parameters = step.get("parameters")
+        tool_call = step.get("tool_call") if isinstance(step.get("tool_call"), dict) else {}
+        tool_name = str(step.get("tool_name") or step.get("name") or tool_call.get("name") or "").strip()
+        raw_parameters = step.get("parameters") if isinstance(step.get("parameters"), dict) else tool_call.get("parameters")
         if not isinstance(raw_parameters, dict):
             raw_parameters = {}
         normalized_call = self._normalize_tool_call(name=tool_name, parameters=raw_parameters)
@@ -5847,37 +5761,11 @@ class Pipeline:
             "required": bool(step.get("required", True)),
         }
 
+    def _normalize_planner_action(self, action: Any, scene: str, mode: str = "agent") -> Tuple[bool, str, List[dict], str]:
+        return self.agent_harness.normalize_planner_action(action, scene, mode, self._normalize_planner_step)
+
     def _normalize_planner_plan(self, plan_payload: Any, scene: str, mode: str = "agent") -> dict:
-        policy = self._scene_policy(scene, mode)
-        data = plan_payload if isinstance(plan_payload, dict) else {}
-        normalized_scene = str(data.get("scene") or scene or "general_agent").strip() or scene or "general_agent"
-        if normalized_scene not in SCENE_TOOL_POLICY:
-            normalized_scene = scene or "general_agent"
-
-        steps: List[dict] = []
-        raw_steps = data.get("steps") if isinstance(data.get("steps"), list) else []
-        for raw_step in raw_steps[: max(1, int(policy.get("max_steps_per_round") or 1))]:
-            normalized_step = self._normalize_planner_step(raw_step, normalized_scene, mode)
-            if normalized_step is not None:
-                steps.append(normalized_step)
-
-        final_answer = str(data.get("final_answer") or "").strip()
-        answer_ready = bool(data.get("answer_ready"))
-        if answer_ready and not final_answer and steps:
-            answer_ready = False
-        if not answer_ready:
-            final_answer = ""
-        if answer_ready:
-            steps = []
-
-        return {
-            "scene": normalized_scene,
-            "answer_ready": answer_ready,
-            "final_answer": final_answer,
-            "reasoning_summary": str(data.get("reasoning_summary") or "").strip(),
-            "stop_reason": str(data.get("stop_reason") or "").strip(),
-            "steps": steps,
-        }
+        return self.agent_harness.normalize_planner_plan(plan_payload, scene, mode, self._normalize_planner_step)
 
     def _plan_agent_next_steps(
         self,
@@ -5900,8 +5788,35 @@ class Pipeline:
             remaining_rounds=remaining_rounds,
         )
         response = self._post_agent_payload(payload, model_name=model_name)
+        native_tool_calls = self._filter_tool_calls_for_user_intent(self._extract_response_tool_calls(response), messages)
+        if native_tool_calls:
+            steps = []
+            for tool_call in native_tool_calls[:1]:
+                if self._tool_call_allowed_for_scene(tool_call, scene, mode):
+                    steps.append({"tool_call": tool_call, "goal": "执行模型返回的原生工具调用", "required": True})
+            return {
+                "scene": scene,
+                "answer_ready": False,
+                "final_answer": "",
+                "reasoning_summary": "模型返回了原生工具调用，已交由 harness 校验执行。",
+                "stop_reason": "等待工具 observation 后再继续决策。",
+                "action_type": "tool" if steps else "none",
+                "planner_protocol": "native_tool_calls",
+                "steps": steps,
+            }
         content = self._clean_agent_content(self._extract_assistant_content(response), model_name=model_name)
         plan_payload = self._extract_json_value_from_text(content)
+        if plan_payload is None and content.strip():
+            return {
+                "scene": scene,
+                "answer_ready": True,
+                "final_answer": content.strip(),
+                "reasoning_summary": "模型返回了可见文本，按最终回答处理。",
+                "stop_reason": "done",
+                "action_type": "final",
+                "planner_protocol": "text_final",
+                "steps": [],
+            }
         return self._normalize_planner_plan(plan_payload, scene=scene, mode=mode)
 
     def _prepare_planner_executor_synthesis_payload(
@@ -5912,6 +5827,8 @@ class Pipeline:
         model_name: str,
         planner_notes: List[dict],
         tool_observations: List[dict],
+        agent_trace: Optional[Any] = None,
+        limit_reached: bool = False,
     ) -> dict:
         provider = self._get_provider(model_name)
         payload = provider.filter_payload(body)
@@ -5926,18 +5843,17 @@ class Pipeline:
             synthesis_messages,
             body.get("_xiamimate_memory_profile") if isinstance(body, dict) else None,
         )
+        synthesis_context = self.agent_harness.synthesis_context(
+            planner_notes,
+            tool_observations,
+            self._planner_observation_context,
+            trace=agent_trace,
+            limit_reached=limit_reached,
+        )
         synthesis_messages.append(
             {
                 "role": "user",
-                "content": json.dumps(
-                    {
-                        "planner_notes": planner_notes[-4:],
-                        "tool_observations": self._planner_observation_context(tool_observations, limit=8),
-                        "instruction": "不要再调用工具；只基于这些证据回答用户原问题。",
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
+                "content": json.dumps(synthesis_context, ensure_ascii=False, indent=2),
             }
         )
         payload["messages"] = synthesis_messages
@@ -5955,6 +5871,8 @@ class Pipeline:
         model_name: str,
         planner_notes: List[dict],
         tool_observations: List[dict],
+        agent_trace: Optional[Any] = None,
+        limit_reached: bool = False,
     ) -> str:
         payload = self._prepare_planner_executor_synthesis_payload(
             messages=messages,
@@ -5962,6 +5880,8 @@ class Pipeline:
             model_name=model_name,
             planner_notes=planner_notes,
             tool_observations=tool_observations,
+            agent_trace=agent_trace,
+            limit_reached=limit_reached,
         )
         response = self._post_agent_payload(payload, model_name=model_name)
         content = self._clean_agent_content(self._extract_assistant_content(response), model_name=model_name)
@@ -5969,17 +5889,8 @@ class Pipeline:
             return self._fallback_opportunity_answer_if_needed(content, tool_observations)
         return self._fallback_answer_from_tool_observations(tool_observations)
 
-    def _planner_plan_note(self, scene: str, plan: dict) -> dict:
-        return {
-            "scene": scene,
-            "reasoning_summary": str((plan or {}).get("reasoning_summary") or "").strip(),
-            "stop_reason": str((plan or {}).get("stop_reason") or "").strip(),
-            "planned_tools": [
-                str(((step or {}).get("tool_call") or {}).get("name") or "").strip()
-                for step in (plan or {}).get("steps") or []
-                if isinstance(step, dict)
-            ],
-        }
+    def _planner_plan_note(self, scene: str, plan: dict, trace: Optional[Any] = None) -> dict:
+        return self.agent_harness.planner_plan_note(scene, plan, trace=trace)
 
     def _prepare_agent_final_synthesis_payload(
         self,
@@ -6197,12 +6108,23 @@ class Pipeline:
         charge_llm: bool = True,
     ) -> str:
         source_messages = deepcopy(messages or [])
-        tool_observations: List[dict] = []
-        tool_result_cache: Dict[Tuple[str, str], dict] = {}
         used_tools = False
-        planner_notes: List[dict] = []
         scene = self._classify_agent_scene(source_messages, mode=mode)
+        react_runner = self.agent_harness.new_react_runner(mode=mode, scene=scene)
+        agent_trace = react_runner.trace
+        tool_store = react_runner.observation_store
+        tool_observations: List[dict] = tool_store.observations
+        tool_result_cache: Dict[Tuple[str, str], dict] = tool_store.tool_result_cache
+        planner_notes: List[dict] = react_runner.planner_notes
         max_rounds = min(self._agent_max_tool_rounds(), int(self._scene_policy(scene, mode).get("max_rounds") or 1))
+        react_runner.start(max_rounds=max_rounds)
+
+        def persist_trace(status: str = "finished") -> None:
+            self._persist_agent_trace(
+                agent_trace,
+                status=status,
+                extra={"tool_count": len(tool_observations), "planner_note_count": len(planner_notes), "stream": False},
+            )
 
         for round_index in range(max_rounds):
             try:
@@ -6217,13 +6139,21 @@ class Pipeline:
                 )
             except RuntimeError as exc:
                 if tool_observations:
-                    return self._fallback_answer_from_tool_observations(tool_observations, error=str(exc))
+                    answer = self._fallback_answer_from_tool_observations(tool_observations, error=str(exc))
+                    persist_trace(status="error")
+                    return answer
+                persist_trace(status="error")
                 raise
 
             scene = str(plan.get("scene") or scene or "general_agent").strip() or "general_agent"
-            planner_notes.append(self._planner_plan_note(scene, plan))
+            explicit_tool_name = ""
+            if not tool_observations:
+                explicit_tool_name = self._explicit_tool_name_from_text(self._extract_last_user_text(source_messages))
+                if explicit_tool_name:
+                    scene = self._scene_for_explicit_tool(explicit_tool_name, scene)
+            react_runner.plan_note(scene, plan)
 
-            if plan.get("answer_ready") and str(plan.get("final_answer") or "").strip():
+            if not explicit_tool_name and plan.get("answer_ready") and str(plan.get("final_answer") or "").strip():
                 if charge_llm and mode == "agent" and not used_tools:
                     self._charge_standalone_llm_request(
                         billing_context=billing_context,
@@ -6231,18 +6161,45 @@ class Pipeline:
                         mode=mode,
                         stream=False,
                     )
-                return self._fallback_opportunity_answer_if_needed(str(plan.get("final_answer") or "").strip(), tool_observations)
+                react_runner.final(scene, status="planner_final")
+                answer = self._fallback_opportunity_answer_if_needed(str(plan.get("final_answer") or "").strip(), tool_observations)
+                persist_trace()
+                return answer
 
             steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
-            steps = self._enforce_theme_resolve_first_step(steps, scene, source_messages, body, tool_observations)
+            if explicit_tool_name and not tool_observations:
+                matching_explicit_steps = [
+                    step
+                    for step in steps
+                    if str(((step or {}).get("tool_call") or {}).get("name") or "").strip() == explicit_tool_name
+                ]
+                if matching_explicit_steps:
+                    steps = [matching_explicit_steps[0]]
+                else:
+                    explicit_step = self._explicit_tool_request_step(source_messages, body, scene, mode=mode)
+                    if explicit_step is not None:
+                        steps = [explicit_step]
+            if plan.get("planner_protocol") != "native_tool_calls" and not (explicit_tool_name and explicit_tool_name != "resolve_candidates"):
+                steps = self._enforce_theme_resolve_first_step(steps, scene, source_messages, body, tool_observations)
+            steps = self._repair_planner_steps_required_arguments(steps, source_messages, body)
             steps = self._filter_redundant_planner_steps(steps, scene, tool_observations)
+            react_runner.validation(scene, steps)
             if not steps:
+                if not tool_observations and str(plan.get("action_type") or "").strip() in {"", "none"}:
+                    answer = self._fallback_answer_from_tool_observations(tool_observations)
+                    persist_trace()
+                    return answer
+                opportunity_fallback = self._fallback_opportunity_answer_from_observations(tool_observations)
+                if opportunity_fallback:
+                    persist_trace()
+                    return opportunity_fallback
                 answer = self._synthesize_planner_executor_answer(
                     messages=source_messages,
                     body=body,
                     model_name=model_name,
                     planner_notes=planner_notes,
                     tool_observations=tool_observations,
+                    agent_trace=agent_trace,
                 )
                 if charge_llm and mode == "agent" and not used_tools:
                     self._charge_standalone_llm_request(
@@ -6251,6 +6208,7 @@ class Pipeline:
                         mode=mode,
                         stream=False,
                     )
+                persist_trace()
                 return answer
 
             used_tools = True
@@ -6269,21 +6227,30 @@ class Pipeline:
                 public_tool_call = self._strip_internal_tool_context(tool_call)
                 result = self._execute_tool_call(tool_call, billing_context, truncate=False)
                 observation = self._build_tool_observation(tool_call=public_tool_call, result=result)
-                tool_result_cache[self._tool_call_cache_key(tool_call)] = observation
-                tool_observations.append(observation)
+                react_runner.observation(
+                    scene,
+                    str(tool_call.get("name") or "").strip(),
+                    "error" if self._tool_result_has_error(result) else "ok",
+                    observation=observation,
+                    cache_key=self._tool_call_cache_key(tool_call),
+                )
                 executed_any = True
 
             if not executed_any:
                 break
 
         if tool_observations:
-            return self._synthesize_planner_executor_answer(
+            answer = self._synthesize_planner_executor_answer(
                 messages=source_messages,
                 body=body,
                 model_name=model_name,
                 planner_notes=planner_notes,
                 tool_observations=tool_observations,
+                agent_trace=agent_trace,
+                limit_reached=True,
             )
+            persist_trace()
+            return answer
 
         fallback_answer = self._synthesize_planner_executor_answer(
             messages=source_messages,
@@ -6291,6 +6258,8 @@ class Pipeline:
             model_name=model_name,
             planner_notes=planner_notes,
             tool_observations=tool_observations,
+            agent_trace=agent_trace,
+            limit_reached=True,
         )
         if charge_llm and mode == "agent" and not used_tools:
             self._charge_standalone_llm_request(
@@ -6299,6 +6268,7 @@ class Pipeline:
                 mode=mode,
                 stream=False,
             )
+        persist_trace()
         return fallback_answer
 
     def _charge_standalone_llm_request(
@@ -7485,6 +7455,10 @@ class Pipeline:
 
         if "marketplace" in filtered_params:
             filtered_params["marketplace"] = self._normalize_marketplace_value(filtered_params["marketplace"])
+        if tool_name == "launch_budget_calculator":
+            for rate_param in ("referral_fee_rate", "coupon_discount_rate", "return_rate"):
+                if rate_param in filtered_params:
+                    filtered_params[rate_param] = self._normalize_fraction_rate_value(filtered_params[rate_param])
 
         return {"name": tool_name, "parameters": filtered_params}
 
@@ -7537,6 +7511,28 @@ class Pipeline:
         if suffix in known_codes:
             return suffix
 
+        return value
+
+    def _normalize_fraction_rate_value(self, value: Any) -> Any:
+        if value in (None, ""):
+            return value
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return value
+            has_percent = "%" in text or "percent" in text.lower()
+            numeric_text = re.sub(r"[^0-9.\-]+", "", text)
+            if not numeric_text:
+                return value
+            try:
+                number = float(numeric_text)
+            except ValueError:
+                return value
+            if has_percent or number > 1:
+                return number / 100.0
+            return number
+        if isinstance(value, (int, float)) and value > 1:
+            return float(value) / 100.0
         return value
 
     def _coerce_tool_value(self, value: Any) -> Any:
@@ -8369,6 +8365,8 @@ class Pipeline:
         opportunity_fallback = self._fallback_opportunity_answer_from_observations(tool_observations)
         if opportunity_fallback:
             return opportunity_fallback
+        if not tool_observations:
+            return "未生成可展示的结果。"
         lines = [
             "工具已经执行完成，但模型整理最终答复时失败；先返回工具结果摘要，方便继续分析。",
         ]
