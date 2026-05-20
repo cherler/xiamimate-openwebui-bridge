@@ -139,6 +139,11 @@
   display: grid;
   gap: 14px;
 }
+#xm-contact-modal.xm-contact-mode-official_account .xm-contact-card {
+  width: min(690px, calc(100vw - 32px));
+  padding: 30px;
+  gap: 20px;
+}
 #xm-contact-modal .xm-contact-header {
   display: flex;
   align-items: flex-start;
@@ -181,10 +186,16 @@
 }
 #xm-contact-modal .xm-contact-qr {
   width: min(100%, 280px);
+  max-height: calc(100vh - 220px);
+  object-fit: contain;
   border-radius: 16px;
   background: #fff;
   border: 1px solid rgba(17, 75, 95, 0.12);
   box-shadow: 0 14px 34px rgba(30, 42, 47, 0.1);
+}
+#xm-contact-modal.xm-contact-mode-official_account .xm-contact-qr {
+  width: min(100%, 570px);
+  max-height: calc(100vh - 190px);
 }
 #xm-contact-modal .xm-contact-qr-fallback {
   color: #68767d;

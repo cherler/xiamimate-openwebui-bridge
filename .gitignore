@@ -9,3 +9,7 @@ pipelines/*/valves.json
 .venv/
 .vscode/
 .recover-*/
+*.log
+*.bak
+*.tmp
+*.swp

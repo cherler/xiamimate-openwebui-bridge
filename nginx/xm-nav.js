@@ -415,6 +415,8 @@
 
   function applyModalMeta() {
     var mode = contactModes[currentContactMode] || contactModes.wechat;
+    modal.classList.remove('xm-contact-mode-wechat', 'xm-contact-mode-official_account');
+    modal.classList.add('xm-contact-mode-' + currentContactMode);
     if (contactTitle) {
       contactTitle.textContent = mode.title;
     }
