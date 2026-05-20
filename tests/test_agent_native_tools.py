@@ -1720,5 +1720,361 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertLessEqual(len(rendered), 4000)
 
 
+class SessionContextStoreTests(unittest.TestCase):
+    def _store(self):
+        return xiamimate.agent_harness.SessionContextStore(ttl_seconds=3600, max_sessions=3, max_tool_results=2)
+
+    def test_update_and_get_roundtrip(self) -> None:
+        store = self._store()
+        store.update("chat-a", {"last_product_query": "humidifier", "last_marketplace": "US"})
+        snapshot = store.get("chat-a")
+        self.assertEqual(snapshot["last_product_query"], "humidifier")
+        self.assertEqual(snapshot["last_marketplace"], "US")
+        self.assertNotIn("_touched_at", snapshot)
+
+    def test_get_empty_for_unknown_or_blank_chat_id(self) -> None:
+        store = self._store()
+        self.assertEqual(store.get(None), {})
+        self.assertEqual(store.get(""), {})
+        self.assertEqual(store.get("never-set"), {})
+
+    def test_update_ignores_none_values_and_underscore_keys(self) -> None:
+        store = self._store()
+        store.update("c1", {"last_product_query": "humidifier", "_internal": "x", "last_marketplace": None})
+        snapshot = store.get("c1")
+        self.assertEqual(snapshot.get("last_product_query"), "humidifier")
+        self.assertNotIn("last_marketplace", snapshot)
+        self.assertNotIn("_internal", snapshot)
+
+    def test_record_tool_result_truncates_and_evicts(self) -> None:
+        store = xiamimate.agent_harness.SessionContextStore(max_tool_result_chars=10, max_tool_results=2)
+        store.record_tool_result("c1", "resolve_candidates", "x" * 50, parameters={"product_query": "humidifier"})
+        store.record_tool_result("c1", "candidate_pool_stats", "yy", parameters={"candidate_pool_id": "p1"})
+        store.record_tool_result("c1", "candidate_pool_trends", "zz", parameters={"candidate_pool_id": "p1"})
+        snapshot = store.get("c1")
+        calls = snapshot["last_tool_calls"]
+        tool_names = [entry["tool_name"] for entry in calls.values()]
+        self.assertEqual(tool_names, ["candidate_pool_stats", "candidate_pool_trends"])
+        first_entry = next(iter(calls.values()))
+        self.assertTrue(first_entry["summary"])
+        self.assertTrue(first_entry.get("params_fingerprint"))
+
+    def test_record_tool_result_dedups_by_fingerprint(self) -> None:
+        store = xiamimate.agent_harness.SessionContextStore(max_tool_results=4)
+        # 同名工具不同参数 -> 视为不同条目
+        store.record_tool_result("c1", "candidate_pool_trends", "win30", parameters={"candidate_pool_id": "p1", "window_days": 30})
+        store.record_tool_result("c1", "candidate_pool_trends", "win90", parameters={"candidate_pool_id": "p1", "window_days": 90})
+        # 同名工具同参数 -> 覆盖最新
+        store.record_tool_result("c1", "candidate_pool_trends", "win30b", parameters={"candidate_pool_id": "p1", "window_days": 30})
+        snapshot = store.get("c1")
+        calls = snapshot["last_tool_calls"]
+        self.assertEqual(len(calls), 2)
+
+    def test_lru_evicts_oldest_session(self) -> None:
+        store = xiamimate.agent_harness.SessionContextStore(max_sessions=2)
+        store.update("a", {"last_product_query": "q1"})
+        store.update("b", {"last_product_query": "q2"})
+        store.update("c", {"last_product_query": "q3"})
+        self.assertEqual(store.get("a"), {})
+        self.assertEqual(store.get("b").get("last_product_query"), "q2")
+        self.assertEqual(store.get("c").get("last_product_query"), "q3")
+
+    def test_clear_removes_session(self) -> None:
+        store = self._store()
+        store.update("c1", {"last_product_query": "humidifier"})
+        store.clear("c1")
+        self.assertEqual(store.get("c1"), {})
+
+
+class AgentHarnessSessionMemoryTests(unittest.TestCase):
+    def _harness(self, chat_id: str = "chat-test"):
+        store = xiamimate.agent_harness.SessionContextStore()
+        return xiamimate.agent_harness.AgentHarness(chat_id=chat_id, session_store=store), store
+
+    def test_after_tool_observation_extracts_candidate_pool_from_resolve_candidates(self) -> None:
+        harness, store = self._harness()
+        payload = json.dumps(
+            {
+                "success": True,
+                "data": {
+                    "candidate_pool_id": "pool-xyz",
+                    "candidate_asins": ["B001ABCD12", "B002EFGH34", "B003IJKL56"],
+                    "candidate_pool_size": 3,
+                    "leaf_categories": [{"category_id": 999, "category_path": "Home > Humidifiers"}],
+                },
+            }
+        )
+        harness.after_tool_observation(
+            tool_call={"name": "resolve_candidates", "parameters": {"product_query": "humidifier", "marketplace": "US"}},
+            result=payload,
+            compact_result=payload[:200],
+        )
+        snapshot = harness.session_snapshot()
+        self.assertEqual(snapshot["last_product_query"], "humidifier")
+        self.assertEqual(snapshot["last_marketplace"], "US")
+        pool = snapshot["last_candidate_pool"]
+        self.assertEqual(pool["pool_id"], "pool-xyz")
+        self.assertEqual(pool["size"], 3)
+        self.assertEqual(pool["asins_total"], 3)
+        self.assertIn("B001ABCD12", pool["asins_preview"])
+        recent_tools = [item["tool_name"] for item in snapshot["recent_tool_results"]]
+        self.assertIn("resolve_candidates", recent_tools)
+
+    def test_after_tool_observation_extracts_category_handle(self) -> None:
+        harness, _ = self._harness()
+        payload = json.dumps(
+            {"success": True, "data": {"category_id": 12345, "category_path": "Home > Humidifiers"}}
+        )
+        harness.after_tool_observation(
+            tool_call={"name": "category_resolve", "parameters": {"category_query": "humidifier", "marketplace": "US"}},
+            result=payload,
+            compact_result=payload,
+        )
+        snapshot = harness.session_snapshot()
+        self.assertEqual(str(snapshot["last_category_id"]), "12345")
+        self.assertEqual(snapshot["last_category_path"], "Home > Humidifiers")
+
+    def test_repair_fills_candidate_pool_from_session_for_followup_tool(self) -> None:
+        harness, _ = self._harness()
+        harness.after_tool_observation(
+            tool_call={"name": "resolve_candidates", "parameters": {"product_query": "humidifier", "marketplace": "US"}},
+            result=json.dumps(
+                {"success": True, "data": {"candidate_pool_id": "pool-1", "candidate_asins": ["B001ABCD12", "B002EFGH34"]}}
+            ),
+            compact_result="ok",
+        )
+        repaired = harness.repair_tool_call_required_arguments(
+            {"name": "candidate_pool_stats", "parameters": {}},
+            lambda tool_name, parameters: {},
+            lambda tool_name, parameters: {"name": tool_name, "parameters": parameters},
+        )
+        self.assertIsNotNone(repaired)
+        params = repaired["parameters"]
+        self.assertEqual(params.get("candidate_pool_id"), "pool-1")
+        self.assertEqual(params.get("product_query"), "humidifier")
+        self.assertEqual(params.get("marketplace"), "US")
+        self.assertIn("B001ABCD12", str(params.get("candidate_asins", "")))
+
+
+class AgentMultiTurnSessionMemoryTests(unittest.TestCase):
+    def make_pipeline(self) -> xiamimate.Pipeline:
+        pipe = xiamimate.Pipeline()
+        pipe.agent_tools = FakeAgentTools()
+        pipe._charge_billing_event = lambda **kwargs: {"points_charged": 0}
+        pipe._refund_billing_event = lambda **kwargs: None
+        return pipe
+
+    def test_second_turn_reuses_candidate_pool_via_session_memory(self) -> None:
+        pipe = self.make_pipeline()
+        pipe._classify_agent_scene = lambda messages, mode="agent": "theme_analysis"
+
+        # Turn 1: resolve_candidates establishes the pool.
+        executed_turn1: list[dict] = []
+
+        def plan_turn1(**kwargs) -> dict:
+            return {
+                "scene": "theme_analysis",
+                "answer_ready": False,
+                "final_answer": "",
+                "reasoning_summary": "解析候选池",
+                "steps": [
+                    {
+                        "tool_call": {
+                            "name": "resolve_candidates",
+                            "parameters": {"product_query": "humidifier", "marketplace": "US"},
+                        },
+                        "goal": "建立候选池",
+                        "required": True,
+                    }
+                ],
+                "stop_reason": "等候选池",
+            }
+
+        def exec_turn1(tool_call: dict, billing_context: dict, truncate: bool = True) -> str:
+            executed_turn1.append(copy.deepcopy(tool_call))
+            return json.dumps(
+                {
+                    "success": True,
+                    "data": {
+                        "candidate_pool_id": "pool-shared",
+                        "candidate_asins": ["B001ABCD12", "B002EFGH34", "B003IJKL56"],
+                        "candidate_pool_size": 3,
+                    },
+                },
+                ensure_ascii=False,
+            )
+
+        pipe._plan_agent_next_steps = plan_turn1
+        pipe._execute_tool_call = exec_turn1
+        pipe._synthesize_planner_executor_answer = lambda **kwargs: "候选池已建立。"
+
+        pipe._ensure_agent_harness({"chat_id": "chat-multi-1"})
+        pipe._run_agent_loop(
+            messages=[{"role": "user", "content": "/tool 解析 humidifier 候选池"}],
+            body={"chat_id": "chat-multi-1"},
+            billing_context={"api_key": "test"},
+            model_name="deepseek-v4-pro",
+            mode="agent",
+        )
+
+        snapshot = pipe._session_snapshot()
+        self.assertEqual(snapshot["last_candidate_pool"]["pool_id"], "pool-shared")
+        self.assertEqual(snapshot["last_product_query"], "humidifier")
+
+        # Turn 2: same chat_id, planner asks for candidate_pool_stats with empty params.
+        executed_turn2: list[dict] = []
+        plan_turn2_calls: list[int] = []
+
+        def plan_turn2(**kwargs) -> dict:
+            plan_turn2_calls.append(1)
+            observed = kwargs.get("tool_observations") or []
+            if observed:
+                return {
+                    "scene": "theme_analysis",
+                    "answer_ready": True,
+                    "final_answer": "pool stats 已分析。",
+                    "reasoning_summary": "已得到 stats",
+                    "steps": [],
+                    "stop_reason": "done",
+                }
+            return {
+                "scene": "theme_analysis",
+                "answer_ready": False,
+                "final_answer": "",
+                "reasoning_summary": "继续查看 pool stats",
+                "steps": [
+                    {
+                        "tool_call": {
+                            "name": "candidate_pool_stats",
+                            "parameters": {},
+                        },
+                        "goal": "看 pool stats",
+                        "required": True,
+                    }
+                ],
+                "stop_reason": "看完作答",
+            }
+
+        def exec_turn2(tool_call: dict, billing_context: dict, truncate: bool = True) -> str:
+            executed_turn2.append(copy.deepcopy(tool_call))
+            return json.dumps({"success": True, "data": {"avg_price": 35.0}}, ensure_ascii=False)
+
+        pipe._plan_agent_next_steps = plan_turn2
+        pipe._execute_tool_call = exec_turn2
+        pipe._synthesize_planner_executor_answer = lambda **kwargs: "pool stats 已分析。"
+        pipe._ensure_agent_harness({"chat_id": "chat-multi-1"})
+
+        answer = pipe._run_agent_loop(
+            messages=[{"role": "user", "content": "继续跑 candidate_pool_stats"}],
+            body={"chat_id": "chat-multi-1"},
+            billing_context={"api_key": "test"},
+            model_name="deepseek-v4-pro",
+            mode="agent",
+        )
+
+        self.assertEqual(len(executed_turn2), 1)
+        self.assertEqual(executed_turn2[0]["name"], "candidate_pool_stats")
+        params = executed_turn2[0]["parameters"]
+        self.assertEqual(params.get("candidate_pool_id"), "pool-shared")
+        self.assertEqual(params.get("product_query"), "humidifier")
+        self.assertIn("B001ABCD12", str(params.get("candidate_asins", "")))
+        self.assertIn("pool stats", answer)
+
+    def test_planner_payload_includes_session_memory_snapshot(self) -> None:
+        pipe = self.make_pipeline()
+        pipe._ensure_agent_harness({"chat_id": "chat-session-mem"})
+        pipe.agent_harness.after_tool_observation(
+            tool_call={"name": "resolve_candidates", "parameters": {"product_query": "humidifier", "marketplace": "US"}},
+            result=json.dumps(
+                {"success": True, "data": {"candidate_pool_id": "pool-A", "candidate_asins": ["B001ABCD12"]}}
+            ),
+            compact_result="ok",
+        )
+
+        class _StubProvider:
+            def filter_payload(self, body: dict) -> dict:
+                return {}
+
+        pipe._get_provider = lambda model_name: _StubProvider()
+        pipe._insert_agent_memory_profile_message = lambda messages, profile: None
+
+        payload = pipe._prepare_agent_planner_payload(
+            messages=[{"role": "user", "content": "继续"}],
+            body={"chat_id": "chat-session-mem"},
+            mode="agent",
+            model_name="deepseek-v4-pro",
+            scene="theme_analysis",
+            tool_observations=[],
+            remaining_rounds=3,
+        )
+        last_user = next((m for m in reversed(payload["messages"]) if m.get("role") == "user"), None)
+        self.assertIsNotNone(last_user)
+        content = last_user["content"]
+        self.assertIn("session_memory", content)
+        self.assertIn("pool-A", content)
+        # already_observed_tools should include resolve_candidates because the session
+        # already has a candidate pool, even though this request has zero observations.
+        planner_payload = json.loads(content)
+        self.assertIn("resolve_candidates", planner_payload.get("already_observed_tools", []))
+
+    def test_third_turn_drops_redundant_resolve_candidates_from_planner_steps(self) -> None:
+        pipe = self.make_pipeline()
+        pipe._ensure_agent_harness({"chat_id": "chat-third-turn"})
+        # Seed session with a pool from a prior turn.
+        pipe.agent_harness.after_tool_observation(
+            tool_call={"name": "resolve_candidates", "parameters": {"product_query": "humidifier", "marketplace": "US"}},
+            result=json.dumps(
+                {"success": True, "data": {"candidate_pool_id": "pool-T3", "candidate_asins": ["B001ABCD12"]}}
+            ),
+            compact_result="ok",
+        )
+
+        # Planner emits resolve_candidates first (wrong) followed by trends/top_asin (correct).
+        steps = [
+            {"tool_call": {"name": "resolve_candidates", "parameters": {"product_query": "humidifier", "marketplace": "US"}}},
+            {"tool_call": {"name": "candidate_pool_trends", "parameters": {"candidate_pool_id": "pool-T3"}}},
+            {"tool_call": {"name": "top_asin_drilldown", "parameters": {"candidate_pool_id": "pool-T3"}}},
+        ]
+        filtered = pipe.agent_harness.filter_redundant_planner_steps(steps, "theme_analysis", [])
+        kept_names = [s["tool_call"]["name"] for s in filtered]
+        self.assertNotIn("resolve_candidates", kept_names)
+        self.assertIn("candidate_pool_trends", kept_names)
+        self.assertIn("top_asin_drilldown", kept_names)
+
+    def test_cross_turn_dedup_by_fingerprint_for_any_analysis_tool(self) -> None:
+        """通用机制：任何工具只要 (tool_name + 参数) 跨轮重复，executor 都应跳过；参数变了则放行。"""
+        pipe = self.make_pipeline()
+        pipe._ensure_agent_harness({"chat_id": "chat-generic-dedup"})
+        # Seed: 上一轮已经跑过 trends 和 top_asin_drilldown
+        pipe.agent_harness.after_tool_observation(
+            tool_call={"name": "candidate_pool_trends", "parameters": {"candidate_pool_id": "p1", "window_days": 30}},
+            result=json.dumps({"success": True, "data": {"trend_phase": "flat"}}),
+            compact_result="trends-flat",
+        )
+        pipe.agent_harness.after_tool_observation(
+            tool_call={"name": "top_asin_drilldown", "parameters": {"candidate_pool_id": "p1", "top_n": 5}},
+            result=json.dumps({"success": True, "data": {"top_asins": []}}),
+            compact_result="top-asin-summary",
+        )
+
+        # 第四轮 planner 又把同参数的 trends + top_asin_drilldown 拍上来，并新增了 weak_forecast
+        steps = [
+            {"tool_call": {"name": "candidate_pool_trends", "parameters": {"candidate_pool_id": "p1", "window_days": 30}}},  # dup
+            {"tool_call": {"name": "top_asin_drilldown", "parameters": {"candidate_pool_id": "p1", "top_n": 5}}},  # dup
+            {"tool_call": {"name": "candidate_pool_trends", "parameters": {"candidate_pool_id": "p1", "window_days": 90}}},  # 参数不同，应保留
+            {"tool_call": {"name": "candidate_pool_weak_forecast", "parameters": {"candidate_pool_id": "p1"}}},  # 全新
+        ]
+        filtered = pipe.agent_harness.filter_redundant_planner_steps(steps, "theme_analysis", [])
+        kept = [(s["tool_call"]["name"], s["tool_call"]["parameters"].get("window_days")) for s in filtered]
+        # 重复的 (trends, 30) 与 (top_asin_drilldown, top_n=5) 应被丢掉
+        self.assertNotIn(("candidate_pool_trends", 30), kept)
+        # 同名但 window_days=90 必须保留
+        self.assertIn(("candidate_pool_trends", 90), kept)
+        # 全新工具必须保留
+        self.assertIn("candidate_pool_weak_forecast", [n for n, _ in kept])
+        # top_asin_drilldown 同参数应被丢掉
+        self.assertNotIn("top_asin_drilldown", [n for n, _ in kept])
+
+
 if __name__ == "__main__":
     unittest.main()

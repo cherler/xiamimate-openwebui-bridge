@@ -346,6 +346,7 @@ class Pipeline:
         self.type = "manifold"
         self.id = os.getenv("XIAMIMATE_MODEL_PREFIX", "xiamimate")
         self.name = "XiaMimate: "
+        self._last_chat_id = None
         self.agent_harness = agent_harness.AgentHarness()
         self.agent_tools = self._load_agent_tools()
         self.valves = self.Valves(
@@ -371,6 +372,24 @@ class Pipeline:
         )
         self._help_answer_cache: Dict[str, dict] = {}
         self.pipelines = self._build_agent_pipelines()
+    def _ensure_agent_harness(self, body: dict):
+        # mode_router 的 inlet 会把 metadata.chat_id 复制到 body['chat_id']，
+        # 这里依然兼容直接出现在 body 根的情况。
+        metadata = body.get("metadata") if isinstance(body, dict) else None
+        chat_id = str(body.get("chat_id") or "").strip()
+        if not chat_id and isinstance(metadata, dict):
+            chat_id = str(metadata.get("chat_id") or "").strip()
+        chat_id = chat_id or None
+        if chat_id != self._last_chat_id or self.agent_harness is None:
+            try:
+                self.agent_harness = agent_harness.AgentHarness(chat_id=chat_id)
+            except TypeError:
+                # 兼容旧构造
+                self.agent_harness = agent_harness.AgentHarness()
+            self._last_chat_id = chat_id
+        if self.agent_harness is None:
+            self.agent_harness = agent_harness.AgentHarness()
+        return self.agent_harness
 
     async def on_startup(self):
         print("on_startup:xiamimate")
@@ -539,6 +558,7 @@ class Pipeline:
         if mode == "web":
             return self._run_web_search(query=normalized_user_message, body=body, model=response_model, model_name=agent_model_name)
         if mode in {"agent", "tool"}:
+            self._ensure_agent_harness(body)
             return self._run_agent(
                 messages=normalized_messages,
                 body=body,
@@ -5485,19 +5505,44 @@ class Pipeline:
         return self.agent_harness.filter_redundant_planner_steps(steps, scene, tool_observations)
 
     def _infer_theme_product_query(self, messages: List[dict]) -> str:
-        text = self._extract_last_user_text(messages).strip()
-        if not text:
-            return ""
         patterns = (
             r"(?:评估|分析|判断|研究|拆解|看看|看一下)\s+([^，。！？\n]{2,90}?)\s+在\s+",
             r"^\s*([A-Za-z][A-Za-z0-9 &+\-/]{1,70})\s+在\s+",
             r"(?:评估|分析|判断|研究|拆解)\s+([A-Za-z][A-Za-z0-9 &+\-/]{1,70})",
         )
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if match:
-                return str(match.group(1) or "").strip(" ：:，,。")[:120]
-        return ""
+        user_texts: List[str] = []
+        for msg in reversed(messages or []):
+            if not isinstance(msg, dict):
+                continue
+            if str(msg.get("role") or "").lower() != "user":
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_part = str(part.get("text") or "").strip()
+                        if text_part:
+                            user_texts.append(text_part)
+            else:
+                text_part = str(content or "").strip()
+                if text_part:
+                    user_texts.append(text_part)
+            if len(user_texts) >= 6:
+                break
+        for text in user_texts:
+            for pattern in patterns:
+                match = re.search(pattern, text, flags=re.IGNORECASE)
+                if match:
+                    return str(match.group(1) or "").strip(" ：:，,。")[:120]
+        snapshot = self._session_snapshot()
+        fallback = str(snapshot.get("last_product_query") or "").strip()
+        return fallback[:120] if fallback else ""
+
+    def _session_snapshot(self) -> Dict[str, Any]:
+        try:
+            return self.agent_harness.session_snapshot()
+        except AttributeError:
+            return {}
 
     def _explicit_tool_name_from_text(self, text: str) -> str:
         return self.agent_harness.explicit_tool_name_from_text(text)
@@ -5655,6 +5700,10 @@ class Pipeline:
     ) -> List[dict]:
         if scene != "theme_analysis" or "resolve_candidates" in set(self._observed_tool_names(tool_observations)):
             return steps
+        session_snapshot = self._session_snapshot() or {}
+        existing_pool = session_snapshot.get("last_candidate_pool") if isinstance(session_snapshot, dict) else None
+        if isinstance(existing_pool, dict) and existing_pool.get("pool_id"):
+            return steps
         for step in steps or []:
             if str(((step or {}).get("tool_call") or {}).get("name") or "").strip() == "resolve_candidates":
                 repaired_step = self._repair_theme_resolve_step(step, messages, body)
@@ -5686,6 +5735,22 @@ class Pipeline:
             planner_messages,
             body.get("_xiamimate_memory_profile") if isinstance(body, dict) else None,
         )
+        session_snapshot = self._session_snapshot() or {}
+        observed_tools = list(self._observed_tool_names(tool_observations))
+        # 跨轮已持久化的 prerequisite 工具（候选池/类目）必须以 already_observed 形式告诉 planner，
+        # 否则 planner 在新一轮请求里看不到本次 tool_observations，会重新规划 resolve_candidates。
+        executed_signatures: list[str] = []
+        if isinstance(session_snapshot, dict):
+            pool = session_snapshot.get("last_candidate_pool") if isinstance(session_snapshot.get("last_candidate_pool"), dict) else None
+            if pool and pool.get("pool_id") and "resolve_candidates" not in observed_tools:
+                observed_tools.append("resolve_candidates")
+            if (session_snapshot.get("last_category_id") or session_snapshot.get("last_category_path")) and "category_resolve" not in observed_tools:
+                observed_tools.append("category_resolve")
+            for entry in session_snapshot.get("recent_tool_calls") or []:
+                tn = (entry or {}).get("tool_name")
+                fp = (entry or {}).get("params_fingerprint")
+                if tn and fp:
+                    executed_signatures.append(f"{tn}::{fp}")
         planner_messages.append(
             {
                 "role": "user",
@@ -5696,10 +5761,22 @@ class Pipeline:
                         "scene_hint": scene,
                         "scene_policy": self._scene_policy(scene, mode),
                         "allowed_tools": self._planner_tool_catalog(scene, mode),
-                        "already_observed_tools": self._observed_tool_names(tool_observations),
+                        "already_observed_tools": observed_tools,
+                        "executed_tool_signatures": executed_signatures,
                         "previous_tool_observations": self._planner_observation_context(tool_observations),
+                        "session_memory": session_snapshot,
                         "remaining_rounds": remaining_rounds,
-                        "planner_note": "如果已有工具足够回答，请返回 action.type=final 和 final_answer；不要重复调用 already_observed_tools 中的工具。如果需要工具，只返回一个 action.type=tool 的下一步动作，不要一次性规划完整路线。",
+                        "planner_note": (
+                            "session_memory 是同一对话之前已成功执行的工具产物（候选池/类目/各分析工具的最近结果），可直接复用。"
+                            "通用跨轮去重规则：如果你要规划的工具调用 (tool_name + 参数) 完全匹配 executed_tool_signatures 中已有的签名，"
+                            "请不要重复执行——直接从 session_memory.recent_tool_calls 取既有 summary，"
+                            "或者基于已有产物给出 final_answer。"
+                            "仅当用户明确要求『重新跑/刷新/换 window/换 marketplace 等不同参数』时才允许用不同入参重跑同名工具。"
+                            "对于 resolve_candidates / category_resolve 这类只负责获取候选池/类目句柄的 prerequisite 工具，"
+                            "只要 session_memory.last_candidate_pool.pool_id 或 last_category_id 已存在，就视为已完成，禁止再次调用。"
+                            "如果已有工具足够回答，请返回 action.type=final 和 final_answer。"
+                            "如果需要继续执行新的工具，只返回一个 action.type=tool 的下一步动作，不要一次性规划完整路线。"
+                        ),
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -5720,25 +5797,49 @@ class Pipeline:
         text = str(value or "").strip()
         if not text:
             return None
-        try:
-            return json.loads(text)
-        except ValueError:
-            pass
+
+        def _try_load(raw: str):
+            raw = raw.strip()
+            if not raw:
+                return None
+            for attempt in (raw, raw.replace("\r\n", "\n")):
+                try:
+                    return json.loads(attempt)
+                except ValueError:
+                    pass
+            # 容忍字符串值中未转义的换行/制表符（LLM 经常这么干）
+            try:
+                return json.loads(raw, strict=False)
+            except ValueError:
+                return None
+
+        loaded = _try_load(text)
+        if loaded is not None:
+            return loaded
 
         fenced_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, flags=re.IGNORECASE)
         if fenced_match:
-            try:
-                return json.loads(fenced_match.group(1).strip())
-            except ValueError:
-                pass
+            loaded = _try_load(fenced_match.group(1))
+            if loaded is not None:
+                return loaded
 
         start = text.find("{")
         end = text.rfind("}")
         if start >= 0 and end > start:
-            try:
-                return json.loads(text[start : end + 1])
-            except ValueError:
-                return None
+            loaded = _try_load(text[start : end + 1])
+            if loaded is not None:
+                return loaded
+
+        # 最后兜底：如果文本明显是 planner JSON（包含 action/final_answer 关键字），
+        # 用正则提取 final_answer 字符串，避免把原始 JSON 当作最终回答吐给用户。
+        if re.search(r'"action"\s*:|"final_answer"\s*:', text):
+            m = re.search(r'"final_answer"\s*:\s*"((?:\\.|[^"\\])*)"', text, flags=re.DOTALL)
+            if m:
+                try:
+                    final_answer = json.loads('"' + m.group(1) + '"')
+                except ValueError:
+                    final_answer = m.group(1).encode("utf-8", "ignore").decode("unicode_escape", "ignore")
+                return {"action": {"type": "final", "final_answer": final_answer}}
         return None
 
     def _tool_call_allowed_for_scene(self, tool_call: Dict[str, Any], scene: str, mode: str = "agent") -> bool:
@@ -7633,12 +7734,22 @@ class Pipeline:
         return result_text
 
     def _build_tool_observation(self, tool_call: Dict[str, Any], result: str) -> dict:
-        return {
+        observation = {
             "tool_name": str(tool_call.get("name") or ""),
             "arguments": tool_call.get("parameters") or {},
             "raw_result": str(result or ""),
             "llm_result": self._format_tool_result_for_llm(tool_name=str(tool_call.get("name") or ""), result=result),
         }
+        try:
+            if not self._tool_result_has_error(observation["raw_result"]):
+                self.agent_harness.after_tool_observation(
+                    tool_call=tool_call,
+                    result=observation["raw_result"],
+                    compact_result=observation["llm_result"],
+                )
+        except Exception as exc:  # noqa: BLE001
+            print("xiamimate.agent session-context update failed:", repr(exc))
+        return observation
 
     def _format_tool_result_for_llm(self, tool_name: str, result: str, budget: int = 9000) -> str:
         result_text = str(result or "").strip()

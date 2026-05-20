@@ -46,6 +46,14 @@ class Pipeline:
         print("on_shutdown:xiamimate_mode_router")
 
     async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
+        # OpenWebUI 会在转发给 pipelines server 之前 pop 掉 body['metadata']，
+        # 但 chat_id 对多轮 session 复用是必需的，必须在 inlet 这一步固化到 body 根级。
+        metadata = body.get("metadata") if isinstance(body, dict) else None
+        if isinstance(metadata, dict):
+            chat_id_from_meta = str(metadata.get("chat_id") or "").strip()
+            if chat_id_from_meta and not body.get("chat_id"):
+                body["chat_id"] = chat_id_from_meta
+
         if body.get("title"):
             return body
 

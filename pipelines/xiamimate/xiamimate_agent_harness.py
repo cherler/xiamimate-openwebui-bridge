@@ -1,12 +1,171 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import threading
 import time
 import uuid
+from collections import OrderedDict
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+
+def tool_call_fingerprint(parameters: Any) -> str:
+    """生成参数的稳定指纹，用于跨轮判断"同一个工具是否已用相同入参执行过"。"""
+    if parameters is None:
+        return "none"
+    if isinstance(parameters, str):
+        canonical = parameters
+    else:
+        try:
+            canonical = json.dumps(parameters, ensure_ascii=False, sort_keys=True, default=str)
+        except Exception:
+            canonical = str(parameters)
+    return hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:12]
+
+
+def _summarize_parameters(parameters: Any, limit: int = 240) -> str:
+    if parameters is None:
+        return ""
+    try:
+        text = json.dumps(parameters, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        text = str(parameters)
+    if len(text) > limit:
+        text = text[: limit - 1] + "…"
+    return text
+
+
+class SessionContextStore:
+    """跨轮会话级结构化上下文。
+
+    设计目标：解决 ReAct harness 在多轮对话中无法复用前轮工具结构化结果的问题。
+    ObservationStore 每次 HTTP 请求重建，但同一 `chat_id` 的多轮对话需要复用：
+    - 上一轮 resolve_candidates 生成的候选池 (pool_id / asins / size / leaf_categories)
+    - 最近一次明确的 product_query / marketplace
+    - 最近一次 category_resolve 出的 category_id / category_path
+    - 各工具最近一次的 compact result（仅作为 planner 提示，不进入参数）
+
+    进程内 TTL + LRU；bridge 重启后丢失（可接受，后续可外置 Redis）。
+    """
+
+    def __init__(
+        self,
+        ttl_seconds: int = 2 * 60 * 60,
+        max_sessions: int = 512,
+        max_tool_result_chars: int = 1200,
+        max_tool_results: int = 8,
+    ):
+        self.ttl_seconds = max(60, int(ttl_seconds or 7200))
+        self.max_sessions = max(1, int(max_sessions or 512))
+        self.max_tool_result_chars = max(200, int(max_tool_result_chars or 1200))
+        self.max_tool_results = max(1, int(max_tool_results or 8))
+        self._sessions: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        self._lock = threading.RLock()
+
+    def _evict_expired(self, now: float) -> None:
+        expired = [key for key, entry in self._sessions.items() if now - entry.get("_touched_at", 0) > self.ttl_seconds]
+        for key in expired:
+            self._sessions.pop(key, None)
+
+    def _evict_lru(self) -> None:
+        while len(self._sessions) > self.max_sessions:
+            self._sessions.popitem(last=False)
+
+    def get(self, chat_id: Optional[str]) -> Dict[str, Any]:
+        key = str(chat_id or "").strip()
+        if not key:
+            return {}
+        now = time.time()
+        with self._lock:
+            self._evict_expired(now)
+            entry = self._sessions.get(key)
+            if entry is None:
+                return {}
+            self._sessions.move_to_end(key)
+            entry["_touched_at"] = now
+            return {k: v for k, v in entry.items() if not k.startswith("_")}
+
+    def update(self, chat_id: Optional[str], updates: Dict[str, Any]) -> None:
+        key = str(chat_id or "").strip()
+        if not key or not isinstance(updates, dict) or not updates:
+            return
+        now = time.time()
+        with self._lock:
+            self._evict_expired(now)
+            entry = self._sessions.get(key)
+            if entry is None:
+                entry = {"_created_at": now}
+                self._sessions[key] = entry
+            else:
+                self._sessions.move_to_end(key)
+            for field_name, field_value in updates.items():
+                if field_value is None or field_name.startswith("_"):
+                    continue
+                entry[field_name] = field_value
+            entry["_touched_at"] = now
+            self._evict_lru()
+
+    def record_tool_result(
+        self,
+        chat_id: Optional[str],
+        tool_name: str,
+        compact_result: str,
+        parameters: Any = None,
+    ) -> None:
+        key = str(chat_id or "").strip()
+        normalized_tool = str(tool_name or "").strip()
+        if not key or not normalized_tool:
+            return
+        truncated = str(compact_result or "")
+        if len(truncated) > self.max_tool_result_chars:
+            truncated = truncated[: self.max_tool_result_chars] + "...(truncated)"
+        fingerprint = tool_call_fingerprint(parameters)
+        params_preview = _summarize_parameters(parameters)
+        composite_key = f"{normalized_tool}::{fingerprint}"
+        now = time.time()
+        with self._lock:
+            self._evict_expired(now)
+            entry = self._sessions.get(key)
+            if entry is None:
+                entry = {"_created_at": now}
+                self._sessions[key] = entry
+            else:
+                self._sessions.move_to_end(key)
+            tool_calls = entry.get("last_tool_calls")
+            if not isinstance(tool_calls, OrderedDict):
+                tool_calls = OrderedDict()
+                entry["last_tool_calls"] = tool_calls
+            if composite_key in tool_calls:
+                tool_calls.move_to_end(composite_key)
+            tool_calls[composite_key] = {
+                "tool_name": normalized_tool,
+                "params_fingerprint": fingerprint,
+                "params_preview": params_preview,
+                "summary": truncated,
+                "recorded_at": now,
+            }
+            while len(tool_calls) > self.max_tool_results:
+                tool_calls.popitem(last=False)
+            entry["_touched_at"] = now
+            self._evict_lru()
+
+    def clear(self, chat_id: Optional[str]) -> None:
+        key = str(chat_id or "").strip()
+        if not key:
+            return
+        with self._lock:
+            self._sessions.pop(key, None)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._sessions.clear()
+
+
+SESSION_CONTEXT = SessionContextStore()
+
 
 
 AGENT_PLANNER_SYSTEM_PROMPT = """你是 XiaMimate 的 ReAct Planner，负责在每一轮只决定下一步动作。
@@ -44,6 +203,9 @@ JSON 结构：
 - 只可从给定 allowed_tools 中选择工具。
 - 不要编造工具参数；拿不准时先选择前置工具，或直接回答并说明边界。
 - 不要一次性规划完整路线；每次只选择基于当前 Observation 最必要的下一步。
+- 当 session_memory.last_candidate_pool.pool_id 存在时，所有需要 candidate_pool_id 的工具必须原样复用该 pool_id；禁止凭空构造形如 "P-XXXX" 的 pool_id。
+- 当 session_memory.last_candidate_pool 已经存在且本轮用户问题仍指向同一个商品主题/候选池时，禁止再次调用 resolve_candidates；改为直接使用已有 pool_id 进入下一步工具或直接作答。
+- 当历史轮次已经在 executed_tool_signatures 中记录过相同 (tool, parameters) 调用，禁止再次调用该工具；改为基于 session_memory 直接给出 final 答案。
 """
 
 TOOL_REQUIRED_ARGUMENTS = {
@@ -52,7 +214,7 @@ TOOL_REQUIRED_ARGUMENTS = {
     "candidate_pool_stats": ["candidate_pool_id", "candidate_asins", "product_query"],
     "candidate_pool_trends": ["candidate_pool_id", "candidate_asins", "product_query"],
     "category_benchmark": ["candidate_pool_id", "candidate_asins", "product_query", "benchmark_category_id", "benchmark_category_path"],
-    "top_asin_drilldown": ["asin", "asins", "candidate_pool_id"],
+    "top_asin_drilldown": ["asin", "asins", "candidate_pool_id", "product_query"],
     "asin_history_timeseries": ["asins"],
     "expand_candidates": ["product_query", "category_id", "category_path"],
     "candidate_expansion_status": ["job_id"],
@@ -182,7 +344,7 @@ SCENE_TOOL_POLICY = {
     "theme_analysis": {
         "label": "商品主题分析",
         "allowed_layers": ["analysis", "expansion", "foundation", "business"],
-        "max_rounds": 3,
+        "max_rounds": 6,
         "max_steps_per_round": 2,
     },
     "asin_specific_analysis": {
@@ -483,10 +645,243 @@ class SynthesisRunner:
         return context
 
 
+_CANDIDATE_POOL_HANDLES = {
+    "candidate_pool_stats",
+    "candidate_pool_trends",
+    "candidate_pool_weak_forecast",
+    "category_benchmark",
+    "top_asin_drilldown",
+    "product_forecast_explain",
+    "expand_candidates",
+}
+
+
+def _coerce_payload(result: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(result, dict):
+        return result
+    text = str(result or "").strip()
+    if not text:
+        return None
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
+    if fenced:
+        text = fenced.group(1)
+    else:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            text = text[start : end + 1]
+    try:
+        loaded = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _normalize_asin_list(value: Any) -> List[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        items = re.split(r"[\s,\u3001]+", value)
+    elif isinstance(value, (list, tuple, set)):
+        items: List[str] = []
+        for entry in value:
+            if isinstance(entry, dict):
+                asin = str(entry.get("asin") or entry.get("ASIN") or "").strip()
+                if asin:
+                    items.append(asin)
+            else:
+                items.append(str(entry or "").strip())
+    else:
+        return []
+    seen: List[str] = []
+    seen_set: set[str] = set()
+    for raw in items:
+        candidate = raw.strip().upper()
+        if not candidate or candidate in seen_set:
+            continue
+        if re.fullmatch(r"[A-Z0-9]{8,14}", candidate):
+            seen.append(candidate)
+            seen_set.add(candidate)
+    return seen
+
+
+def _extract_candidate_pool(payload: Dict[str, Any]) -> Dict[str, Any]:
+    nested_keys = ("candidate_pool", "pool", "data", "result")
+    sources: List[Dict[str, Any]] = [payload]
+    for key in nested_keys:
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            sources.append(nested)
+    pool_id = ""
+    asins: List[str] = []
+    size: Optional[int] = None
+    leaf_categories: Any = None
+    for source in sources:
+        if not pool_id:
+            for pid_key in ("candidate_pool_id", "pool_id", "id"):
+                value = source.get(pid_key)
+                if value:
+                    pool_id = str(value).strip()
+                    break
+        if not asins:
+            for asin_key in ("candidate_asins", "asins", "asin_list"):
+                normalized = _normalize_asin_list(source.get(asin_key))
+                if normalized:
+                    asins = normalized
+                    break
+        if size is None:
+            for size_key in ("candidate_count", "pool_size", "size", "total"):
+                raw_size = source.get(size_key)
+                if isinstance(raw_size, (int, float)):
+                    size = int(raw_size)
+                    break
+        if leaf_categories is None:
+            leaf_categories = source.get("leaf_categories") or source.get("leaf_category_distribution")
+    if size is None and asins:
+        size = len(asins)
+    if not (pool_id or asins or size):
+        return {}
+    pool: Dict[str, Any] = {}
+    if pool_id:
+        pool["pool_id"] = pool_id
+    if asins:
+        pool["asins"] = asins[:30]
+    if size is not None:
+        pool["size"] = size
+    if leaf_categories:
+        if isinstance(leaf_categories, list):
+            pool["leaf_categories"] = leaf_categories[:5]
+        else:
+            pool["leaf_categories"] = leaf_categories
+    return pool
+
+
+def _extract_category_handle(payload: Dict[str, Any]) -> Dict[str, Any]:
+    sources: List[Dict[str, Any]] = [payload]
+    for key in ("data", "result", "category"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            sources.append(nested)
+    category_id = ""
+    category_path = ""
+    for source in sources:
+        if not category_id:
+            for cid_key in ("category_id", "id", "leaf_category_id"):
+                value = source.get(cid_key)
+                if value:
+                    category_id = str(value).strip()
+                    break
+        if not category_path:
+            for path_key in ("category_path", "path", "leaf_category_path"):
+                value = source.get(path_key)
+                if value:
+                    if isinstance(value, list):
+                        category_path = " > ".join(str(item) for item in value if item)
+                    else:
+                        category_path = str(value).strip()
+                    break
+    handle: Dict[str, Any] = {}
+    if category_id:
+        handle["category_id"] = category_id
+    if category_path:
+        handle["category_path"] = category_path
+    return handle
+
+
 class AgentHarness:
-    def __init__(self, registry: Optional[ToolRegistry] = None):
+    def __init__(
+        self,
+        registry: Optional[ToolRegistry] = None,
+        chat_id: Optional[str] = None,
+        session_store: Optional[SessionContextStore] = None,
+    ):
         self.registry = registry or ToolRegistry()
         self.synthesis_runner = SynthesisRunner()
+        self.chat_id = (str(chat_id).strip() if chat_id else "") or None
+        self.session_store = session_store or SESSION_CONTEXT
+
+    def session_snapshot(self) -> Dict[str, Any]:
+        if not self.chat_id:
+            return {}
+        snapshot = self.session_store.get(self.chat_id)
+        if not snapshot:
+            return {}
+        compact: Dict[str, Any] = {}
+        for key in ("last_product_query", "last_marketplace", "last_category_id", "last_category_path"):
+            value = snapshot.get(key)
+            if value:
+                compact[key] = value
+        pool = snapshot.get("last_candidate_pool")
+        if isinstance(pool, dict) and pool:
+            compact["last_candidate_pool"] = {
+                "pool_id": pool.get("pool_id"),
+                "size": pool.get("size"),
+                "asins_preview": (pool.get("asins") or [])[:8],
+                "asins_total": len(pool.get("asins") or []),
+                "leaf_categories": pool.get("leaf_categories"),
+            }
+        tool_calls = snapshot.get("last_tool_calls")
+        if tool_calls:
+            recent = []
+            for _composite_key, entry in list(tool_calls.items())[-6:]:
+                if isinstance(entry, dict):
+                    recent.append(
+                        {
+                            "tool_name": entry.get("tool_name"),
+                            "params_fingerprint": entry.get("params_fingerprint"),
+                            "params_preview": entry.get("params_preview"),
+                            "summary": entry.get("summary"),
+                        }
+                    )
+            if recent:
+                compact["recent_tool_calls"] = recent
+                # 兼容旧字段：保留 recent_tool_results（tool_name + summary）
+                compact["recent_tool_results"] = [
+                    {"tool_name": item["tool_name"], "summary": item.get("summary")}
+                    for item in recent
+                ]
+        return compact
+
+    def after_tool_observation(
+        self,
+        tool_call: Dict[str, Any],
+        result: Any,
+        compact_result: str = "",
+    ) -> None:
+        if not self.chat_id:
+            return
+        tool_name = str((tool_call or {}).get("name") or "").strip()
+        if not tool_name:
+            return
+        parameters = (tool_call or {}).get("parameters") or {}
+        updates: Dict[str, Any] = {}
+
+        product_query = str(parameters.get("product_query") or "").strip()
+        if product_query:
+            updates["last_product_query"] = product_query
+        marketplace = str(parameters.get("marketplace") or "").strip()
+        if marketplace:
+            updates["last_marketplace"] = marketplace.upper()
+
+        payload = _coerce_payload(result)
+        if payload is not None:
+            if tool_name == "resolve_candidates":
+                pool = _extract_candidate_pool(payload)
+                if pool:
+                    if not pool.get("pool_id") and product_query:
+                        pool["product_query"] = product_query
+                    updates["last_candidate_pool"] = pool
+            if tool_name == "category_resolve":
+                handle = _extract_category_handle(payload)
+                if handle.get("category_id"):
+                    updates["last_category_id"] = handle["category_id"]
+                if handle.get("category_path"):
+                    updates["last_category_path"] = handle["category_path"]
+
+        if updates:
+            self.session_store.update(self.chat_id, updates)
+        if compact_result:
+            self.session_store.record_tool_result(self.chat_id, tool_name, compact_result, parameters=parameters)
 
     def new_observation_store(self) -> ObservationStore:
         return ObservationStore()
@@ -549,18 +944,49 @@ class AgentHarness:
         if not steps:
             return []
         single_execution_tools = self.scene_single_execution_tools(scene)
-        if not single_execution_tools:
-            return steps
-        already_seen = set(self.observed_tool_names(tool_observations))
+        already_seen_names = set(self.observed_tool_names(tool_observations))
+
+        # 通用跨轮去重：用 (tool_name, params_fingerprint) 作为唯一签名；
+        # session 里已经执行过完全相同入参的工具调用一律跳过，参数不同则放行（例如 trends 不同 window_days）。
+        session_signatures: set[str] = set()
+        session_prerequisite_tools: set[str] = set()
+        snapshot = self.session_snapshot() or {}
+        if isinstance(snapshot, dict):
+            for entry in snapshot.get("recent_tool_calls") or []:
+                tn = (entry or {}).get("tool_name")
+                fp = (entry or {}).get("params_fingerprint")
+                if tn and fp:
+                    session_signatures.add(f"{tn}::{fp}")
+            # 结构性兜底：prerequisite 工具的产物已在 session，无论参数是否略有差异都不应再跑
+            pool = snapshot.get("last_candidate_pool")
+            if isinstance(pool, dict) and pool.get("pool_id"):
+                session_prerequisite_tools.add("resolve_candidates")
+            if snapshot.get("last_category_id") or snapshot.get("last_category_path"):
+                session_prerequisite_tools.add("category_resolve")
+
         kept: List[dict] = []
-        planned_seen: set[str] = set()
+        planned_signatures: set[str] = set()
+        planned_names: set[str] = set()
         for step in steps:
-            tool_name = str(((step or {}).get("tool_call") or {}).get("name") or "").strip()
-            if tool_name in single_execution_tools and (tool_name in already_seen or tool_name in planned_seen):
+            tool_call = (step or {}).get("tool_call") or {}
+            tool_name = str(tool_call.get("name") or "").strip()
+            if not tool_name:
+                kept.append(step)
+                continue
+            fingerprint = tool_call_fingerprint(tool_call.get("parameters") or {})
+            signature = f"{tool_name}::{fingerprint}"
+            # 1) 跨轮同签名去重（通用）
+            if signature in session_signatures or signature in planned_signatures:
+                continue
+            # 2) 跨轮 prerequisite 句柄兜底（候选池/类目）
+            if tool_name in session_prerequisite_tools:
+                continue
+            # 3) 同一请求内 single-execution 工具按 tool_name 去重（保留原有语义）
+            if tool_name in single_execution_tools and (tool_name in already_seen_names or tool_name in planned_names):
                 continue
             kept.append(step)
-            if tool_name in single_execution_tools:
-                planned_seen.add(tool_name)
+            planned_signatures.add(signature)
+            planned_names.add(tool_name)
         return kept
 
     def tool_call_allowed_for_scene(self, tool_call: Dict[str, Any], scene: str, mode: str = "agent") -> bool:
@@ -630,10 +1056,29 @@ class AgentHarness:
         if not isinstance(tool_call, dict):
             return None
         tool_name = str(tool_call.get("name") or "").strip()
-        parameters = tool_call.get("parameters") if isinstance(tool_call.get("parameters"), dict) else {}
+        parameters = dict(tool_call.get("parameters") or {}) if isinstance(tool_call.get("parameters"), dict) else {}
+        snapshot = self.session_snapshot() if self.chat_id else {}
+        if snapshot:
+            if tool_name in _CANDIDATE_POOL_HANDLES:
+                pool = snapshot.get("last_candidate_pool") or {}
+                if pool.get("pool_id") and not str(parameters.get("candidate_pool_id") or "").strip():
+                    parameters["candidate_pool_id"] = pool["pool_id"]
+                if not parameters.get("candidate_asins"):
+                    asins_preview = pool.get("asins_preview") or []
+                    if asins_preview:
+                        parameters["candidate_asins"] = list(asins_preview)
+            if not str(parameters.get("product_query") or "").strip() and snapshot.get("last_product_query"):
+                parameters["product_query"] = snapshot["last_product_query"]
+            if not str(parameters.get("marketplace") or "").strip() and snapshot.get("last_marketplace"):
+                parameters["marketplace"] = snapshot["last_marketplace"]
+            if not str(parameters.get("category_id") or "").strip() and snapshot.get("last_category_id"):
+                parameters["category_id"] = snapshot["last_category_id"]
+            if not str(parameters.get("category_path") or "").strip() and snapshot.get("last_category_path"):
+                parameters["category_path"] = snapshot["last_category_path"]
         inferred = infer_required_arguments(tool_name, parameters) or {}
-        if not inferred and tool_call_has_required_arguments(tool_call):
-            return tool_call
+        if not inferred and tool_call_has_required_arguments({"name": tool_name, "parameters": parameters}):
+            normalized_existing = normalize_tool_call(tool_name, parameters)
+            return normalized_existing if normalized_existing is not None else {"name": tool_name, "parameters": parameters}
         repaired_parameters = dict(parameters)
         for argument_name, argument_value in inferred.items():
             if not str(repaired_parameters.get(argument_name) or "").strip():

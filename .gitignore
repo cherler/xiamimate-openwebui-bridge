@@ -5,3 +5,7 @@ __pycache__/
 pipelines/failed/
 pipelines/*/valves.json
 .DS_Store
+.pytest_cache/
+.venv/
+.vscode/
+.recover-*/
