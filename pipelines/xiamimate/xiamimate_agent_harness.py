@@ -217,8 +217,6 @@ TOOL_REQUIRED_ARGUMENTS = {
     "candidate_pool_trends": ["candidate_pool_id", "candidate_asins", "product_query"],
     "category_benchmark": ["candidate_pool_id", "candidate_asins", "product_query", "benchmark_category_id", "benchmark_category_path"],
     "top_asin_drilldown": ["asin", "asins", "candidate_pool_id", "product_query"],
-    "asin_review_insights": ["asin", "asins", "candidate_asins", "candidate_pool_id", "product_query"],
-    "amazon_keyword_demand": ["keywords", "product_query"],
     "asin_history_timeseries": ["asins"],
     "expand_candidates": ["product_query", "category_id", "category_path"],
     "candidate_expansion_status": ["job_id"],
@@ -244,7 +242,6 @@ TOOL_NUMERIC_LIMITS = {
     "candidate_pool_slice": {"top_n": (1, 20)},
     "product_forecast_explain": {"top_n": (1, 20)},
     "top_asin_drilldown": {"top_n": (1, 20)},
-    "asin_review_insights": {"max_asins": (1, 20)},
 }
 
 
@@ -316,24 +313,6 @@ TOOL_LAYER_REGISTRY = {
         "layer": "analysis",
         "capability": "头部 ASIN 下钻分析",
         "scene_tags": ["theme_analysis", "general_agent"],
-    },
-    "asin_review_insights": {
-        "layer": "analysis",
-        "capability": "评论关键词、低分原因、正负面评论主题 provider 探针；未配置评论文本 provider 时必须返回能力缺口，禁止编造关键词",
-        "scene_tags": ["theme_analysis", "asin_specific_analysis", "general_agent"],
-        "requires_provider": "review_text_provider",
-        "provides": ["review_insights_when_provider_ready"],
-        "unsupported_claims": ["评论关键词", "差评关键词", "低分原因", "评论质量", "评论痛点", "差评集中"],
-        "fallback_alternatives": ["candidate_pool_slice.rating_distribution", "candidate_pool_slice.review_count_distribution", "top_asin_drilldown.rating_and_review_counts"],
-    },
-    "amazon_keyword_demand": {
-        "layer": "analysis",
-        "capability": "Amazon 关键词月搜索量/需求 provider 探针；未配置 ABA/第三方关键词量 provider 时必须返回能力缺口，禁止伪造搜索量",
-        "scene_tags": ["theme_analysis", "general_agent"],
-        "requires_provider": "amazon_keyword_volume_provider",
-        "provides": ["keyword_demand_when_provider_ready"],
-        "unsupported_claims": ["Amazon 月搜索量", "月搜索量", "ABA 排名", "Helium10 搜索量", "JungleScout 搜索量"],
-        "fallback_alternatives": ["candidate_pool_trends.google_trends_index", "candidate_pool_slice.sales_window_sum", "top_asin_drilldown.sales_and_review_counts"],
     },
     "asin_history_timeseries": {
         "layer": "analysis",
@@ -508,8 +487,6 @@ class ToolRegistry:
                 "candidate_pool_trends",
                 "candidate_pool_weak_forecast",
                 "top_asin_drilldown",
-                "asin_review_insights",
-                "amazon_keyword_demand",
                 "category_benchmark",
             }
         if scene == "blank_opportunity_discovery":
@@ -966,7 +943,6 @@ _CANDIDATE_POOL_HANDLES = {
     "candidate_pool_weak_forecast",
     "category_benchmark",
     "top_asin_drilldown",
-    "asin_review_insights",
     "product_forecast_explain",
     "expand_candidates",
 }

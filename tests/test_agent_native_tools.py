@@ -1401,8 +1401,9 @@ class AgentNativeToolTests(unittest.TestCase):
         allowed_tools = set(pipe._planner_allowed_tool_names("theme_analysis"))
 
         self.assertIn("candidate_pool_slice", allowed_tools)
-        self.assertIn("asin_review_insights", allowed_tools)
-        self.assertIn("amazon_keyword_demand", allowed_tools)
+        # asin_review_insights / amazon_keyword_demand 已从 agent 可见 registry 中下线
+        self.assertNotIn("asin_review_insights", allowed_tools)
+        self.assertNotIn("amazon_keyword_demand", allowed_tools)
 
     def test_candidate_pool_slice_aliases_and_top_n_preflight(self) -> None:
         pipe = self.make_pipeline()
@@ -1429,7 +1430,7 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertEqual(params["material_keywords"], "PLA")
         self.assertEqual(params["top_n"], 20)
 
-    def test_amazon_keyword_demand_keyword_aliases(self) -> None:
+    def test_amazon_keyword_demand_tool_is_downlisted(self) -> None:
         pipe = self.make_pipeline()
 
         normalized = pipe._normalize_tool_call(
@@ -1437,8 +1438,8 @@ class AgentNativeToolTests(unittest.TestCase):
             {"keyword_list": "carbon fiber PLA, matte PLA", "market": "amazon.com"},
         )
 
-        self.assertEqual(normalized["parameters"]["keywords"], "carbon fiber PLA, matte PLA")
-        self.assertEqual(normalized["parameters"]["marketplace"], "US")
+        # 已从 agent 可见工具中下线；planner 不应再被允许调用，规范化返回为 None 表示拒绝。
+        self.assertIsNone(normalized)
 
     def test_report_followup_questions_are_annotated_by_actionability(self) -> None:
         pipe = self.make_pipeline()
@@ -1546,15 +1547,11 @@ class AgentNativeToolTests(unittest.TestCase):
     def test_tool_layer_registry_exposes_machine_readable_boundaries(self) -> None:
         registry = xiamimate.agent_harness.TOOL_LAYER_REGISTRY
         slice_meta = registry["candidate_pool_slice"]
-        review_meta = registry["asin_review_insights"]
-        demand_meta = registry["amazon_keyword_demand"]
         self.assertFalse(slice_meta["requires_provider"])
         self.assertIn("rating_distribution", slice_meta["provides"])
-        self.assertEqual(review_meta["requires_provider"], "review_text_provider")
-        self.assertIn("评论关键词", review_meta["unsupported_claims"])
-        self.assertIn("candidate_pool_slice.rating_distribution", review_meta["fallback_alternatives"])
-        self.assertEqual(demand_meta["requires_provider"], "amazon_keyword_volume_provider")
-        self.assertIn("Amazon 月搜索量", demand_meta["unsupported_claims"])
+        # asin_review_insights / amazon_keyword_demand 已从 registry 中下线，不应再被读到。
+        self.assertNotIn("asin_review_insights", registry)
+        self.assertNotIn("amazon_keyword_demand", registry)
 
     def test_invalid_opportunity_expansion_falls_back_to_real_cards(self) -> None:
         pipe = self.make_pipeline()
@@ -2428,6 +2425,168 @@ class AgentMultiTurnSessionMemoryTests(unittest.TestCase):
         self.assertIn("candidate_pool_weak_forecast", [n for n, _ in kept])
         # top_asin_drilldown 同参数应被丢掉
         self.assertNotIn("top_asin_drilldown", [n for n, _ in kept])
+
+
+class DownlistedToolsAndPlannerJsonLeakGuardTests(unittest.TestCase):
+    """覆盖两件事：
+    1. asin_review_insights / amazon_keyword_demand 已从 agent 可见 registry 和 scene policy 中下线。
+    2. 当 planner LLM 把 planner 调度 JSON 当成文本返回时，harness 不会把这段 JSON 当 final_answer 吐给用户。
+    """
+
+    def _make_pipeline(self) -> xiamimate.Pipeline:
+        pipe = xiamimate.Pipeline()
+        pipe.agent_tools = FakeAgentTools()
+        pipe._charge_billing_event = lambda **kwargs: {"points_charged": 0}
+        pipe._refund_billing_event = lambda **kwargs: None
+        return pipe
+
+    def test_review_insights_and_keyword_demand_removed_from_agent_registry(self) -> None:
+        from xiamimate import agent_harness
+
+        self.assertNotIn("asin_review_insights", agent_harness.TOOL_LAYER_REGISTRY)
+        self.assertNotIn("amazon_keyword_demand", agent_harness.TOOL_LAYER_REGISTRY)
+        self.assertNotIn("asin_review_insights", agent_harness.ALLOWED_AGENT_TOOLS)
+        self.assertNotIn("amazon_keyword_demand", agent_harness.ALLOWED_AGENT_TOOLS)
+        self.assertNotIn("asin_review_insights", agent_harness.TOOL_REQUIRED_ARGUMENTS)
+        self.assertNotIn("amazon_keyword_demand", agent_harness.TOOL_REQUIRED_ARGUMENTS)
+        self.assertNotIn("asin_review_insights", agent_harness.TOOL_NUMERIC_LIMITS)
+
+        # 各 scene 的 single_execution_tools 也不再包含这两个工具
+        registry = agent_harness.ToolRegistry()
+        for scene in agent_harness.SCENE_TOOL_POLICY:
+            single = registry.single_execution_tools(scene)
+            self.assertNotIn("asin_review_insights", single, scene)
+            self.assertNotIn("amazon_keyword_demand", single, scene)
+
+    def test_planner_json_leak_is_quarantined_in_plan_step(self) -> None:
+        pipe = self._make_pipeline()
+        leaked_planner_json = json.dumps(
+            {
+                "scene": "theme_analysis",
+                "reasoning_summary": "已经拿到 stats，下一步切片",
+                "action": {
+                    "type": "tool",
+                    "tool": {
+                        "tool_name": "candidate_pool_slice",
+                        "goal": "按价格段切片",
+                        "parameters": {"candidate_pool_id": "pool-1", "top_n": 5},
+                    },
+                    "stop_reason": "切片完成后再判断是否继续",
+                },
+            },
+            ensure_ascii=False,
+        )
+        # 把 _extract_assistant_content 输出的 content 假装"已经无法解析为 JSON"——
+        # 用 _extract_json_value_from_text 返回 None 的替身来模拟解析失败
+        pipe._extract_json_value_from_text = lambda value: None
+        pipe._post_agent_payload = lambda payload, model_name: {
+            "choices": [{"message": {"role": "assistant", "content": leaked_planner_json}}]
+        }
+        plan = pipe._plan_agent_next_steps(
+            messages=[{"role": "user", "content": "继续切片"}],
+            body={},
+            model_name="minimax-m2",
+            mode="agent",
+            scene="theme_analysis",
+            tool_observations=[{"tool_name": "candidate_pool_stats", "result": "{}"}],
+            remaining_rounds=2,
+        )
+        self.assertFalse(plan["answer_ready"], plan)
+        self.assertEqual(plan["action_type"], "none")
+        self.assertEqual(plan["final_answer"], "")
+        self.assertEqual(plan["steps"], [])
+        self.assertEqual(plan.get("stop_reason"), "planner_json_leak_guard")
+
+    def test_planner_json_inside_final_answer_field_is_also_quarantined(self) -> None:
+        pipe = self._make_pipeline()
+        # 模型把整段 planner JSON 塞进 action.final_answer 字符串里
+        nested_leak = json.dumps(
+            {
+                "scene": "theme_analysis",
+                "action": {
+                    "type": "final",
+                    "final_answer": json.dumps(
+                        {
+                            "scene": "theme_analysis",
+                            "reasoning_summary": "...",
+                            "action": {
+                                "type": "tool",
+                                "tool": {"tool_name": "candidate_pool_slice", "parameters": {}},
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            },
+            ensure_ascii=False,
+        )
+        pipe._post_agent_payload = lambda payload, model_name: {
+            "choices": [{"message": {"role": "assistant", "content": nested_leak}}]
+        }
+        plan = pipe._plan_agent_next_steps(
+            messages=[{"role": "user", "content": "继续切片"}],
+            body={},
+            model_name="minimax-m2",
+            mode="agent",
+            scene="theme_analysis",
+            tool_observations=[{"tool_name": "candidate_pool_stats", "result": "{}"}],
+            remaining_rounds=2,
+        )
+        self.assertFalse(plan["answer_ready"], plan)
+        self.assertEqual(plan["action_type"], "none")
+        self.assertEqual(plan["final_answer"], "")
+        self.assertEqual(plan.get("stop_reason"), "planner_json_leak_guard")
+
+    def test_synthesize_planner_executor_answer_strips_planner_json_leak(self) -> None:
+        pipe = self._make_pipeline()
+        leaked = json.dumps(
+            {
+                "scene": "theme_analysis",
+                "reasoning_summary": "fallback should kick in",
+                "action": {"type": "tool", "tool": {"tool_name": "candidate_pool_slice", "parameters": {}}},
+            },
+            ensure_ascii=False,
+        )
+        pipe._post_agent_payload = lambda payload, model_name: {
+            "choices": [{"message": {"role": "assistant", "content": leaked}}]
+        }
+        # 当 _post_agent_payload 返回 planner JSON 时，合成器不能把它当成最终答案；
+        # 应该走 _fallback_answer_from_tool_observations 兜底。
+        observations = [
+            {
+                "tool_name": "candidate_pool_stats",
+                "result": json.dumps({"success": True, "data": {"pool_size": 12}}, ensure_ascii=False),
+            }
+        ]
+        answer = pipe._synthesize_planner_executor_answer(
+            messages=[{"role": "user", "content": "继续切片"}],
+            body={},
+            model_name="minimax-m2",
+            planner_notes=[],
+            tool_observations=observations,
+        )
+        self.assertNotIn('"scene"', answer)
+        self.assertNotIn('"action"', answer)
+        self.assertNotIn('"tool_name"', answer)
+
+    def test_looks_like_planner_json_recognizes_typical_envelopes(self) -> None:
+        pipe = self._make_pipeline()
+        positives = [
+            '{"scene":"theme_analysis","reasoning_summary":"x","action":{"type":"tool","tool":{"tool_name":"candidate_pool_slice","parameters":{}}}}',
+            '{"action":{"type":"final","final_answer":"x"}}',
+            '{"answer_ready":true,"final_answer":"x","steps":[],"action_type":"final"}',
+            '```json\n{"scene":"theme_analysis","action":{"type":"tool","tool":{"tool_name":"x","parameters":{}}}}\n```',
+        ]
+        for sample in positives:
+            self.assertTrue(pipe._looks_like_planner_json(sample), sample[:60])
+        negatives = [
+            "## 结论\n候选池规模 12，建议聚焦头部品牌。",
+            "这是一段普通中文回答，无 JSON 结构。",
+            "{ this is not json but starts with brace }",
+            "",
+        ]
+        for sample in negatives:
+            self.assertFalse(pipe._looks_like_planner_json(sample), sample[:60])
 
 
 if __name__ == "__main__":

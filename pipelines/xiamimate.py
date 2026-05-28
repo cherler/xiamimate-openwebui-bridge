@@ -69,7 +69,7 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 13. 只有当用户还没有给出明确商品主题/关键词/ASIN、在问“找机会/发现机会/某大类下有哪些细分方向/不知道分析什么”时，才调用 opportunity_discovery 输出机会卡片；机会卡片是继续分析入口，按机会编号深入分析时，沿用 opportunities_for_llm 中该编号的 next_action.request 继续调用 resolve_candidates，并以返回的 rank/title/category_path 作为上下文。若用户已经给出明确主题（例如“评估 car vacuum 在 Temu 美国站的机会”“分析 humidifier 在 Amazon US 是否值得做”），不要调用 opportunity_discovery，即使用户句子里出现“机会”二字，也应走主题分析：resolve_candidates -> candidate_pool_stats/candidate_pool_trends/category_benchmark/top_asin_drilldown，并按需要补充 search_knowledge_base 或 web_search。机会发现最终答复必须以逐机会卡片作为主答案；当用户要求 topN/机会卡片/逐卡分析时，每张卡片固定包含“机会理由 / 关键证据 / 风险或证据边界 / 下一步验证”，只展示用户请求数量，不得只返回工具表格。payload.opportunity_cards_text 中的总览表、字段解释和公式明细只能作为证据来源参考，不得替代主答案；不要丢列、改数值或补未返回的数值；同时遵守 payload.llm_summary_guidance/display_rules：保留同名主题隐藏提示；有 personalized_opportunity_score 时保留个性化分或说明排序口径；趋势展示优先使用 trend_momentum_display/trend_signal_status，不能把趋势缺失或近期为 0 简化成普通 -100%；next_action.requires_category_resolve=true 时必须提醒先 category_resolve 再做类目召回。
 14. 当用户明确询问销量预测、未来增长或“为什么模型看好/看空”时，优先调用 product_forecast_explain；不要把 candidate_pool_weak_forecast 的弱信号包装成正式模型预测。
 15. 不要把“用户问法”写成固定流程；按 tool_contract.capability 选择能回答问题的工具，按 evidence_contract 区分 tool_fact、derived_metric、default_assumption、hypothesis。涉及启动资金、盈亏平衡、单件利润、预算周期等计算时，调用 launch_budget_calculator，让工具产出公式和数值；最终答复可以自由组织，但必须把明确事实、计算结果、默认假设和商业判断分开。
-16. 当用户询问品牌内 top ASIN、材质细分 top ASIN、评分/评论数量分布时，优先调用 candidate_pool_slice。评论关键词/低分原因只能调用 asin_review_insights；如果返回 provider_required，必须说明当前缺评论文本 provider。Amazon 月搜索量只能调用 amazon_keyword_demand；如果返回 provider_required，必须说明当前缺关键词量 provider，不得用 Google Trends 或推理伪装为月搜索量。
+16. 当用户询问品牌内 top ASIN、材质细分 top ASIN、评分/评论数量分布时，优先调用 candidate_pool_slice。评论文本关键词/低分原因以及 Amazon 月搜索量目前均未接入 provider，绝不能伪造这些数据，也不要用 Google Trends / 反推伪装为月搜索量；遇到这类诉求，明确给出当前能力边界并推荐 candidate_pool_slice 的评分/评论数量分布、candidate_pool_trends.google_trends_index 等可用替代线索。
 
 工具调用规则：
 - 当你决定调用工具时，直接输出工具调用指令，不要在工具调用之前添加任何文字（如"好的，我来帮你…"等）。
@@ -96,8 +96,6 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 - launch_budget_calculator: 启动资金、单件经济模型、盈亏平衡与多场景预算计算
 - top_asin_drilldown: 头部 ASIN 下钻
 - asin_history_timeseries: 指定 ASIN 的历史时序
-- asin_review_insights: 评论关键词/低分原因 provider 探针；未配置 provider 时返回能力缺口
-- amazon_keyword_demand: Amazon 关键词月搜索量 provider 探针；未配置 provider 时返回能力缺口
 - category_benchmark: 类目基准对比
 - keepa_asin_lookup: 直连 Keepa API 查询 ASIN 商品详情（当本地数据库没有相关 ASIN 时使用）
 """
@@ -6133,6 +6131,20 @@ class Pipeline:
         content = self._clean_agent_content(self._extract_assistant_content(response), model_name=model_name)
         plan_payload = self._extract_json_value_from_text(content)
         if plan_payload is None and content.strip():
+            # 防止模型返回一段看似 planner JSON 但解析失败的文本被当成 final_answer 吐给用户。
+            # 这种情况应该走后续的 synthesis 路径，由 _synthesize_planner_executor_answer
+            # 重新基于已有观察生成 markdown，或在无观察时走兑底提示。
+            if self._looks_like_planner_json(content):
+                return {
+                    "scene": scene,
+                    "answer_ready": False,
+                    "final_answer": "",
+                    "reasoning_summary": "检测到模型返回 planner JSON 但未能解析，转交后续综合生成。",
+                    "stop_reason": "planner_json_leak_guard",
+                    "action_type": "none",
+                    "planner_protocol": "leak_guard",
+                    "steps": [],
+                }
             return {
                 "scene": scene,
                 "answer_ready": True,
@@ -6143,7 +6155,50 @@ class Pipeline:
                 "planner_protocol": "text_final",
                 "steps": [],
             }
-        return self._normalize_planner_plan(plan_payload, scene=scene, mode=mode)
+        normalized = self._normalize_planner_plan(plan_payload, scene=scene, mode=mode)
+        # 二次护栏：如果 normalize 出来的 final_answer 本身看似 planner JSON（比如模型把整段
+        # planner JSON 塞到 action.final_answer 字段里），也应该推到 synthesis 路径。
+        if normalized.get("answer_ready") and self._looks_like_planner_json(str(normalized.get("final_answer") or "")):
+            return {
+                "scene": normalized.get("scene") or scene,
+                "answer_ready": False,
+                "final_answer": "",
+                "reasoning_summary": "检测到 final_answer 字段依然是 planner JSON，转交后续综合生成。",
+                "stop_reason": "planner_json_leak_guard",
+                "action_type": "none",
+                "planner_protocol": "leak_guard",
+                "steps": [],
+            }
+        return normalized
+
+    @staticmethod
+    def _looks_like_planner_json(text: str) -> bool:
+        """Heuristic：判断一段文本是否 “是 planner/agent 内部 JSON 而不是用户可见的 markdown 回答”。
+
+        模型偶尔会把 planner 调度 JSON 当成文本返回（尤其在 final synthesis 阶段当上下
+        文较长、提示词包含 planner 模板时）。如果被当作最终回答转发到 SSE，用户
+        会看到一大段 {"scene":"...","action":{...}}。这里用轻量标记检测拦下，让外层转入
+        synthesis / fallback 路径重新生成可读回答。
+        """
+
+        if not isinstance(text, str):
+            return False
+        stripped = text.strip()
+        if not stripped or len(stripped) < 40:
+            return False
+        if not (stripped.startswith("{") or stripped.startswith("```")):
+            return False
+        sample = stripped[:4000]
+        marker_groups = (
+            ('"action"', ('"tool"', '"tool_name"', '"final_answer"', '"type"')),
+            ('"scene"', ('"reasoning_summary"', '"action"', '"stop_reason"')),
+            ('"answer_ready"', ('"final_answer"', '"steps"', '"action_type"')),
+            ('"planner_protocol"', ('"steps"', '"action_type"')),
+        )
+        for primary, secondaries in marker_groups:
+            if primary in sample and any(s in sample for s in secondaries):
+                return True
+        return False
 
     def _prepare_planner_executor_synthesis_payload(
         self,
@@ -6213,6 +6268,10 @@ class Pipeline:
         )
         response = self._post_agent_payload(payload, model_name=model_name)
         content = self._clean_agent_content(self._extract_assistant_content(response), model_name=model_name)
+        # 合成阶段也可能返回 planner JSON（模型误把 synthesis prompt 当成了另一轮 planner）。
+        # 这里统一拦下，避免将调度 JSON 作为最终回答吐给用户。
+        if content and self._looks_like_planner_json(content):
+            content = ""
         if content:
             return self._fallback_opportunity_answer_if_needed(
                 content,
