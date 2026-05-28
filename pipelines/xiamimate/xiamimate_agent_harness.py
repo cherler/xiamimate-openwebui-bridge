@@ -933,6 +933,8 @@ def preflight_tool_call(tool_call: Dict[str, Any], answer_contract: Optional[dic
 
     contract = answer_contract or {}
     requested_count = contract.get("requested_count")
+    if tool_name == "opportunity_discovery" and not str(parameters.get("marketplace") or "").strip():
+        parameters["marketplace"] = "US"
     if tool_name == "opportunity_discovery" and contract.get("entity_type") == "opportunity_card" and requested_count:
         with contextlib.suppress(TypeError, ValueError):
             parameters["limit"] = max(1, min(30, int(requested_count)))

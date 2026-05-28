@@ -1335,6 +1335,23 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertEqual(contract["entity_type"], "opportunity_card")
         self.assertIn("每张卡片", " ".join(contract["must_include"]))
 
+    def test_opportunity_discovery_preflight_defaults_marketplace(self) -> None:
+        pipe = self.make_pipeline()
+        messages = [{"role": "user", "content": "使用机会发现模块，输出top5的机会卡片"}]
+        steps = [
+            {
+                "tool_call": {
+                    "name": "opportunity_discovery",
+                    "parameters": {"marketplace": "", "limit": 10},
+                }
+            }
+        ]
+
+        repaired = pipe._repair_planner_steps_required_arguments(steps, messages, {})
+
+        self.assertEqual(repaired[0]["tool_call"]["parameters"]["marketplace"], "US")
+        self.assertEqual(repaired[0]["tool_call"]["parameters"]["limit"], 5)
+
     def test_tool_preflight_clamps_top_asin_top_n_to_schema_limit(self) -> None:
         pipe = self.make_pipeline()
         messages = [{"role": "user", "content": "提供 SUNLU/Creality 在候选池中的具体 ASIN 列表"}]
@@ -1577,6 +1594,31 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertIn("Air Fresheners", query)
         self.assertIn("Home & Kitchen > Home Fragrance", query)
         self.assertNotIn("机会编号7", query)
+
+    def test_report_query_resolves_opportunity_reference_from_card_heading(self) -> None:
+        pipe = self.make_pipeline()
+        messages = [
+            {
+                "role": "assistant",
+                "content": """下面是本次机会发现返回的机会卡片。
+
+### 机会 1：Power Strips
+- 机会理由：机会得分 86.69，排序靠前；细分类目为 Electronics > Power Strips
+- 下一步验证：用 resolve_candidates 分析 `Power Strips`；category_id=172282；category_path=Electronics > Accessories & Supplies > Power Strips & Surge Protectors > Power Strips，再进入 candidate_pool_stats。
+
+### 机会 2：Tumblers
+- 机会理由：机会得分 76.25。
+""",
+            },
+            {"role": "user", "content": "/report deep 请基于上一步机会发现中的机会编号 1，生成深度分析报告"},
+        ]
+
+        query = pipe._resolve_report_query_from_context("请基于上一步机会发现中的机会编号 1，生成深度分析报告", messages)
+
+        self.assertIsNotNone(query)
+        self.assertIn("Power Strips", query)
+        self.assertIn("类目路径", query)
+        self.assertIn("Power Strips & Surge Protectors", query)
 
     def test_report_query_prefers_opportunity_next_action_request(self) -> None:
         pipe = self.make_pipeline()

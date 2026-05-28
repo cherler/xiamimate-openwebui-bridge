@@ -1789,6 +1789,10 @@ class Pipeline:
             if opportunity:
                 return opportunity
 
+            opportunity = self._find_opportunity_in_card_heading(rank, text)
+            if opportunity:
+                return opportunity
+
             opportunity = self._find_opportunity_in_numbered_text(rank, text)
             if opportunity:
                 return opportunity
@@ -1897,6 +1901,34 @@ class Pipeline:
             return int(match.group(1))
         except (TypeError, ValueError):
             return None
+
+    def _find_opportunity_in_card_heading(self, rank: int, text: str) -> Optional[dict]:
+        pattern = re.compile(
+            r"^\s*#{1,4}\s*机会\s*(?:编号\s*)?(?:#|＃)?%d\s*[：:]\s*(.+?)\s*$" % rank,
+            flags=re.MULTILINE,
+        )
+        match = pattern.search(str(text or ""))
+        if not match:
+            return None
+        title = match.group(1).strip()
+        block_end = len(text)
+        next_heading = re.search(r"^\s*#{1,4}\s*机会\s*(?:编号\s*)?(?:#|＃)?\d{1,3}\s*[：:]", text[match.end() :], flags=re.MULTILINE)
+        if next_heading:
+            block_end = match.end() + next_heading.start()
+        block = text[match.end() : block_end]
+        category_id = ""
+        category_path = ""
+        category_id_match = re.search(r"category_id\s*=\s*([0-9]+)", block)
+        if category_id_match:
+            category_id = category_id_match.group(1).strip()
+        category_path_match = re.search(r"category_path\s*=\s*([^，。\n]+)", block)
+        if category_path_match:
+            category_path = category_path_match.group(1).strip()
+        if not category_path:
+            category_path_match = re.search(r"细分类目为\s*([^\n；]+)", block)
+            if category_path_match:
+                category_path = category_path_match.group(1).strip()
+        return {"rank": rank, "title": title, "category_id": category_id, "category_path": category_path}
 
     def _find_opportunity_in_numbered_text(self, rank: int, text: str) -> Optional[dict]:
         pattern = re.compile(
