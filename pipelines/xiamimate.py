@@ -8,6 +8,7 @@ requirements: requests
 """
 
 import ast
+import contextlib
 import importlib.util
 import json
 import os
@@ -56,7 +57,7 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 1. 需要数据时优先调用已挂载的工具，不要凭空编造指标。
 2. 需要平台规则、运营方法、合规要求等知识时，先调用 search_knowledge_base 工具检索知识库，不要依赖自身训练数据。
 3. 需要最新外部动态、站外情报、近期政策变化或实时市场讨论时，调用 web_search 工具，不要把旧知识当成最新事实。
-4. 需要商品数据时，先调用 resolve_candidates 拿到 candidate_pool_id 和 candidate_asins；后续 candidate_pool_stats / candidate_pool_trends / candidate_pool_weak_forecast / product_forecast_explain / top_asin_drilldown / category_benchmark 优先传 candidate_pool_id，只有缺少 pool_id 时才传 candidate_asins。
+4. 需要商品数据时，先调用 resolve_candidates 拿到 candidate_pool_id 和 candidate_asins；后续 candidate_pool_stats / candidate_pool_slice / candidate_pool_trends / candidate_pool_weak_forecast / product_forecast_explain / top_asin_drilldown / category_benchmark 优先传 candidate_pool_id，只有缺少 pool_id 时才传 candidate_asins。
 5. 当你已经有明确 ASIN，且需要看近 7 到 90 天的销量、价格、BSR、评论变化、L3/leaf 类目或类目路径时，必须优先调用 asin_history_timeseries；它会返回 latest_snapshot.category_path / l3_category_name / leaf_category_name 以及 window_summary.review_growth_window。
 6. keepa_asin_lookup 只用于本地历史没有命中、需要实时商品快照兜底、或明确要求直连 Keepa 的场景；它不能替代 30 天评论增长、历史窗口和本地类目路径分析。
 7. 如果工具尚未返回数据，只能给出分析框架、验证路径和风险提醒，明确标注为待验证。
@@ -65,9 +66,10 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 10. 涉及类目归属、竞品筛选、是否排除某 ASIN 时，必须基于工具结果中的事实字段判断，优先引用 latest_snapshot.leaf_category_name / latest_snapshot.category_path，其次引用 l3_category_name；不要仅凭标题、品牌或自身知识补全类目。
 11. 当用户要求“清洗/筛选/过滤上一步候选池”，且上一步 resolve_candidates 已返回 ASIN、品牌、product_title、leaf_category_name、fine_category_name、category_path、match_score、match_reasons 等字段时，直接基于这些字段筛选；不要为了判断标题或类目路径是否包含某词而调用 top_asin_drilldown。只有用户明确要求补充销量、价格、BSR、评论、预测等候选池没有的字段，才调用下游详情工具。
 12. 当 resolve_candidates 返回 pool_quality.is_sufficient_for_analysis=false 时，按闭环流程处理，不要把当前候选池包装成完整品类结论：先引用 pool_quality.insufficient_coverage_reason 说明覆盖不足；再调用 category_resolve 获取稳定 category_id/category_path；随后用 resolve_candidates(recall_mode=hybrid 或 category, category_id/category_path, include_descendants=true) 重试本地类目池；若 pool_quality 仍不足，调用 expand_candidates 创建补池任务，并调用 candidate_expansion_status 查询 queued/waiting_token/discovering/hydrating/syncing/completed 状态和 data_readiness。只有补池 job 的 data_readiness.analysis_ready=true，或本地池已 sufficient 且 stats/trends 有有效数值时，才继续 category_benchmark、candidate_pool_stats、top_asin_drilldown 和强结论；如果 status=completed 但 data_readiness.readiness_status=history_hydration_pending 或 serving_sync_pending，要说明“ASIN 已补入但分析特征未就绪”，建议等待 hydrate/serving sync 或只给待验证框架，不要把空 stats 当成市场事实。
-13. 只有当用户还没有给出明确商品主题/关键词/ASIN、在问“找机会/发现机会/某大类下有哪些细分方向/不知道分析什么”时，才调用 opportunity_discovery 输出机会卡片；机会卡片是继续分析入口，按机会编号深入分析时，沿用 opportunities_for_llm 中该编号的 next_action.request 继续调用 resolve_candidates，并以返回的 rank/title/category_path 作为上下文。若用户已经给出明确主题（例如“评估 car vacuum 在 Temu 美国站的机会”“分析 humidifier 在 Amazon US 是否值得做”），不要调用 opportunity_discovery，即使用户句子里出现“机会”二字，也应走主题分析：resolve_candidates -> candidate_pool_stats/candidate_pool_trends/category_benchmark/top_asin_drilldown，并按需要补充 search_knowledge_base 或 web_search。机会发现最终答复必须把 payload.opportunity_cards_text 中的总览表、字段解释和公式明细作为工具证据块展示，可自拟标题、摘要和解读，但不要改写成平铺列表，不要丢列、改数值或补未返回的数值；同时遵守 payload.llm_summary_guidance/display_rules：保留同名主题隐藏提示；有 personalized_opportunity_score 时保留个性化分或说明排序口径；趋势展示优先使用 trend_momentum_display/trend_signal_status，不能把趋势缺失或近期为 0 简化成普通 -100%；next_action.requires_category_resolve=true 时必须提醒先 category_resolve 再做类目召回。
+13. 只有当用户还没有给出明确商品主题/关键词/ASIN、在问“找机会/发现机会/某大类下有哪些细分方向/不知道分析什么”时，才调用 opportunity_discovery 输出机会卡片；机会卡片是继续分析入口，按机会编号深入分析时，沿用 opportunities_for_llm 中该编号的 next_action.request 继续调用 resolve_candidates，并以返回的 rank/title/category_path 作为上下文。若用户已经给出明确主题（例如“评估 car vacuum 在 Temu 美国站的机会”“分析 humidifier 在 Amazon US 是否值得做”），不要调用 opportunity_discovery，即使用户句子里出现“机会”二字，也应走主题分析：resolve_candidates -> candidate_pool_stats/candidate_pool_trends/category_benchmark/top_asin_drilldown，并按需要补充 search_knowledge_base 或 web_search。机会发现最终答复必须以逐机会卡片作为主答案；当用户要求 topN/机会卡片/逐卡分析时，每张卡片固定包含“机会理由 / 关键证据 / 风险或证据边界 / 下一步验证”，只展示用户请求数量，不得只返回工具表格。payload.opportunity_cards_text 中的总览表、字段解释和公式明细只能作为证据来源参考，不得替代主答案；不要丢列、改数值或补未返回的数值；同时遵守 payload.llm_summary_guidance/display_rules：保留同名主题隐藏提示；有 personalized_opportunity_score 时保留个性化分或说明排序口径；趋势展示优先使用 trend_momentum_display/trend_signal_status，不能把趋势缺失或近期为 0 简化成普通 -100%；next_action.requires_category_resolve=true 时必须提醒先 category_resolve 再做类目召回。
 14. 当用户明确询问销量预测、未来增长或“为什么模型看好/看空”时，优先调用 product_forecast_explain；不要把 candidate_pool_weak_forecast 的弱信号包装成正式模型预测。
 15. 不要把“用户问法”写成固定流程；按 tool_contract.capability 选择能回答问题的工具，按 evidence_contract 区分 tool_fact、derived_metric、default_assumption、hypothesis。涉及启动资金、盈亏平衡、单件利润、预算周期等计算时，调用 launch_budget_calculator，让工具产出公式和数值；最终答复可以自由组织，但必须把明确事实、计算结果、默认假设和商业判断分开。
+16. 当用户询问品牌内 top ASIN、材质细分 top ASIN、评分/评论数量分布时，优先调用 candidate_pool_slice。评论关键词/低分原因只能调用 asin_review_insights；如果返回 provider_required，必须说明当前缺评论文本 provider。Amazon 月搜索量只能调用 amazon_keyword_demand；如果返回 provider_required，必须说明当前缺关键词量 provider，不得用 Google Trends 或推理伪装为月搜索量。
 
 工具调用规则：
 - 当你决定调用工具时，直接输出工具调用指令，不要在工具调用之前添加任何文字（如"好的，我来帮你…"等）。
@@ -87,12 +89,15 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 - opportunity_discovery: 发现空白机会或大类细分机会；仅用于用户尚未给出明确商品主题/关键词/ASIN 的场景
 - opportunity_discovery_job: 按机会发现 job_id 回取完整机会卡片和结构化证据
 - candidate_pool_stats: 候选池描述统计，优先使用 resolve_candidates 返回的 candidate_pool_id
+- candidate_pool_slice: 候选池品牌/标题/材质切片，返回切片 top ASIN 和评分/评论/销量分布
 - candidate_pool_trends: 候选池趋势诊断
 - candidate_pool_weak_forecast: 弱信号预测标记
 - product_forecast_explain: 商品销量模型预测与自动解释，调用正式 Theme API forecast explainability 路由
 - launch_budget_calculator: 启动资金、单件经济模型、盈亏平衡与多场景预算计算
 - top_asin_drilldown: 头部 ASIN 下钻
 - asin_history_timeseries: 指定 ASIN 的历史时序
+- asin_review_insights: 评论关键词/低分原因 provider 探针；未配置 provider 时返回能力缺口
+- amazon_keyword_demand: Amazon 关键词月搜索量 provider 探针；未配置 provider 时返回能力缺口
 - category_benchmark: 类目基准对比
 - keepa_asin_lookup: 直连 Keepa API 查询 ASIN 商品详情（当本地数据库没有相关 ASIN 时使用）
 """
@@ -147,6 +152,9 @@ AGENT_SYNTHESIS_SYSTEM_PROMPT = """你是 XiaMimate 的 Answer Synthesizer。
 4. 涉及工具证据时，区分工具事实、推理判断和证据边界。
 5. 若工具证据不足，明确说明还缺什么，不要假装结论已被验证。
 6. 不要输出内部 JSON、tool_call、planner 字段或控制标记。
+7. 如果上下文包含 answer_contract，必须按其中 requested_count、answer_shape、must_include 和 must_not_include 组织最终答复。
+8. 如果上下文包含 followup_actionability_policy，报告尾部追问必须标注当前是否可直接执行；评论关键词、Amazon 月搜索量、品牌内 top3 等缺 provider 的问题不得写成已完整支持。
+9. 当 answer_contract.entity_type=opportunity_card 时，最终答复必须使用以下逐卡模板作为主答案，不要只输出排名表：`### 机会 N：<名称>`，其下依次给出 `机会理由`、`关键证据`、`风险/证据边界`、`下一步验证`。没有对应工具字段时写“当前工具未返回该细节”，不要编造。
 """
 
 TOOL_LAYER_REGISTRY = agent_harness.TOOL_LAYER_REGISTRY
@@ -266,10 +274,13 @@ TOOL_BILLING_EVENT = {
     "web_search": "web_search",
     "resolve_candidates": "product_api_call",
     "candidate_pool_stats": "product_api_call",
+    "candidate_pool_slice": "product_api_call",
     "candidate_pool_trends": "product_api_call",
     "candidate_pool_weak_forecast": "product_api_call",
     "top_asin_drilldown": "product_api_call",
     "asin_history_timeseries": "product_api_call",
+    "asin_review_insights": "product_api_call",
+    "amazon_keyword_demand": "product_api_call",
     "category_benchmark": "product_api_call",
     "keepa_asin_lookup": "product_api_call",
 }
@@ -1299,6 +1310,7 @@ class Pipeline:
         react_runner = self.agent_harness.new_react_runner(mode=mode, scene=scene)
         agent_trace = react_runner.trace
         trace_status = "finished"
+        final_answer_for_grade = ""
         tool_store = react_runner.observation_store
         tool_observations: List[dict] = tool_store.observations
         tool_result_cache: Dict[Tuple[str, str], dict] = tool_store.tool_result_cache
@@ -1397,7 +1409,12 @@ class Pipeline:
                             mode=mode,
                             stream=True,
                         )
-                    final_answer = self._fallback_opportunity_answer_if_needed(str(plan.get("final_answer") or "").strip(), tool_observations)
+                    final_answer = self._fallback_opportunity_answer_if_needed(
+                        str(plan.get("final_answer") or "").strip(),
+                        tool_observations,
+                        answer_contract=self._answer_contract_from_messages(source_messages),
+                    )
+                    final_answer_for_grade = final_answer
                     react_runner.final(scene, status="planner_final")
                     for chunk in emit_reasoning_chunks(self._format_agent_progress("Planner 已确认可直接作答，正在生成最终答复", percent=100)):
                         yield chunk
@@ -1432,6 +1449,7 @@ class Pipeline:
                 if not steps:
                     if not tool_observations and str(plan.get("action_type") or "").strip() in {"", "none"}:
                         final_answer = self._fallback_answer_from_tool_observations(tool_observations)
+                        final_answer_for_grade = final_answer
                         for chunk in emit_reasoning_chunks(self._format_agent_progress("未生成可执行工具或可见答复，返回兜底提示", percent=100)):
                             yield chunk
                         close_chunk = close_reasoning_chunk()
@@ -1449,6 +1467,7 @@ class Pipeline:
                         tool_observations=tool_observations,
                         agent_trace=agent_trace,
                     )
+                    final_answer_for_grade = final_answer
                     if mode == "agent" and not used_tools:
                         self._charge_standalone_llm_request(
                             billing_context=billing_context,
@@ -1537,6 +1556,7 @@ class Pipeline:
                     agent_trace=agent_trace,
                     limit_reached=bool(tool_observations),
                 )
+                final_answer_for_grade = final_answer
                 if mode == "agent" and not used_tools:
                     self._charge_standalone_llm_request(
                         billing_context=billing_context,
@@ -1559,10 +1579,14 @@ class Pipeline:
                 yield close_chunk
             yield emit_text_chunk("\n" + self._error_text(str(exc)))
 
+        trace_extra = {"tool_count": len(tool_observations), "planner_note_count": len(planner_notes), "stream": True}
+        grader_result = self._grade_agent_answer_for_trace(source_messages, final_answer_for_grade, tool_observations, agent_trace)
+        if grader_result.get("status") != "skipped":
+            trace_extra["grader_result"] = grader_result
         self._persist_agent_trace(
             agent_trace,
             status=trace_status,
-            extra={"tool_count": len(tool_observations), "planner_note_count": len(planner_notes), "stream": True},
+            extra=trace_extra,
         )
         close_chunk = close_reasoning_chunk()
         if close_chunk is not None:
@@ -1578,6 +1602,32 @@ class Pipeline:
             self.agent_harness.write_trace(agent_trace, sink_path, status=status, extra=extra or {})
         except Exception as exc:
             print("xiamimate.agent failed to persist trace", str(exc)[:300])
+
+    def _grade_agent_answer_for_trace(
+        self,
+        messages: List[dict],
+        answer_text: str,
+        tool_observations: List[dict],
+        agent_trace: Optional[Any] = None,
+    ) -> dict:
+        try:
+            result = self.agent_harness.grade_answer(
+                user_text=self._extract_last_user_text(messages),
+                answer_text=answer_text,
+                answer_contract=self._answer_contract_from_messages(messages),
+                tool_observations=tool_observations,
+            )
+        except Exception as exc:  # noqa: BLE001
+            result = {"grader": "deterministic_v1", "status": "error", "score": 0.0, "checks": [], "failures": [str(exc)[:160]]}
+        if agent_trace is not None and result.get("status") != "skipped":
+            with contextlib.suppress(Exception):
+                agent_trace.record(
+                    "grader_result",
+                    status=str(result.get("status") or ""),
+                    score=result.get("score"),
+                    failures=", ".join(result.get("failures") or []),
+                )
+        return result
 
     def _resolve_mode(
         self,
@@ -2303,12 +2353,15 @@ class Pipeline:
             "web_search": "网络搜索",
             "resolve_candidates": "候选池解析",
             "candidate_pool_stats": "候选池统计",
+            "candidate_pool_slice": "候选池切片",
             "candidate_pool_trends": "候选池趋势",
             "candidate_pool_weak_forecast": "弱信号预测",
             "product_forecast_explain": "模型预测解释",
             "top_asin_drilldown": "头部 ASIN 深挖",
             "opportunity_discovery": "机会发现",
             "asin_history_timeseries": "ASIN 历史时序",
+            "asin_review_insights": "评论关键词洞察",
+            "amazon_keyword_demand": "Amazon 关键词需求",
             "category_benchmark": "类目基准对比",
             "keepa_asin_lookup": "Keepa ASIN 查询",
         }
@@ -2718,18 +2771,125 @@ class Pipeline:
         answer_text = self._strip_outer_markdown_fence(answer_text)
         visible_text, payload = self._extract_structured_workflow_payload(answer_text)
         if not payload:
-            return answer_text, None
+            return self._annotate_report_followup_actionability(answer_text), None
 
         payload = self._augment_asin_history_payload(payload)
         payload = self._augment_selection_report_payload(payload, fallback_summary=visible_text)
         rendered = self._render_structured_workflow_payload(payload, fallback_summary=visible_text)
         rendered = self._append_report_refund_visibility_note(rendered, payload)
+        rendered = self._annotate_report_followup_actionability(rendered)
         payload_comment = self._build_structured_payload_comment(payload)
         if rendered:
             return rendered.rstrip(), payload_comment
         if visible_text:
+            visible_text = self._annotate_report_followup_actionability(visible_text)
             return self._append_report_refund_visibility_note(visible_text, payload).rstrip(), payload_comment
         return "", payload_comment
+
+    def _annotate_report_followup_actionability(self, text: str) -> str:
+        rendered = str(text or "")
+        if not rendered.strip():
+            return rendered
+
+        has_followup_section = bool(re.search(r"^#{2,4}\s*(?:下一步|🔁\s*下一步).*(?:追问|问题|建议)", rendered, flags=re.MULTILINE))
+        has_unsupported_prompt = any(
+            marker in rendered
+            for marker in (
+                "评论关键词",
+                "评分分布 + 关键词",
+                "低分原因",
+                "评论质量",
+                "差评",
+                "评论痛点",
+                "月搜索量",
+                "ABA",
+                "Helium10",
+                "JungleScout",
+                "品牌SUNLU",
+                "品牌 SUNLU",
+            )
+        )
+        if not has_followup_section and not has_unsupported_prompt:
+            return rendered
+
+        rendered = re.sub(
+            r"^(#{2,4}\s*)下一步可复制追问\s*$",
+            r"\1下一步验证问题（已按当前工具能力标注）",
+            rendered,
+            flags=re.MULTILINE,
+        )
+        rendered = re.sub(
+            r"^(#{2,4}\s*)🔁\s*下一步追问\s*$",
+            r"\1下一步验证问题（已按当前工具能力标注）",
+            rendered,
+            flags=re.MULTILINE,
+        )
+
+        note = (
+            "> 能力边界提示：当前虾米选品可直接查询候选池销量、价格、评分、评论数量、BSR、品牌分布和利润测算；"
+            "品牌/标题/材质维度 top ASIN 可用 candidate_pool_slice；评论关键词需要评论文本分析 provider，Amazon 月搜索量需要 ABA/第三方关键词量 provider。"
+        )
+        if "能力边界提示" not in rendered:
+            rendered = re.sub(
+                r"(#{2,4}\s*下一步验证问题（已按当前工具能力标注）\s*\n)",
+                r"\1\n" + note + "\n",
+                rendered,
+                count=1,
+            )
+            if "下一步验证问题（已按当前工具能力标注）" not in rendered and has_unsupported_prompt:
+                rendered = rendered.rstrip() + "\n\n" + note
+
+        lines = []
+        for line in rendered.splitlines():
+            updated = self._rewrite_provider_required_followup_line(line)
+            if ("品牌SUNLU" in updated or "品牌 SUNLU" in updated or "SUNLU/Creality" in updated) and "candidate_pool_slice" not in updated:
+                updated += "（品牌内 top ASIN 可直接调用 candidate_pool_slice，输出评分/评论数量/销量分布；评论关键词仍需评论文本分析 provider。）"
+            lines.append(updated)
+        return "\n".join(lines)
+
+    def _rewrite_provider_required_followup_line(self, line: str) -> str:
+        updated = str(line or "")
+        if not updated.strip():
+            return updated
+        review_terms = (
+            "评论关键词",
+            "评分分布 + 关键词",
+            "低分原因",
+            "评论质量",
+            "差评关键词",
+            "差评集中",
+            "评论痛点",
+            "1-3 星差评",
+            "1–3 星差评",
+            "1～3 星差评",
+        )
+        keyword_terms = ("月搜索量", "Amazon 搜索量", "amazon 搜索量", "ABA", "Helium10", "JungleScout")
+        if any(term in updated for term in review_terms):
+            updated = self._force_provider_required_marker(updated, "需评论文本 provider")
+            if "评论文本分析 provider" not in updated and "review_text_provider" not in updated:
+                updated += "（provider_required：真实评论关键词、低分原因或评论质量分析需评论文本分析 provider；当前仅能直接验证评分/评论数量分布。）"
+        if any(term in updated for term in keyword_terms):
+            updated = self._force_provider_required_marker(updated, "需关键词量 provider")
+            if "关键词量 provider" not in updated:
+                updated += "（provider_required：精确 Amazon 月搜索量需 ABA/Helium10/JungleScout 或自有关键词量 provider；当前只能用趋势指数、ASIN 销量和评论量作替代验证。）"
+        return updated
+
+    def _force_provider_required_marker(self, line: str, marker: str) -> str:
+        updated = str(line or "")
+        if "provider_required" in updated or marker in updated:
+            return updated
+        updated = re.sub(r"(?:✅\s*)?可直接执行\s*[：:]?", marker + "：", updated)
+        updated = re.sub(r"(?:✅\s*)?直接执行\s*[：:]?", marker + "：", updated)
+        updated = updated.replace("✅", "")
+        stripped = updated.lstrip()
+        prefix_len = len(updated) - len(stripped)
+        prefix = updated[:prefix_len]
+        if re.match(r"^(?:[-*]\s*)?(?:\d+[\.、)]\s*)?(?:\*\*)?需", stripped):
+            return updated
+        numbered = re.match(r"^((?:[-*]\s*)?(?:\d+[\.、)]\s*))(.+)$", stripped)
+        if numbered:
+            return prefix + numbered.group(1) + marker + "：" + numbered.group(2).strip()
+        return prefix + marker + "：" + stripped
 
     def _append_report_refund_visibility_note(self, text: str, payload: dict) -> str:
         rendered = str(text or "").rstrip()
@@ -5616,14 +5776,23 @@ class Pipeline:
 
     def _repair_planner_steps_required_arguments(self, steps: List[dict], messages: List[dict], body: dict) -> List[dict]:
         repaired_steps: List[dict] = []
+        answer_contract = self._answer_contract_from_messages(messages)
         for step in steps or []:
             repaired_call = self._repair_tool_call_required_arguments((step or {}).get("tool_call") or {}, messages, body)
             if repaired_call is None:
                 continue
+            repaired_call = self.agent_harness.preflight_tool_call(repaired_call, answer_contract=answer_contract)
             repaired_step = dict(step or {})
             repaired_step["tool_call"] = repaired_call
             repaired_steps.append(repaired_step)
         return repaired_steps
+
+    def _answer_contract_from_messages(self, messages: List[dict]) -> dict:
+        latest_text = self._extract_last_user_text(messages)
+        try:
+            return self.agent_harness.answer_contract_from_text(latest_text)
+        except AttributeError:
+            return {}
 
     def _explicit_tool_request_step(self, messages: List[dict], body: dict, scene: str, mode: str = "agent") -> Optional[dict]:
         latest_text = self._extract_last_user_text(messages)
@@ -5636,6 +5805,10 @@ class Pipeline:
         repaired_call = self._repair_tool_call_required_arguments(initial_call, messages, body)
         if repaired_call is None:
             return None
+        repaired_call = self.agent_harness.preflight_tool_call(
+            repaired_call,
+            answer_contract=self._answer_contract_from_messages(messages),
+        )
         return {"tool_call": repaired_call, "goal": "按用户显式请求直接调用目标工具", "required": True}
 
     def _scene_for_explicit_tool(self, tool_name: str, current_scene: str) -> str:
@@ -5950,6 +6123,8 @@ class Pipeline:
             self._planner_observation_context,
             trace=agent_trace,
             limit_reached=limit_reached,
+            answer_contract=self._answer_contract_from_messages(messages),
+            followup_actionability_policy=self.agent_harness.followup_actionability_policy(),
         )
         synthesis_messages.append(
             {
@@ -5987,7 +6162,11 @@ class Pipeline:
         response = self._post_agent_payload(payload, model_name=model_name)
         content = self._clean_agent_content(self._extract_assistant_content(response), model_name=model_name)
         if content:
-            return self._fallback_opportunity_answer_if_needed(content, tool_observations)
+            return self._fallback_opportunity_answer_if_needed(
+                content,
+                tool_observations,
+                answer_contract=self._answer_contract_from_messages(messages),
+            )
         return self._fallback_answer_from_tool_observations(tool_observations)
 
     def _planner_plan_note(self, scene: str, plan: dict, trace: Optional[Any] = None) -> dict:
@@ -6154,11 +6333,14 @@ class Pipeline:
         product_theme_tools = {
             "resolve_candidates",
             "candidate_pool_stats",
+            "candidate_pool_slice",
             "candidate_pool_trends",
             "candidate_pool_weak_forecast",
             "product_forecast_explain",
             "top_asin_drilldown",
             "asin_history_timeseries",
+            "asin_review_insights",
+            "amazon_keyword_demand",
             "category_benchmark",
             "launch_budget_calculator",
         }
@@ -6220,11 +6402,15 @@ class Pipeline:
         max_rounds = min(self._agent_max_tool_rounds(), int(self._scene_policy(scene, mode).get("max_rounds") or 1))
         react_runner.start(max_rounds=max_rounds)
 
-        def persist_trace(status: str = "finished") -> None:
+        def persist_trace(status: str = "finished", answer_text: str = "") -> None:
+            trace_extra = {"tool_count": len(tool_observations), "planner_note_count": len(planner_notes), "stream": False}
+            grader_result = self._grade_agent_answer_for_trace(source_messages, answer_text, tool_observations, agent_trace)
+            if grader_result.get("status") != "skipped":
+                trace_extra["grader_result"] = grader_result
             self._persist_agent_trace(
                 agent_trace,
                 status=status,
-                extra={"tool_count": len(tool_observations), "planner_note_count": len(planner_notes), "stream": False},
+                extra=trace_extra,
             )
 
         for round_index in range(max_rounds):
@@ -6241,7 +6427,7 @@ class Pipeline:
             except RuntimeError as exc:
                 if tool_observations:
                     answer = self._fallback_answer_from_tool_observations(tool_observations, error=str(exc))
-                    persist_trace(status="error")
+                    persist_trace(status="error", answer_text=answer)
                     return answer
                 persist_trace(status="error")
                 raise
@@ -6263,8 +6449,12 @@ class Pipeline:
                         stream=False,
                     )
                 react_runner.final(scene, status="planner_final")
-                answer = self._fallback_opportunity_answer_if_needed(str(plan.get("final_answer") or "").strip(), tool_observations)
-                persist_trace()
+                answer = self._fallback_opportunity_answer_if_needed(
+                    str(plan.get("final_answer") or "").strip(),
+                    tool_observations,
+                    answer_contract=self._answer_contract_from_messages(source_messages),
+                )
+                persist_trace(answer_text=answer)
                 return answer
 
             steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
@@ -6288,11 +6478,11 @@ class Pipeline:
             if not steps:
                 if not tool_observations and str(plan.get("action_type") or "").strip() in {"", "none"}:
                     answer = self._fallback_answer_from_tool_observations(tool_observations)
-                    persist_trace()
+                    persist_trace(answer_text=answer)
                     return answer
                 opportunity_fallback = self._fallback_opportunity_answer_from_observations(tool_observations)
                 if opportunity_fallback:
-                    persist_trace()
+                    persist_trace(answer_text=opportunity_fallback)
                     return opportunity_fallback
                 answer = self._synthesize_planner_executor_answer(
                     messages=source_messages,
@@ -6309,7 +6499,7 @@ class Pipeline:
                         mode=mode,
                         stream=False,
                     )
-                persist_trace()
+                persist_trace(answer_text=answer)
                 return answer
 
             used_tools = True
@@ -6350,7 +6540,7 @@ class Pipeline:
                 agent_trace=agent_trace,
                 limit_reached=True,
             )
-            persist_trace()
+            persist_trace(answer_text=answer)
             return answer
 
         fallback_answer = self._synthesize_planner_executor_answer(
@@ -6369,7 +6559,7 @@ class Pipeline:
                 mode=mode,
                 stream=False,
             )
-        persist_trace()
+        persist_trace(answer_text=fallback_answer)
         return fallback_answer
 
     def _charge_standalone_llm_request(
@@ -7386,6 +7576,31 @@ class Pipeline:
                 "product_keyword": "product_query",
                 "market": "marketplace",
             },
+            "candidate_pool_slice": {
+                "pool_id": "candidate_pool_id",
+                "candidatePoolId": "candidate_pool_id",
+                "asins": "candidate_asins",
+                "candidate_list": "candidate_asins",
+                "candidate_pool": "candidate_asins",
+                "asin_list": "candidate_asins",
+                "query": "product_query",
+                "category": "product_query",
+                "product": "product_query",
+                "product_keyword": "product_query",
+                "market": "marketplace",
+                "brand": "brand_include",
+                "brands": "brand_include",
+                "brand_names": "brand_include",
+                "title_keyword": "title_keywords",
+                "title_keyword_include": "title_keywords",
+                "keyword": "title_keywords",
+                "keywords": "title_keywords",
+                "material": "material_keywords",
+                "materials": "material_keywords",
+                "material_keyword": "material_keywords",
+                "top_k": "top_n",
+                "max_results": "top_n",
+            },
             "candidate_pool_trends": {
                 "pool_id": "candidate_pool_id",
                 "candidatePoolId": "candidate_pool_id",
@@ -7469,6 +7684,33 @@ class Pipeline:
                 "product": "product_query",
                 "product_keyword": "product_query",
                 "market": "marketplace",
+            },
+            "asin_review_insights": {
+                "pool_id": "candidate_pool_id",
+                "candidatePoolId": "candidate_pool_id",
+                "asin": "candidate_asins",
+                "asins": "candidate_asins",
+                "asin_list": "candidate_asins",
+                "candidate_list": "candidate_asins",
+                "candidate_pool": "candidate_asins",
+                "query": "product_query",
+                "product": "product_query",
+                "product_keyword": "product_query",
+                "market": "marketplace",
+                "top_k": "max_asins",
+                "top_n": "max_asins",
+                "max_results": "max_asins",
+            },
+            "amazon_keyword_demand": {
+                "query": "product_query",
+                "product": "product_query",
+                "product_keyword": "product_query",
+                "keyword": "keywords",
+                "keyword_list": "keywords",
+                "search_terms": "keywords",
+                "market": "marketplace",
+                "target_market": "marketplace",
+                "target_market_norm": "marketplace",
             },
             "asin_history_timeseries": {
                 "asin": "asins",
@@ -7854,9 +8096,10 @@ class Pipeline:
             "result_format": "opportunity_evidence_block",
             "original_chars": original_chars,
             "instruction": (
-                "opportunity_cards_text 是机会发现的工具证据块，应以表格和字段解释形态展示。"
+                "opportunity_cards_text 是机会发现的工具证据来源，不应替代主答案。"
                 "opportunities_for_llm 包含可继续分析的结构化机会入口。"
-                "最终答复可自行组织标题、摘要和解读，但不要把证据表改写成平铺列表，不要丢列、改数值或补未返回的数值；同时必须保留 llm_summary_guidance/display_rules 中要求的同名隐藏提示、个性化分、趋势状态和 category_resolve 前置提醒。"
+                "最终答复可自行组织标题、摘要和解读；如果用户明确要求 topN 机会卡片或逐卡分析，应按用户请求数量裁剪并重组为卡片式解读。"
+                "主答案必须逐卡包含机会理由、关键证据、风险/证据边界和下一步验证；不要展示超过用户请求数量的机会，不要丢列、改数值或补未返回的数值；同时必须保留 llm_summary_guidance/display_rules 中要求的同名隐藏提示、个性化分、趋势状态和 category_resolve 前置提醒。"
             ),
             "payload": compact_payload,
         }
@@ -8017,11 +8260,37 @@ class Pipeline:
         kept_lines.append("[后续工具文本过长已省略]")
         return "\n".join(kept_lines)
 
-    def _fallback_opportunity_answer_if_needed(self, answer: str, tool_observations: List[dict]) -> str:
-        if not self._answer_has_invalid_opportunity_expansion(answer) and self._opportunity_answer_matches_observations(answer, tool_observations):
+    def _fallback_opportunity_answer_if_needed(
+        self,
+        answer: str,
+        tool_observations: List[dict],
+        answer_contract: Optional[dict] = None,
+    ) -> str:
+        if (
+            not self._answer_has_invalid_opportunity_expansion(answer)
+            and self._opportunity_answer_matches_observations(answer, tool_observations)
+            and self._opportunity_answer_satisfies_contract(answer, answer_contract, tool_observations)
+        ):
             return answer
-        fallback = self._fallback_opportunity_answer_from_observations(tool_observations)
+        fallback = self._fallback_opportunity_answer_from_observations(tool_observations, answer_contract=answer_contract)
         return fallback or answer
+
+    def _opportunity_answer_satisfies_contract(
+        self,
+        answer: str,
+        answer_contract: Optional[dict],
+        tool_observations: List[dict],
+    ) -> bool:
+        if not answer_contract or answer_contract.get("entity_type") != "opportunity_card":
+            return True
+        if not any(str(observation.get("tool_name") or "") == "opportunity_discovery" for observation in tool_observations or []):
+            return True
+        result = self.agent_harness.grade_answer(
+            answer_text=answer,
+            answer_contract=answer_contract,
+            tool_observations=tool_observations,
+        )
+        return str(result.get("status") or "") in {"pass", "skipped"}
 
     def _opportunity_answer_matches_observations(self, answer: str, tool_observations: List[dict]) -> bool:
         titles = self._opportunity_titles_from_observations(tool_observations)
@@ -8064,7 +8333,11 @@ class Pipeline:
         markers = ("待补全", "待补充", "估算区间", "基于机会得分分布", "结果压缩截断")
         return any(marker in text for marker in markers)
 
-    def _fallback_opportunity_answer_from_observations(self, tool_observations: List[dict]) -> str:
+    def _fallback_opportunity_answer_from_observations(
+        self,
+        tool_observations: List[dict],
+        answer_contract: Optional[dict] = None,
+    ) -> str:
         for observation in reversed(tool_observations or []):
             if str(observation.get("tool_name") or "") != "opportunity_discovery":
                 continue
@@ -8076,6 +8349,9 @@ class Pipeline:
                 cards_text = str(opportunity_payload.get("opportunity_cards_text") or "").strip()
                 if not cards_text:
                     continue
+                structured_answer = self._render_opportunity_cards_from_payload(opportunity_payload, observation, answer_contract=answer_contract)
+                if structured_answer:
+                    return structured_answer
                 opportunity_count = self._opportunity_count(opportunity_payload)
                 lines = [
                     "下面是本次机会发现返回的机会卡片。",
@@ -8091,6 +8367,145 @@ class Pipeline:
                     )
                 return "\n".join(lines)
         return ""
+
+    def _render_opportunity_cards_from_payload(
+        self,
+        opportunity_payload: dict,
+        observation: dict,
+        answer_contract: Optional[dict] = None,
+    ) -> str:
+        opportunities = opportunity_payload.get("opportunities_for_llm")
+        if not isinstance(opportunities, list) or not opportunities:
+            opportunities = opportunity_payload.get("opportunities")
+        if not isinstance(opportunities, list) or not opportunities:
+            return ""
+        requested_count = self._requested_opportunity_count(observation, opportunity_payload, answer_contract)
+        selected = [item for item in opportunities if isinstance(item, dict)][:requested_count]
+        if not selected:
+            return ""
+        total_count = self._opportunity_count(opportunity_payload) or len(selected)
+        lines = [
+            "下面是本次机会发现返回的机会卡片。",
+            "",
+            "市场: %s | 平台: Amazon | 实际返回机会数: %d" % (self._opportunity_marketplace(observation, opportunity_payload), len(selected)),
+            "",
+        ]
+        for index, item in enumerate(selected, start=1):
+            title = str(item.get("title") or item.get("opportunity") or item.get("name") or "机会 %d" % index).strip()
+            rank = item.get("rank") or index
+            lines.extend(
+                [
+                    "### 机会 %s：%s" % (rank, title),
+                    "- 机会理由：%s" % self._opportunity_reason(item),
+                    "- 关键证据：%s" % self._opportunity_evidence(item),
+                    "- 风险/证据边界：%s" % self._opportunity_boundary(item),
+                    "- 下一步验证：%s" % self._opportunity_next_step(item),
+                    "",
+                ]
+            )
+        lines.append("当前可继续分析的机会编号共有 %d 个。" % total_count)
+        return "\n".join(lines).strip()
+
+    def _requested_opportunity_count(self, observation: dict, opportunity_payload: dict, answer_contract: Optional[dict]) -> int:
+        for value in ((answer_contract or {}).get("requested_count"), ((observation or {}).get("arguments") or {}).get("limit"), opportunity_payload.get("opportunity_count")):
+            with contextlib.suppress(TypeError, ValueError):
+                count = int(value)
+                if count > 0:
+                    return min(30, count)
+        return 5
+
+    def _opportunity_marketplace(self, observation: dict, opportunity_payload: dict) -> str:
+        value = ((observation or {}).get("arguments") or {}).get("marketplace") or opportunity_payload.get("marketplace") or opportunity_payload.get("market") or "US"
+        return str(value or "US").upper()
+
+    def _opportunity_reason(self, item: dict) -> str:
+        for key in ("opportunity_reason", "reason", "why", "summary"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        parts = []
+        score = self._first_present(item, "opportunity_score", "score", "personalized_opportunity_score")
+        if score is not None:
+            parts.append("机会得分 %s，排序靠前" % self._format_metric_value(score))
+        sales = self._first_present(item, "sales_window_sum", "window_sales_sum", "estimated_sales_window", "sales_estimate")
+        if sales is not None:
+            parts.append("窗口销量估算 %s" % self._format_metric_value(sales))
+        category = self._first_present(item, "category_path", "category", "leaf_category_name")
+        if category:
+            parts.append("细分类目为 %s" % category)
+        return "；".join(parts) if parts else "当前工具未返回可展开的机会理由，仅可依据该机会进入后续候选池验证。"
+
+    def _opportunity_evidence(self, item: dict) -> str:
+        parts = []
+        score = self._first_present(item, "opportunity_score", "score")
+        if score is not None:
+            parts.append("机会得分 %s" % self._format_metric_value(score))
+        personalized = self._first_present(item, "personalized_opportunity_score", "personalized_score")
+        if personalized is not None:
+            parts.append("个性化分 %s" % self._format_metric_value(personalized))
+        sales = self._first_present(item, "sales_window_sum", "window_sales_sum", "estimated_daily_sales_sum", "estimated_sales_window")
+        if sales is not None:
+            parts.append("窗口销量估算 %s" % self._format_metric_value(sales))
+        trend = self._first_present(item, "trend_momentum_display", "trend_signal_status", "trend_growth_display", "sales_growth_display")
+        if trend:
+            parts.append("增长/趋势 %s" % trend)
+        competition = self._first_present(item, "competition_offer", "competition_offer_avg", "avg_offer_count", "new_offer_count")
+        if competition is not None:
+            parts.append("竞争 Offer %s" % self._format_metric_value(competition))
+        sample_bits = []
+        for label, key in (("ASIN", "candidate_count"), ("日数据行", "row_count")):
+            value = item.get(key)
+            if value is not None:
+                sample_bits.append("%s=%s" % (label, self._format_metric_value(value)))
+        if sample_bits:
+            parts.append("样本 " + ", ".join(sample_bits))
+        return "；".join(parts) if parts else "当前工具未返回结构化证据字段，请以机会编号继续做候选池验证。"
+
+    def _opportunity_boundary(self, item: dict) -> str:
+        for key in ("risk", "risks", "boundary", "evidence_boundary", "confidence_note"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        parts = []
+        confidence = self._first_present(item, "confidence", "data_confidence")
+        if confidence:
+            parts.append("置信度 %s" % confidence)
+        if item.get("candidate_count") is not None or item.get("row_count") is not None:
+            parts.append("当前结论只覆盖工具返回的候选样本和窗口期")
+        if self._first_present(item, "trend_momentum_display", "trend_signal_status") in (None, ""):
+            parts.append("趋势细节可能缺失，需要后续趋势/候选池工具补证")
+        return "；".join(parts) if parts else "当前工具未返回风险细节；需通过候选池统计、趋势和竞品下钻补证。"
+
+    def _opportunity_next_step(self, item: dict) -> str:
+        next_action = item.get("next_action") if isinstance(item.get("next_action"), dict) else {}
+        request = next_action.get("request") if isinstance(next_action.get("request"), dict) else {}
+        product_query = request.get("product_query") or item.get("title") or item.get("opportunity")
+        category_id = request.get("category_id") or item.get("category_id")
+        category_path = request.get("category_path") or item.get("category_path")
+        if next_action.get("requires_category_resolve"):
+            return "先调用 category_resolve 确认稳定类目，再基于类目召回候选池。"
+        details = []
+        if product_query:
+            details.append("用 resolve_candidates 分析 `%s`" % product_query)
+        if category_id:
+            details.append("category_id=%s" % category_id)
+        if category_path:
+            details.append("category_path=%s" % category_path)
+        if details:
+            return "；".join(details) + "，再进入 candidate_pool_stats / candidate_pool_slice / trend 验证。"
+        return "复制该机会编号做 `/report deep`，或先 resolve_candidates 建立候选池后继续验证。"
+
+    def _first_present(self, item: dict, *keys: str) -> Any:
+        for key in keys:
+            value = item.get(key)
+            if value not in (None, "", [], {}):
+                return value
+        return None
+
+    def _format_metric_value(self, value: Any) -> str:
+        if isinstance(value, float):
+            return ("%.2f" % value).rstrip("0").rstrip(".")
+        return str(value)
 
     def _compact_tool_payload_for_llm(
         self,

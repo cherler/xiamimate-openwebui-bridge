@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import contextlib
 import json
 import re
 import threading
@@ -212,9 +213,12 @@ TOOL_REQUIRED_ARGUMENTS = {
     "resolve_candidates": ["product_query"],
     "category_resolve": ["category_query"],
     "candidate_pool_stats": ["candidate_pool_id", "candidate_asins", "product_query"],
+    "candidate_pool_slice": ["candidate_pool_id", "candidate_asins", "product_query"],
     "candidate_pool_trends": ["candidate_pool_id", "candidate_asins", "product_query"],
     "category_benchmark": ["candidate_pool_id", "candidate_asins", "product_query", "benchmark_category_id", "benchmark_category_path"],
     "top_asin_drilldown": ["asin", "asins", "candidate_pool_id", "product_query"],
+    "asin_review_insights": ["asin", "asins", "candidate_asins", "candidate_pool_id", "product_query"],
+    "amazon_keyword_demand": ["keywords", "product_query"],
     "asin_history_timeseries": ["asins"],
     "expand_candidates": ["product_query", "category_id", "category_path"],
     "candidate_expansion_status": ["job_id"],
@@ -230,9 +234,18 @@ INTEGER_EXPLICIT_ARGUMENTS = {
     "top_k",
     "limit",
     "window_days",
+    "max_asins",
 }
 
 BOOLEAN_EXPLICIT_ARGUMENTS = {"include_descendants", "expand_if_small", "include_result"}
+
+TOOL_NUMERIC_LIMITS = {
+    "candidate_pool_weak_forecast": {"top_n": (1, 20)},
+    "candidate_pool_slice": {"top_n": (1, 20)},
+    "product_forecast_explain": {"top_n": (1, 20)},
+    "top_asin_drilldown": {"top_n": (1, 20)},
+    "asin_review_insights": {"max_asins": (1, 20)},
+}
 
 
 TOOL_LAYER_REGISTRY = {
@@ -276,6 +289,11 @@ TOOL_LAYER_REGISTRY = {
         "capability": "候选池基础统计盘面",
         "scene_tags": ["theme_analysis", "general_agent"],
     },
+    "candidate_pool_slice": {
+        "layer": "analysis",
+        "capability": "按品牌、标题关键词或材质关键词切片候选池，返回切片内 top ASIN、评分/评论数量/销量分布；不能回答评论文本关键词或 Amazon 月搜索量",
+        "scene_tags": ["theme_analysis", "general_agent"],
+    },
     "candidate_pool_trends": {
         "layer": "analysis",
         "capability": "候选池趋势变化",
@@ -294,6 +312,16 @@ TOOL_LAYER_REGISTRY = {
     "top_asin_drilldown": {
         "layer": "analysis",
         "capability": "头部 ASIN 下钻分析",
+        "scene_tags": ["theme_analysis", "general_agent"],
+    },
+    "asin_review_insights": {
+        "layer": "analysis",
+        "capability": "评论关键词、低分原因、正负面评论主题 provider 探针；未配置评论文本 provider 时必须返回能力缺口，禁止编造关键词",
+        "scene_tags": ["theme_analysis", "asin_specific_analysis", "general_agent"],
+    },
+    "amazon_keyword_demand": {
+        "layer": "analysis",
+        "capability": "Amazon 关键词月搜索量/需求 provider 探针；未配置 ABA/第三方关键词量 provider 时必须返回能力缺口，禁止伪造搜索量",
         "scene_tags": ["theme_analysis", "general_agent"],
     },
     "asin_history_timeseries": {
@@ -465,9 +493,12 @@ class ToolRegistry:
                 "resolve_candidates",
                 "category_resolve",
                 "candidate_pool_stats",
+                "candidate_pool_slice",
                 "candidate_pool_trends",
                 "candidate_pool_weak_forecast",
                 "top_asin_drilldown",
+                "asin_review_insights",
+                "amazon_keyword_demand",
                 "category_benchmark",
             }
         if scene == "blank_opportunity_discovery":
@@ -523,7 +554,7 @@ class AgentTrace:
                 {
                     key: value
                     for key, value in event.items()
-                    if key in {"trace_id", "event_type", "elapsed_ms", "mode", "scene", "tool_name", "action_type", "status", "repair_applied"}
+                    if key in {"trace_id", "event_type", "elapsed_ms", "mode", "scene", "tool_name", "action_type", "status", "repair_applied", "score", "failures"}
                 }
             )
         return compacted
@@ -631,6 +662,8 @@ class SynthesisRunner:
         observation_context: Callable[[List[dict], int], List[dict]],
         trace: Optional[AgentTrace] = None,
         limit_reached: bool = False,
+        answer_contract: Optional[dict] = None,
+        followup_actionability_policy: Optional[dict] = None,
     ) -> dict:
         instruction = "不要再调用工具；只基于这些证据回答用户原问题。"
         if limit_reached:
@@ -640,17 +673,283 @@ class SynthesisRunner:
             "tool_observations": observation_context(tool_observations, 8),
             "instruction": instruction,
         }
+        if answer_contract:
+            context["answer_contract"] = answer_contract
+        if followup_actionability_policy:
+            context["followup_actionability_policy"] = followup_actionability_policy
         if trace is not None:
             context["trace"] = trace.compact(limit=16)
         return context
 
 
+def extract_answer_contract_from_text(text: str) -> dict:
+    content = str(text or "").strip()
+    if not content:
+        return {}
+    normalized = content.lower().replace(" ", "")
+    contract: Dict[str, Any] = {}
+
+    top_match = re.search(r"top\s*([1-9][0-9]?)", content, flags=re.IGNORECASE)
+    if not top_match:
+        top_match = re.search(r"前\s*([1-9][0-9]?)\s*(?:个|名|条)?", content)
+    if top_match:
+        with contextlib.suppress(ValueError):
+            contract["requested_count"] = max(1, min(30, int(top_match.group(1))))
+
+    if "机会" in content and ("卡片" in content or "opportunity" in normalized):
+        contract["entity_type"] = "opportunity_card"
+    if "解说" in content or "解读" in content or "分析" in content:
+        contract["answer_shape"] = "card_with_analysis"
+    if "中文" in content or re.search(r"[\u4e00-\u9fff]", content):
+        contract["language"] = "zh"
+
+    if contract.get("entity_type") == "opportunity_card":
+        contract.setdefault("requested_count", 5 if "top5" in normalized else None)
+        contract["must_include"] = [
+            "只展示用户请求数量的机会卡片",
+            "每张卡片包含机会理由、关键证据、主要风险或证据边界、下一步验证",
+            "不要把工具默认返回数量当成用户请求数量",
+        ]
+        contract["must_not_include"] = [
+            "超过用户请求数量的机会排名",
+            "缺少逐卡解说的裸工具表格",
+            "用未返回的数据补齐机会卡片",
+        ]
+    if contract.get("requested_count") is None:
+        contract.pop("requested_count", None)
+    return contract
+
+
+def followup_actionability_policy() -> dict:
+    return {
+        "policy": "报告尾部追问必须按当前工具能力标注支持度；不可把缺少 provider 的问题写成可完整执行的复制追问。",
+        "directly_supported": [
+            "候选池销量、价格、评分、评论数量、BSR、品牌分布",
+            "品牌/标题/材质关键词切片后的 top ASIN 和评分/评论数量/销量分布",
+            "指定 ASIN 的价格、评分、评论数、销量估算和预测解释",
+            "基于明确假设的利润/盈亏平衡测算",
+        ],
+        "partial_or_unsupported": [
+            "评论关键词/低分原因需要 asin_review_insights 或评论文本 provider",
+            "Amazon 月搜索量需要 ABA/Helium 10/Jungle Scout/关键词量 provider",
+            "评论文本 provider 或关键词量 provider 未配置时，只能返回能力缺口和替代验证路径",
+        ],
+        "response_rule": "若问题包含评论关键词、月搜索量、品牌内 top3 等能力缺口，必须显式写出当前只能回答哪些部分，以及缺什么工具或外部数据。",
+    }
+
+
+class AgentGrader:
+    version = "deterministic_v1"
+
+    DIRECT_SUPPORT_MARKERS = (
+        "✅",
+        "可直接执行",
+        "直接执行",
+        "当前可直接",
+        "可以直接",
+        "可执行",
+    )
+    PROVIDER_BOUNDARY_MARKERS = (
+        "provider",
+        "外部",
+        "缺",
+        "无法直接",
+        "不能直接",
+        "不得",
+        "需要",
+        "需 ",
+        "需外部",
+        "待补",
+    )
+    REVIEW_PROVIDER_TERMS = (
+        "评论关键词",
+        "差评关键词",
+        "低分原因",
+        "评论质量",
+        "评论痛点",
+        "差评集中",
+        "1-3 星差评",
+        "1–3 星差评",
+        "1～3 星差评",
+    )
+    KEYWORD_DEMAND_TERMS = (
+        "月搜索量",
+        "amazon 搜索量",
+        "Amazon 搜索量",
+        "ABA",
+        "Helium10",
+        "JungleScout",
+    )
+
+    def grade(
+        self,
+        *,
+        user_text: str = "",
+        answer_text: str = "",
+        answer_contract: Optional[dict] = None,
+        tool_observations: Optional[List[dict]] = None,
+    ) -> dict:
+        checks: List[dict] = []
+        if not str(answer_text or "").strip():
+            return {"grader": self.version, "status": "skipped", "score": None, "checks": [], "failures": []}
+        contract = answer_contract or extract_answer_contract_from_text(user_text)
+        if contract.get("entity_type") == "opportunity_card":
+            checks.extend(self._grade_opportunity_contract(str(answer_text or ""), contract))
+        checks.extend(self._grade_provider_boundaries(str(answer_text or ""), tool_observations or []))
+
+        if not checks:
+            return {"grader": self.version, "status": "skipped", "score": None, "checks": [], "failures": []}
+
+        total_weight = sum(float(check.get("weight") or 1.0) for check in checks)
+        passed_weight = sum(float(check.get("weight") or 1.0) for check in checks if check.get("passed"))
+        score = round(passed_weight / total_weight, 4) if total_weight else 1.0
+        failures = [str(check.get("name") or "check") for check in checks if not check.get("passed")]
+        status = "pass" if not failures else ("partial" if score >= 0.5 else "fail")
+        return {"grader": self.version, "status": status, "score": score, "checks": checks, "failures": failures}
+
+    def _grade_opportunity_contract(self, answer_text: str, contract: dict) -> List[dict]:
+        requested_count = contract.get("requested_count")
+        checks: List[dict] = []
+        if requested_count:
+            observed_count = self._observed_opportunity_count(answer_text)
+            checks.append(
+                self._check(
+                    "opportunity_requested_count",
+                    observed_count == int(requested_count),
+                    0.35,
+                    "requested=%s observed=%s" % (requested_count, observed_count if observed_count is not None else "unknown"),
+                )
+            )
+            too_many = observed_count is not None and observed_count > int(requested_count)
+            checks.append(
+                self._check(
+                    "opportunity_no_extra_items",
+                    not too_many and "实际返回机会数: 10" not in answer_text and "实际返回机会数：10" not in answer_text,
+                    0.2,
+                    "answer must not expose more opportunities than requested",
+                )
+            )
+
+        required_terms = ["机会理由", "关键证据", "下一步"]
+        risk_ok = "风险" in answer_text or "证据边界" in answer_text or "边界" in answer_text
+        missing = [term for term in required_terms if term not in answer_text]
+        if not risk_ok:
+            missing.append("风险/证据边界")
+        checks.append(
+            self._check(
+                "opportunity_card_analysis_fields",
+                not missing,
+                0.45,
+                "missing=%s" % (", ".join(missing) if missing else "none"),
+            )
+        )
+        return checks
+
+    def _grade_provider_boundaries(self, answer_text: str, tool_observations: List[dict]) -> List[dict]:
+        checks: List[dict] = []
+        review_conflicts = self._unsupported_direct_lines(answer_text, self.REVIEW_PROVIDER_TERMS)
+        keyword_conflicts = self._unsupported_direct_lines(answer_text, self.KEYWORD_DEMAND_TERMS)
+        if review_conflicts or self._provider_required_observed(tool_observations, "asin_review_insights"):
+            checks.append(
+                self._check(
+                    "review_provider_boundary",
+                    not review_conflicts and self._mentions_review_provider_boundary(answer_text),
+                    0.5,
+                    self._details_for_conflicts(review_conflicts, "review_text_provider boundary required"),
+                )
+            )
+        if keyword_conflicts or self._provider_required_observed(tool_observations, "amazon_keyword_demand"):
+            checks.append(
+                self._check(
+                    "keyword_demand_provider_boundary",
+                    not keyword_conflicts and self._mentions_keyword_provider_boundary(answer_text),
+                    0.5,
+                    self._details_for_conflicts(keyword_conflicts, "keyword demand provider boundary required"),
+                )
+            )
+        return checks
+
+    def _unsupported_direct_lines(self, answer_text: str, terms: Tuple[str, ...]) -> List[str]:
+        conflicts: List[str] = []
+        for line in str(answer_text or "").splitlines():
+            normalized = line.strip()
+            if not normalized or not any(term in normalized for term in terms):
+                continue
+            if not any(marker in normalized for marker in self.DIRECT_SUPPORT_MARKERS):
+                continue
+            if any(marker in normalized for marker in self.PROVIDER_BOUNDARY_MARKERS):
+                continue
+            conflicts.append(normalized[:240])
+        return conflicts
+
+    def _observed_opportunity_count(self, answer_text: str) -> Optional[int]:
+        match = re.search(r"实际返回机会数\s*[:：]\s*(\d+)", answer_text)
+        if match:
+            with contextlib.suppress(ValueError):
+                return int(match.group(1))
+        table_rows = re.findall(r"^\|\s*\d+\s*\|", answer_text, flags=re.MULTILINE)
+        if table_rows:
+            return len(table_rows)
+        headings = re.findall(r"^#{1,4}\s*(?:机会\s*)?\d+[\.、：:]", answer_text, flags=re.MULTILINE)
+        return len(headings) if headings else None
+
+    def _provider_required_observed(self, tool_observations: List[dict], tool_name: str) -> bool:
+        for observation in tool_observations or []:
+            if not isinstance(observation, dict) or observation.get("tool_name") != tool_name:
+                continue
+            raw_result = str(observation.get("raw_result") or observation.get("llm_result") or "")
+            if "provider_required" in raw_result or "missing_capability" in raw_result:
+                return True
+        return False
+
+    def _mentions_review_provider_boundary(self, answer_text: str) -> bool:
+        return "review_text_provider" in answer_text or "评论文本" in answer_text or "评论文本分析 provider" in answer_text
+
+    def _mentions_keyword_provider_boundary(self, answer_text: str) -> bool:
+        return "关键词量 provider" in answer_text or "amazon_keyword_demand" in answer_text or "ABA" in answer_text
+
+    def _details_for_conflicts(self, conflicts: List[str], fallback: str) -> str:
+        if not conflicts:
+            return fallback
+        return "conflicting_lines=%s" % " | ".join(conflicts[:3])
+
+    def _check(self, name: str, passed: bool, weight: float, details: str = "") -> dict:
+        return {"name": name, "passed": bool(passed), "weight": float(weight), "details": details}
+
+
+def preflight_tool_call(tool_call: Dict[str, Any], answer_contract: Optional[dict] = None) -> Dict[str, Any]:
+    if not isinstance(tool_call, dict):
+        return tool_call
+    tool_name = str(tool_call.get("name") or "").strip()
+    parameters = dict(tool_call.get("parameters") or {}) if isinstance(tool_call.get("parameters"), dict) else {}
+
+    limits = TOOL_NUMERIC_LIMITS.get(tool_name) or {}
+    for param_name, (min_value, max_value) in limits.items():
+        if param_name not in parameters or parameters.get(param_name) in (None, ""):
+            continue
+        with contextlib.suppress(TypeError, ValueError):
+            raw_value = int(float(parameters[param_name]))
+            parameters[param_name] = max(min_value, min(max_value, raw_value))
+
+    contract = answer_contract or {}
+    requested_count = contract.get("requested_count")
+    if tool_name == "opportunity_discovery" and contract.get("entity_type") == "opportunity_card" and requested_count:
+        with contextlib.suppress(TypeError, ValueError):
+            parameters["limit"] = max(1, min(30, int(requested_count)))
+
+    updated = dict(tool_call)
+    updated["parameters"] = parameters
+    return updated
+
+
 _CANDIDATE_POOL_HANDLES = {
     "candidate_pool_stats",
+    "candidate_pool_slice",
     "candidate_pool_trends",
     "candidate_pool_weak_forecast",
     "category_benchmark",
     "top_asin_drilldown",
+    "asin_review_insights",
     "product_forecast_explain",
     "expand_candidates",
 }
@@ -797,6 +1096,7 @@ class AgentHarness:
     ):
         self.registry = registry or ToolRegistry()
         self.synthesis_runner = SynthesisRunner()
+        self.grader = AgentGrader()
         self.chat_id = (str(chat_id).strip() if chat_id else "") or None
         self.session_store = session_store or SESSION_CONTEXT
 
@@ -908,6 +1208,8 @@ class AgentHarness:
         observation_context: Callable[[List[dict], int], List[dict]],
         trace: Optional[AgentTrace] = None,
         limit_reached: bool = False,
+        answer_contract: Optional[dict] = None,
+        followup_actionability_policy: Optional[dict] = None,
     ) -> dict:
         return self.synthesis_runner.build_context(
             planner_notes,
@@ -915,6 +1217,32 @@ class AgentHarness:
             observation_context,
             trace=trace,
             limit_reached=limit_reached,
+            answer_contract=answer_contract,
+            followup_actionability_policy=followup_actionability_policy,
+        )
+
+    def answer_contract_from_text(self, text: str) -> dict:
+        return extract_answer_contract_from_text(text)
+
+    def followup_actionability_policy(self) -> dict:
+        return followup_actionability_policy()
+
+    def preflight_tool_call(self, tool_call: Dict[str, Any], answer_contract: Optional[dict] = None) -> Dict[str, Any]:
+        return preflight_tool_call(tool_call, answer_contract=answer_contract)
+
+    def grade_answer(
+        self,
+        *,
+        user_text: str = "",
+        answer_text: str = "",
+        answer_contract: Optional[dict] = None,
+        tool_observations: Optional[List[dict]] = None,
+    ) -> dict:
+        return self.grader.grade(
+            user_text=user_text,
+            answer_text=answer_text,
+            answer_contract=answer_contract,
+            tool_observations=tool_observations,
         )
 
     def scene_policy(self, scene: str, mode: str = "agent") -> dict:

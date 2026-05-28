@@ -56,5 +56,21 @@
     "required_any_terms": ["预算", "盈亏", "利润", "启动资金"],
     "forbidden_terms": ["缺少必填参数", "工具不可用"],
     "max_term_counts": {"正在执行步骤 1/1：launch_budget_calculator": 1}
+  },
+  {
+    "case_id": "opportunity_top5_card_contract_stream",
+    "title": "机会发现 top5 卡片结构",
+    "prompt": "/agent 使用机会发现模块，输出top5的机会卡片，并对每个卡片的机会进行分析解说",
+    "stream": true,
+    "required_any_terms": ["机会卡片", "Top 5", "top5", "下一步"],
+    "forbidden_terms": ["实际返回机会数：10", "第 6", "第6"]
+  },
+  {
+    "case_id": "report_followup_actionability_standard",
+    "title": "报告追问能力边界标注",
+    "prompt": "/report standard Amazon 美国 3D Printing Filament 选品机会分析，重点给出后续追问建议",
+    "stream": false,
+    "required_any_terms": ["能力边界", "当前可", "需外部数据", "provider"],
+    "forbidden_terms": ["月搜索量分别是多少？头部 ASIN", "评分分布 + 关键词）是什么样的？"]
   }
 ]

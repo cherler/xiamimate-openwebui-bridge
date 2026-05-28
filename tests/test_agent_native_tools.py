@@ -64,6 +64,43 @@ class FakeAgentTools:
         """Get candidate pool stats."""
         return ""
 
+    def candidate_pool_slice(
+        self,
+        candidate_asins: str = "",
+        candidate_pool_id: str = "",
+        marketplace: str = "US",
+        window_days: int = 30,
+        brand_include: str = "",
+        title_keywords: str = "",
+        material_keywords: str = "",
+        sort_by: str = "sales_window_sum",
+        top_n: int = 3,
+        product_query: str = "",
+    ) -> str:
+        """Slice candidate pool by brand, title, or material."""
+        return ""
+
+    def asin_review_insights(
+        self,
+        candidate_asins: str = "",
+        candidate_pool_id: str = "",
+        marketplace: str = "US",
+        window_days: int = 30,
+        max_asins: int = 10,
+        product_query: str = "",
+    ) -> str:
+        """Fetch review insight provider status."""
+        return ""
+
+    def amazon_keyword_demand(
+        self,
+        keywords: str = "",
+        product_query: str = "",
+        marketplace: str = "US",
+    ) -> str:
+        """Fetch Amazon keyword demand provider status."""
+        return ""
+
     def category_benchmark(
         self,
         candidate_asins: str = "",
@@ -545,8 +582,8 @@ class AgentNativeToolTests(unittest.TestCase):
         compacted = json.loads(rendered)
 
         self.assertEqual(compacted["result_format"], "opportunity_evidence_block")
-        self.assertIn("工具证据块", compacted["instruction"])
-        self.assertIn("不要把证据表改写成平铺列表", compacted["instruction"])
+        self.assertIn("工具证据来源", compacted["instruction"])
+        self.assertIn("主答案必须逐卡包含机会理由", compacted["instruction"])
         self.assertEqual(compacted["payload"]["opportunity_discovery_job_id"], "odisc_test")
         self.assertEqual(compacted["payload"]["result_ref"]["job_id"], "odisc_test")
         self.assertEqual(compacted["payload"]["opportunity_count"], 10)
@@ -1278,6 +1315,175 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertEqual(normalized["parameters"]["marketplace"], "US")
         self.assertEqual(normalized["parameters"]["limit"], 5)
 
+    def test_opportunity_top5_request_preflights_discovery_limit(self) -> None:
+        pipe = self.make_pipeline()
+        messages = [{"role": "user", "content": "使用机会发现模块，输出top5的机会卡片，并对每个卡片的机会进行分析解说"}]
+        steps = [
+            {
+                "tool_call": {
+                    "name": "opportunity_discovery",
+                    "parameters": {"marketplace": "US", "limit": 10},
+                }
+            }
+        ]
+
+        repaired = pipe._repair_planner_steps_required_arguments(steps, messages, {})
+
+        self.assertEqual(repaired[0]["tool_call"]["parameters"]["limit"], 5)
+        contract = pipe._answer_contract_from_messages(messages)
+        self.assertEqual(contract["requested_count"], 5)
+        self.assertEqual(contract["entity_type"], "opportunity_card")
+        self.assertIn("每张卡片", " ".join(contract["must_include"]))
+
+    def test_tool_preflight_clamps_top_asin_top_n_to_schema_limit(self) -> None:
+        pipe = self.make_pipeline()
+        messages = [{"role": "user", "content": "提供 SUNLU/Creality 在候选池中的具体 ASIN 列表"}]
+        steps = [
+            {
+                "tool_call": {
+                    "name": "top_asin_drilldown",
+                    "parameters": {"candidate_pool_id": "11111111-1111-4111-8111-111111111111", "top_n": 30},
+                }
+            }
+        ]
+
+        repaired = pipe._repair_planner_steps_required_arguments(steps, messages, {})
+
+        self.assertEqual(repaired[0]["tool_call"]["parameters"]["top_n"], 20)
+
+    def test_stage_b_c_tools_are_registered_for_theme_analysis(self) -> None:
+        pipe = self.make_pipeline()
+
+        allowed_tools = set(pipe._planner_allowed_tool_names("theme_analysis"))
+
+        self.assertIn("candidate_pool_slice", allowed_tools)
+        self.assertIn("asin_review_insights", allowed_tools)
+        self.assertIn("amazon_keyword_demand", allowed_tools)
+
+    def test_candidate_pool_slice_aliases_and_top_n_preflight(self) -> None:
+        pipe = self.make_pipeline()
+        messages = [{"role": "user", "content": "从候选池里看 SUNLU/Creality 的 top30 ASIN"}]
+        steps = [
+            {
+                "tool_call": pipe._normalize_tool_call(
+                    "candidate_pool_slice",
+                    {
+                        "pool_id": "11111111-1111-4111-8111-111111111111",
+                        "brands": ["SUNLU", "Creality"],
+                        "material": "PLA",
+                        "top_n": 30,
+                    },
+                )
+            }
+        ]
+
+        repaired = pipe._repair_planner_steps_required_arguments(steps, messages, {})
+        params = repaired[0]["tool_call"]["parameters"]
+
+        self.assertEqual(params["candidate_pool_id"], "11111111-1111-4111-8111-111111111111")
+        self.assertEqual(params["brand_include"], ["SUNLU", "Creality"])
+        self.assertEqual(params["material_keywords"], "PLA")
+        self.assertEqual(params["top_n"], 20)
+
+    def test_amazon_keyword_demand_keyword_aliases(self) -> None:
+        pipe = self.make_pipeline()
+
+        normalized = pipe._normalize_tool_call(
+            "amazon_keyword_demand",
+            {"keyword_list": "carbon fiber PLA, matte PLA", "market": "amazon.com"},
+        )
+
+        self.assertEqual(normalized["parameters"]["keywords"], "carbon fiber PLA, matte PLA")
+        self.assertEqual(normalized["parameters"]["marketplace"], "US")
+
+    def test_report_followup_questions_are_annotated_by_actionability(self) -> None:
+        pipe = self.make_pipeline()
+        answer = """# Amazon 美国 3D Printing Filament 深度选品分析报告
+
+## 下一步可复制追问
+
+3. **竞品下钻：** Creality / SUNLU / eSUN 三家的 1kg PLA 基础款评论结构（评分分布 + 关键词）是什么样的？
+
+4. **差异化机会矩阵：** 碳纤维增强 PLA、哑光 PLA、丝绸 PLA 这三个细分材质在 Amazon 上的月搜索量分别是多少？头部 ASIN 的月销量区间和评论量分布？
+"""
+
+        rendered = pipe._prepare_workflow_answer(answer)
+
+        self.assertIn("下一步验证问题（已按当前工具能力标注）", rendered)
+        self.assertIn("能力边界提示", rendered)
+        self.assertIn("评论文本分析 provider", rendered)
+        self.assertIn("关键词量 provider", rendered)
+        self.assertIn("需评论文本 provider", rendered)
+        self.assertIn("需关键词量 provider", rendered)
+        self.assertNotIn("下一步可复制追问", rendered)
+
+    def test_report_followup_provider_required_rewrites_direct_markers(self) -> None:
+        pipe = self.make_pipeline()
+        answer = """## 下一步验证问题
+
+5. ✅ 评论质量分析：Top 5 ASIN 的 1-3 星差评集中在哪些痛点？
+6. 可直接执行：Power Strips 在 Amazon 的月搜索量是多少？
+"""
+
+        rendered = pipe._prepare_workflow_answer(answer)
+
+        self.assertIn("需评论文本 provider：评论质量分析", rendered)
+        self.assertIn("需关键词量 provider：Power Strips", rendered)
+        self.assertIn("provider_required", rendered)
+        self.assertNotIn("✅ 评论质量分析", rendered)
+        self.assertNotIn("可直接执行：Power Strips", rendered)
+
+    def test_agent_grader_flags_opportunity_table_without_card_fields(self) -> None:
+        pipe = self.make_pipeline()
+        user_text = "使用机会发现模块，输出top5的机会卡片，并对每个卡片的机会进行分析解说"
+        answer = """## 机会发现结果
+
+市场: US | 平台: Amazon | 实际返回机会数: 5
+
+| 排名 | 机会 | 机会得分 |
+|---:|---|---:|
+| 1 | Power Strips | 86.69 |
+| 2 | Windshield Sunshades | 80.70 |
+| 3 | Women's Pants | 80.64 |
+| 4 | Men's Button-Down Shirts | 76.36 |
+| 5 | Tumblers | 76.25 |
+"""
+
+        result = pipe.agent_harness.grade_answer(user_text=user_text, answer_text=answer)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertIn("opportunity_card_analysis_fields", result["failures"])
+        checks = {check["name"]: check for check in result["checks"]}
+        self.assertTrue(checks["opportunity_requested_count"]["passed"])
+        self.assertTrue(checks["opportunity_no_extra_items"]["passed"])
+
+    def test_agent_grader_flags_provider_required_followup_as_direct(self) -> None:
+        pipe = self.make_pipeline()
+        answer = """## 下一步验证问题（已按当前工具能力标注）
+
+5. 可直接执行：评论质量分析：Top 5 ASIN 的 1-3 星差评集中在哪些痛点？
+"""
+
+        result = pipe.agent_harness.grade_answer(answer_text=answer)
+
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("review_provider_boundary", result["failures"])
+
+    def test_agent_grader_accepts_review_provider_boundary(self) -> None:
+        pipe = self.make_pipeline()
+        answer = "当前缺 review_text_provider；asin_review_insights 返回 provider_required，不能生成真实评论关键词。"
+        observations = [
+            {
+                "tool_name": "asin_review_insights",
+                "raw_result": json.dumps({"success": True, "provider_required": True, "missing_capability": "review_text_provider"}),
+            }
+        ]
+
+        result = pipe.agent_harness.grade_answer(answer_text=answer, tool_observations=observations)
+
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(result["score"], 1.0)
+
     def test_invalid_opportunity_expansion_falls_back_to_real_cards(self) -> None:
         pipe = self.make_pipeline()
         raw_result = json.dumps(
@@ -1302,6 +1508,57 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertIn("真实机会2", answer)
         self.assertIn("本次机会发现返回的机会卡片", answer)
         self.assertIn("当前可继续分析的机会编号共有 2 个", answer)
+
+    def test_opportunity_contract_fallback_renders_analysis_cards(self) -> None:
+        pipe = self.make_pipeline()
+        user_text = "使用机会发现模块，输出top2的机会卡片，并对每个卡片的机会进行分析解说"
+        raw_result = json.dumps(
+            {
+                "opportunity_count": 2,
+                "opportunity_cards_text": "| 排名 | 机会主题 | 得分 |\n| --- | --- | --- |\n| #1 | Power Strips | 86.69 |\n| #2 | Tumblers | 76.25 |",
+                "opportunities_for_llm": [
+                    {
+                        "rank": 1,
+                        "title": "Power Strips",
+                        "category_id": 11,
+                        "category_path": "Electronics > Power Strips",
+                        "opportunity_score": 86.69,
+                        "sales_window_sum": 930110.88,
+                        "trend_momentum_display": "销量 +175.42% / 趋势 近期趋势缺失",
+                        "candidate_count": 62,
+                        "row_count": 611,
+                        "confidence": "medium",
+                        "next_action": {"request": {"product_query": "Power Strips", "category_id": 11, "category_path": "Electronics > Power Strips"}},
+                    },
+                    {
+                        "rank": 2,
+                        "title": "Tumblers",
+                        "category_path": "Home & Kitchen > Tumblers",
+                        "opportunity_score": 76.25,
+                        "candidate_count": 32,
+                        "row_count": 342,
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        )
+        observation = pipe._build_tool_observation({"name": "opportunity_discovery", "parameters": {"marketplace": "US", "limit": 2}}, raw_result)
+
+        answer = pipe._fallback_opportunity_answer_if_needed(
+            "## 机会发现结果\n\n| 排名 | 机会 |\n|---:|---|\n| 1 | Power Strips |\n| 2 | Tumblers |",
+            [observation],
+            answer_contract=pipe.agent_harness.answer_contract_from_text(user_text),
+        )
+
+        self.assertIn("### 机会 1：Power Strips", answer)
+        self.assertIn("### 机会 2：Tumblers", answer)
+        self.assertIn("机会理由", answer)
+        self.assertIn("关键证据", answer)
+        self.assertIn("风险/证据边界", answer)
+        self.assertIn("下一步验证", answer)
+        self.assertNotIn("| 排名 |", answer)
+        grade = pipe.agent_harness.grade_answer(user_text=user_text, answer_text=answer)
+        self.assertEqual(grade["status"], "pass")
         self.assertNotIn("估算区间", answer)
 
     def test_report_query_resolves_opportunity_reference_from_markdown_table(self) -> None:
