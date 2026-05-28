@@ -155,6 +155,7 @@ AGENT_SYNTHESIS_SYSTEM_PROMPT = """你是 XiaMimate 的 Answer Synthesizer。
 7. 如果上下文包含 answer_contract，必须按其中 requested_count、answer_shape、must_include 和 must_not_include 组织最终答复。
 8. 如果上下文包含 followup_actionability_policy，报告尾部追问必须标注当前是否可直接执行；评论关键词、Amazon 月搜索量、品牌内 top3 等缺 provider 的问题不得写成已完整支持。
 9. 当 answer_contract.entity_type=opportunity_card 时，最终答复必须使用以下逐卡模板作为主答案，不要只输出排名表：`### 机会 N：<名称>`，其下依次给出 `机会理由`、`关键证据`、`风险/证据边界`、`下一步验证`。没有对应工具字段时写“当前工具未返回该细节”，不要编造。
+10. 当任一工具结果包含 provider_status=provider_required 或 missing_capability 时，必须显式说明缺失的 provider，并复述该结果中 available_alternatives 至少一条作为下一步替代验证路径，不要把 provider_required 包装成普通结论。
 """
 
 TOOL_LAYER_REGISTRY = agent_harness.TOOL_LAYER_REGISTRY
@@ -2896,14 +2897,16 @@ class Pipeline:
             "1～3 星差评",
         )
         keyword_terms = ("月搜索量", "Amazon 搜索量", "amazon 搜索量", "ABA", "Helium10", "JungleScout")
+        review_note = "（provider_required：真实评论关键词、低分原因或评论质量分析需评论文本分析 provider；当前仅能直接验证评分/评论数量分布。）"
+        keyword_note = "（provider_required：精确 Amazon 月搜索量需 ABA/Helium10/JungleScout 或自有关键词量 provider；当前只能用趋势指数、ASIN 销量和评论量作替代验证。）"
         if any(term in updated for term in review_terms):
             updated = self._force_provider_required_marker(updated, "需评论文本 provider")
-            if "评论文本分析 provider" not in updated and "review_text_provider" not in updated:
-                updated += "（provider_required：真实评论关键词、低分原因或评论质量分析需评论文本分析 provider；当前仅能直接验证评分/评论数量分布。）"
+            if "评论文本分析 provider" not in updated and "review_text_provider" not in updated and review_note not in updated:
+                updated += review_note
         if any(term in updated for term in keyword_terms):
             updated = self._force_provider_required_marker(updated, "需关键词量 provider")
-            if "关键词量 provider" not in updated:
-                updated += "（provider_required：精确 Amazon 月搜索量需 ABA/Helium10/JungleScout 或自有关键词量 provider；当前只能用趋势指数、ASIN 销量和评论量作替代验证。）"
+            if "关键词量 provider" not in updated and keyword_note not in updated:
+                updated += keyword_note
         return updated
 
     def _force_provider_required_marker(self, line: str, marker: str) -> str:

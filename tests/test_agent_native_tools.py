@@ -1501,6 +1501,34 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertEqual(result["status"], "pass")
         self.assertEqual(result["score"], 1.0)
 
+    def test_agent_grader_does_not_treat_generic_que_as_boundary(self) -> None:
+        pipe = self.make_pipeline()
+        answer = "1. 评论关键词：✅可直接执行 — 销量缺口分析"
+        observations = [
+            {
+                "tool_name": "asin_review_insights",
+                "raw_result": json.dumps({"success": True, "provider_required": True, "missing_capability": "review_text_provider"}),
+            }
+        ]
+
+        result = pipe.agent_harness.grade_answer(answer_text=answer, tool_observations=observations)
+
+        self.assertEqual(result["status"], "fail")
+        self.assertIn("review_provider_boundary", result["failures"])
+
+    def test_tool_layer_registry_exposes_machine_readable_boundaries(self) -> None:
+        registry = xiamimate.agent_harness.TOOL_LAYER_REGISTRY
+        slice_meta = registry["candidate_pool_slice"]
+        review_meta = registry["asin_review_insights"]
+        demand_meta = registry["amazon_keyword_demand"]
+        self.assertFalse(slice_meta["requires_provider"])
+        self.assertIn("rating_distribution", slice_meta["provides"])
+        self.assertEqual(review_meta["requires_provider"], "review_text_provider")
+        self.assertIn("评论关键词", review_meta["unsupported_claims"])
+        self.assertIn("candidate_pool_slice.rating_distribution", review_meta["fallback_alternatives"])
+        self.assertEqual(demand_meta["requires_provider"], "amazon_keyword_volume_provider")
+        self.assertIn("Amazon 月搜索量", demand_meta["unsupported_claims"])
+
     def test_invalid_opportunity_expansion_falls_back_to_real_cards(self) -> None:
         pipe = self.make_pipeline()
         raw_result = json.dumps(

@@ -293,6 +293,9 @@ TOOL_LAYER_REGISTRY = {
         "layer": "analysis",
         "capability": "按品牌、标题关键词或材质关键词切片候选池，返回切片内 top ASIN、评分/评论数量/销量分布；不能回答评论文本关键词或 Amazon 月搜索量",
         "scene_tags": ["theme_analysis", "general_agent"],
+        "requires_provider": False,
+        "provides": ["slice_top_asins", "rating_distribution", "review_count_distribution", "sales_window_sum", "top_brands"],
+        "unsupported_claims": ["评论文本关键词", "低分原因", "Amazon 月搜索量"],
     },
     "candidate_pool_trends": {
         "layer": "analysis",
@@ -318,11 +321,19 @@ TOOL_LAYER_REGISTRY = {
         "layer": "analysis",
         "capability": "评论关键词、低分原因、正负面评论主题 provider 探针；未配置评论文本 provider 时必须返回能力缺口，禁止编造关键词",
         "scene_tags": ["theme_analysis", "asin_specific_analysis", "general_agent"],
+        "requires_provider": "review_text_provider",
+        "provides": ["review_insights_when_provider_ready"],
+        "unsupported_claims": ["评论关键词", "差评关键词", "低分原因", "评论质量", "评论痛点", "差评集中"],
+        "fallback_alternatives": ["candidate_pool_slice.rating_distribution", "candidate_pool_slice.review_count_distribution", "top_asin_drilldown.rating_and_review_counts"],
     },
     "amazon_keyword_demand": {
         "layer": "analysis",
         "capability": "Amazon 关键词月搜索量/需求 provider 探针；未配置 ABA/第三方关键词量 provider 时必须返回能力缺口，禁止伪造搜索量",
         "scene_tags": ["theme_analysis", "general_agent"],
+        "requires_provider": "amazon_keyword_volume_provider",
+        "provides": ["keyword_demand_when_provider_ready"],
+        "unsupported_claims": ["Amazon 月搜索量", "月搜索量", "ABA 排名", "Helium10 搜索量", "JungleScout 搜索量"],
+        "fallback_alternatives": ["candidate_pool_trends.google_trends_index", "candidate_pool_slice.sales_window_sum", "top_asin_drilldown.sales_and_review_counts"],
     },
     "asin_history_timeseries": {
         "layer": "analysis",
@@ -752,13 +763,17 @@ class AgentGrader:
     PROVIDER_BOUNDARY_MARKERS = (
         "provider",
         "外部",
-        "缺",
+        "能力缺口",
+        "未配置",
+        "未支持",
         "无法直接",
         "不能直接",
         "不得",
         "需要",
         "需 ",
         "需外部",
+        "需评论文本",
+        "需关键词量",
         "待补",
     )
     REVIEW_PROVIDER_TERMS = (
