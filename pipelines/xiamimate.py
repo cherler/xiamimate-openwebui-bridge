@@ -569,6 +569,13 @@ class Pipeline:
             return self._run_report(query=normalized_user_message, body=body, model=response_model)
         if mode == "web":
             return self._run_web_search(query=normalized_user_message, body=body, model=response_model, model_name=agent_model_name)
+        if mode == "tool" and self._explicit_tool_name_from_text(normalized_user_message) == "web_search":
+            return self._run_web_search(
+                query=self._web_search_query_from_tool_alias(normalized_user_message),
+                body=body,
+                model=response_model,
+                model_name=agent_model_name,
+            )
         if mode in {"agent", "tool"}:
             self._ensure_agent_harness(body)
             return self._run_agent(
@@ -5741,6 +5748,16 @@ class Pipeline:
 
     def _explicit_tool_name_from_text(self, text: str) -> str:
         return self.agent_harness.explicit_tool_name_from_text(text)
+
+    def _web_search_query_from_tool_alias(self, text: str) -> str:
+        query = str(text or "").strip()
+        query = re.sub(
+            r"^(?:请|帮我)?\s*(?:调用|执行|运行|使用)?\s*(?:原生)?\s*(?:工具\s*)?web[_-]?search\s*[，,:：]?\s*",
+            "",
+            query,
+            flags=re.IGNORECASE,
+        ).strip()
+        return query or str(text or "").strip()
 
     def _extract_explicit_tool_subject(self, text: str, tool_name: str) -> str:
         return agent_harness.extract_explicit_tool_subject(text, tool_name)

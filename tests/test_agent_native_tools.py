@@ -380,6 +380,33 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertIn("Tavily 外部检索证据", observed_payloads[0]["messages"][1]["content"])
         self.assertIn("请不要输出原始搜索结果列表", observed_payloads[0]["messages"][1]["content"])
 
+    def test_tool_web_search_alias_redirects_to_web_route(self) -> None:
+        pipe = self.make_pipeline()
+        observed_calls = []
+
+        def run_web_search(query: str, body: dict, model: str, model_name: str = "") -> dict:
+            observed_calls.append({"query": query, "model": model, "model_name": model_name})
+            return pipe._chat_response(content="web result", model=model)
+
+        pipe._run_web_search = run_web_search
+        response = pipe.pipe(
+            user_message="/tool 请调用 web_search，搜索最近 30 天 portable fan overseas market trend，并返回搜索摘要和来源。",
+            model_id="xiamimate.agent-minimax",
+            messages=[
+                {
+                    "role": "user",
+                    "content": "/tool 请调用 web_search，搜索最近 30 天 portable fan overseas market trend，并返回搜索摘要和来源。",
+                }
+            ],
+            body={"model": "xiamimate.agent-minimax", "stream": False, "messages": []},
+        )
+
+        self.assertEqual(response["choices"][0]["message"]["content"], "web result")
+        self.assertEqual(len(observed_calls), 1)
+        self.assertEqual(observed_calls[0]["query"], "搜索最近 30 天 portable fan overseas market trend，并返回搜索摘要和来源。")
+        self.assertEqual(observed_calls[0]["model"], "xiamimate.agent-minimax")
+        self.assertEqual(observed_calls[0]["model_name"], "MiniMax-M2.7-highspeed")
+
     def test_native_capable_provider_does_not_execute_text_tool_markup(self) -> None:
         pipe = self.make_pipeline()
         observed_payloads = []
