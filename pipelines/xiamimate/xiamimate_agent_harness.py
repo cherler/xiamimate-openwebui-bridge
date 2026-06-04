@@ -397,20 +397,40 @@ def observed_tool_names(tool_observations: List[dict]) -> List[str]:
     return names
 
 
+def _digest_observation_result(text: str, head: int = 480, tail: int = 240) -> str:
+    text = (text or "").strip()
+    if len(text) <= head + tail + 32:
+        return text
+    omitted = len(text) - head - tail
+    return f"{text[:head]}\n\n\u2026[omitted {omitted} chars]\u2026\n\n{text[-tail:]}"
+
+
 def planner_observation_context(
     tool_observations: List[dict],
     truncate_text: Callable[[str, int], str],
     limit: int = 6,
 ) -> List[dict]:
+    window = (tool_observations or [])[-max(1, limit) :]
     items: List[dict] = []
-    for observation in (tool_observations or [])[-max(1, limit) :]:
-        items.append(
-            {
-                "tool_name": str(observation.get("tool_name") or "").strip(),
-                "arguments": observation.get("arguments") or {},
-                "result": truncate_text(str(observation.get("llm_result") or ""), 2400),
-            }
-        )
+    last_index = len(window) - 1
+    for idx, observation in enumerate(window):
+        result_text = str(observation.get("llm_result") or "")
+        if idx == last_index:
+            # Newest observation: keep full content (with a safety cap to avoid runaway payloads).
+            result_payload = truncate_text(result_text, 12000)
+            digest = False
+        else:
+            # Older observations: planner already saw them; compress to head+tail digest.
+            result_payload = _digest_observation_result(result_text)
+            digest = True
+        item = {
+            "tool_name": str(observation.get("tool_name") or "").strip(),
+            "arguments": observation.get("arguments") or {},
+            "result": result_payload,
+        }
+        if digest:
+            item["result_digest"] = True
+        items.append(item)
     return items
 
 

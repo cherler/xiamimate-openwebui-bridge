@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from copy import deepcopy
@@ -347,6 +348,9 @@ class Pipeline:
         AGENT_MODEL_MINIMAX_LABEL: str = "MiniMax M2.7"
         AGENT_MAX_TOOL_ROUNDS: int = 12
         AGENT_TRACE_SINK_PATH: str = ""
+        AGENT_PLANNER_MODEL: str = ""
+        AGENT_PLANNER_HEARTBEAT_SECONDS: int = 5
+        AGENT_PLANNER_OBSERVATION_LIMIT: int = 4
         HELP_FAST_TOP_K: int = 4
         HELP_CACHE_TTL_SECONDS: int = 900
         HELP_CACHE_MAX_ENTRIES: int = 128
@@ -374,6 +378,9 @@ class Pipeline:
                 "AGENT_MODEL_MINIMAX_LABEL": os.getenv("AGENT_MODEL_MINIMAX_LABEL", "MiniMax M2.7"),
                 "AGENT_MAX_TOOL_ROUNDS": int(os.getenv("AGENT_MAX_TOOL_ROUNDS", "12")),
                 "AGENT_TRACE_SINK_PATH": os.getenv("AGENT_TRACE_SINK_PATH", ""),
+                "AGENT_PLANNER_MODEL": os.getenv("AGENT_PLANNER_MODEL", ""),
+                "AGENT_PLANNER_HEARTBEAT_SECONDS": int(os.getenv("AGENT_PLANNER_HEARTBEAT_SECONDS", "5") or 0),
+                "AGENT_PLANNER_OBSERVATION_LIMIT": int(os.getenv("AGENT_PLANNER_OBSERVATION_LIMIT", "4") or 4),
                 "HELP_FAST_TOP_K": int(os.getenv("HELP_FAST_TOP_K", "4")),
                 "HELP_CACHE_TTL_SECONDS": int(os.getenv("HELP_CACHE_TTL_SECONDS", "900")),
                 "HELP_CACHE_MAX_ENTRIES": int(os.getenv("HELP_CACHE_MAX_ENTRIES", "128")),
@@ -1376,7 +1383,7 @@ class Pipeline:
                 for chunk in emit_reasoning_chunks(self._format_agent_progress("正在规划执行路径", percent=25)):
                     yield chunk
                 try:
-                    plan = self._plan_agent_next_steps(
+                    planner_kwargs = dict(
                         messages=source_messages,
                         body=body,
                         model_name=model_name,
@@ -1385,6 +1392,38 @@ class Pipeline:
                         tool_observations=tool_observations,
                         remaining_rounds=max_rounds - round_index,
                     )
+                    heartbeat_interval = max(0, int(self.valves.AGENT_PLANNER_HEARTBEAT_SECONDS or 0))
+                    if heartbeat_interval <= 0:
+                        plan = self._plan_agent_next_steps(**planner_kwargs)
+                    else:
+                        result_holder: dict = {}
+
+                        def _planner_runner() -> None:
+                            try:
+                                result_holder["plan"] = self._plan_agent_next_steps(**planner_kwargs)
+                            except BaseException as plan_exc:  # noqa: BLE001 - re-raise on main thread
+                                result_holder["exc"] = plan_exc
+
+                        planner_thread = threading.Thread(target=_planner_runner, name="xm-planner", daemon=True)
+                        planner_thread.start()
+                        heartbeat_start = time.monotonic()
+                        next_tick = heartbeat_start + heartbeat_interval
+                        while planner_thread.is_alive():
+                            now = time.monotonic()
+                            wait_for = max(0.05, next_tick - now)
+                            planner_thread.join(timeout=wait_for)
+                            if not planner_thread.is_alive():
+                                break
+                            elapsed = int(time.monotonic() - heartbeat_start)
+                            for chunk in emit_reasoning_chunks(
+                                self._format_agent_progress(f"正在规划执行路径 (已等待 {elapsed}s)", percent=25)
+                            ):
+                                yield chunk
+                            next_tick = time.monotonic() + heartbeat_interval
+                        planner_thread.join()
+                        if "exc" in result_holder:
+                            raise result_holder["exc"]
+                        plan = result_holder.get("plan") or {}
                 except RuntimeError as exc:
                     if tool_observations:
                         final_answer = self._fallback_answer_from_tool_observations(tool_observations, error=str(exc))
@@ -5688,11 +5727,12 @@ class Pipeline:
     def _planner_tool_catalog(self, scene: str, mode: str = "agent") -> List[dict]:
         return self.agent_harness.planner_tool_catalog(scene, mode, tool_label=self._tool_name_label)
 
-    def _planner_observation_context(self, tool_observations: List[dict], limit: int = 6) -> List[dict]:
+    def _planner_observation_context(self, tool_observations: List[dict], limit: Optional[int] = None) -> List[dict]:
+        effective_limit = int(limit) if limit is not None else max(1, int(self.valves.AGENT_PLANNER_OBSERVATION_LIMIT or 4))
         return self.agent_harness.planner_observation_context(
             tool_observations,
-            lambda text, budget: self._truncate_text_for_llm(text, budget=budget),
-            limit=limit,
+            lambda text, budget: self._truncate_text_for_llm(text, budget=int(budget or 12000)),
+            limit=effective_limit,
         )
 
     def _observed_tool_names(self, tool_observations: List[dict]) -> List[str]:
@@ -5945,13 +5985,15 @@ class Pipeline:
         tool_observations: List[dict],
         remaining_rounds: int,
     ) -> dict:
-        provider = self._get_provider(model_name)
+        # planner 单独走轻量模型时，filter_payload 仍用 agent provider 以兼容字段过滤，
+        # 但 payload.model 改成 planner_model_name，让 chat-backend 路由到轻量模型。
+        planner_model_name = str(self.valves.AGENT_PLANNER_MODEL or "").strip() or model_name or self._model_name_for_profile(self._default_agent_profile())
+        provider = self._get_provider(planner_model_name)
         payload = provider.filter_payload(body)
-        payload["model"] = model_name or self._model_name_for_profile(self._default_agent_profile())
+        payload["model"] = planner_model_name
         payload["stream"] = False
         payload.pop("tools", None)
         payload.pop("tool_choice", None)
-
         planner_messages = deepcopy(messages or [])
         planner_messages.insert(0, {"role": "system", "content": AGENT_PLANNER_SYSTEM_PROMPT})
         self._insert_agent_memory_profile_message(
@@ -6111,7 +6153,8 @@ class Pipeline:
             tool_observations=tool_observations,
             remaining_rounds=remaining_rounds,
         )
-        response = self._post_agent_payload(payload, model_name=model_name)
+        planner_model_name = str(payload.get("model") or "").strip() or model_name
+        response = self._post_agent_payload(payload, model_name=planner_model_name)
         native_tool_calls = self._filter_tool_calls_for_user_intent(self._extract_response_tool_calls(response), messages)
         if native_tool_calls:
             steps = []

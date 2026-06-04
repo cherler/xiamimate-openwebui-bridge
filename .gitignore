@@ -13,3 +13,4 @@ pipelines/*/valves.json
 *.bak
 *.tmp
 *.swp
+logs/*.jsonl
