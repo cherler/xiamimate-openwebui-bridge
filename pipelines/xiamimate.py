@@ -361,6 +361,7 @@ class Pipeline:
         AGENT_TITLE_TRANSLATION_TIMEOUT: int = 20
         AGENT_TITLE_TRANSLATOR_BASE_URL: str = ""
         AGENT_TITLE_TRANSLATOR_API_KEY: str = ""
+        AGENT_OPPORTUNITY_BYPASS_SYNTHESIS: bool = True
         HELP_FAST_TOP_K: int = 4
         HELP_CACHE_TTL_SECONDS: int = 900
         HELP_CACHE_MAX_ENTRIES: int = 128
@@ -397,6 +398,7 @@ class Pipeline:
                 "AGENT_TITLE_TRANSLATION_TIMEOUT": int(os.getenv("AGENT_TITLE_TRANSLATION_TIMEOUT", "20") or 20),
                 "AGENT_TITLE_TRANSLATOR_BASE_URL": os.getenv("AGENT_TITLE_TRANSLATOR_BASE_URL", ""),
                 "AGENT_TITLE_TRANSLATOR_API_KEY": os.getenv("AGENT_TITLE_TRANSLATOR_API_KEY", ""),
+                "AGENT_OPPORTUNITY_BYPASS_SYNTHESIS": (os.getenv("AGENT_OPPORTUNITY_BYPASS_SYNTHESIS", "true").strip().lower() not in {"0", "false", "no", "off", ""}),
                 "HELP_FAST_TOP_K": int(os.getenv("HELP_FAST_TOP_K", "4")),
                 "HELP_CACHE_TTL_SECONDS": int(os.getenv("HELP_CACHE_TTL_SECONDS", "900")),
                 "HELP_CACHE_MAX_ENTRIES": int(os.getenv("HELP_CACHE_MAX_ENTRIES", "128")),
@@ -6327,6 +6329,12 @@ class Pipeline:
         agent_trace: Optional[Any] = None,
         limit_reached: bool = False,
     ) -> str:
+        bypass = self._maybe_bypass_synthesis_with_rendered_opportunity_cards(
+            messages=messages,
+            tool_observations=tool_observations,
+        )
+        if bypass:
+            return bypass
         payload = self._prepare_planner_executor_synthesis_payload(
             messages=messages,
             body=body,
@@ -8518,6 +8526,54 @@ class Pipeline:
             if normalized_title in answer_text:
                 matched_count += 1
         return matched_count >= min(3, max(1, len(titles)))
+
+    def _maybe_bypass_synthesis_with_rendered_opportunity_cards(
+        self,
+        *,
+        messages: List[dict],
+        tool_observations: List[dict],
+    ) -> str:
+        # 机会卡片场景下，最后一轮 opportunity_discovery 的结构化输出（含 title_zh）
+        # 已经由 renderer 拼装成符合 answer_contract 的最终答复，再过一次 synthesis
+        # LLM 既慢又有改写丢列/丢中文的风险。这里只做结构判断，不做内容打分：
+        # ① 总开关开启；② answer_contract 是 opportunity_card；③ 最后一个工具调用
+        # 就是 opportunity_discovery；④ 该 observation 携带成功的结构化 payload
+        # （opportunity_cards_text 非空 + opportunities_for_llm 非空）。任一不满足
+        # 即回退到原 synthesis 路径。
+        if not bool(getattr(self.valves, "AGENT_OPPORTUNITY_BYPASS_SYNTHESIS", True)):
+            return ""
+        contract = self._answer_contract_from_messages(messages)
+        if not isinstance(contract, dict) or contract.get("entity_type") != "opportunity_card":
+            return ""
+        if not tool_observations:
+            return ""
+        last_observation = tool_observations[-1] or {}
+        if str(last_observation.get("tool_name") or "") != "opportunity_discovery":
+            return ""
+        payload = None
+        for result_key in ("raw_result", "llm_result"):
+            payload = self._load_tool_json_payload(last_observation.get(result_key))
+            if payload is not None:
+                break
+        if not isinstance(payload, dict):
+            return ""
+        if payload.get("success") is False:
+            return ""
+        opportunity_payload = self._extract_opportunity_payload(
+            payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
+        )
+        if not isinstance(opportunity_payload, dict):
+            return ""
+        cards_text = str(opportunity_payload.get("opportunity_cards_text") or "").strip()
+        if len(cards_text) < 200:
+            return ""
+        items = opportunity_payload.get("opportunities_for_llm")
+        if not isinstance(items, list) or not items:
+            return ""
+        rendered = self._render_opportunity_cards_from_payload(
+            opportunity_payload, last_observation, answer_contract=contract
+        )
+        return rendered or ""
 
     def _opportunity_titles_from_observations(self, tool_observations: List[dict]) -> List[str]:
         for observation in reversed(tool_observations or []):
