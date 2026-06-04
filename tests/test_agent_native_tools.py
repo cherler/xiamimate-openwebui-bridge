@@ -1722,6 +1722,67 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertNotIn("title_translations", observation)
         self.assertNotIn("title_zh", observation["raw_result"])
 
+    def test_translate_opportunity_titles_retries_once_on_failure(self) -> None:
+        pipe = self.make_pipeline()
+        pipe.valves.AGENT_TITLE_TRANSLATOR_MODEL = "deepseek-v4-flash"
+        attempts = {"count": 0}
+
+        def flaky_post(payload: dict, model_name: str) -> dict:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise RuntimeError("simulated read timeout")
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {"translations": {"Power Strips": "排插"}}, ensure_ascii=False
+                            )
+                        }
+                    }
+                ]
+            }
+
+        pipe._post_agent_payload = flaky_post
+        result = pipe._translate_opportunity_titles(["Power Strips"])
+        self.assertEqual(attempts["count"], 2)
+        self.assertEqual(result, {"Power Strips": "排插"})
+        self.assertEqual(pipe._opportunity_title_zh_cache.get("Power Strips"), "排插")
+
+    def test_translate_opportunity_titles_does_not_cache_failure(self) -> None:
+        pipe = self.make_pipeline()
+        pipe.valves.AGENT_TITLE_TRANSLATOR_MODEL = "deepseek-v4-flash"
+        attempts = {"count": 0}
+
+        def always_fail(payload: dict, model_name: str) -> dict:
+            attempts["count"] += 1
+            raise RuntimeError("simulated read timeout")
+
+        pipe._post_agent_payload = always_fail
+        result = pipe._translate_opportunity_titles(["Power Strips"])
+        self.assertEqual(result, {})
+        self.assertEqual(attempts["count"], 2)
+        self.assertNotIn("Power Strips", pipe._opportunity_title_zh_cache)
+
+        def recover(payload: dict, model_name: str) -> dict:
+            attempts["count"] += 1
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {"translations": {"Power Strips": "排插"}}, ensure_ascii=False
+                            )
+                        }
+                    }
+                ]
+            }
+
+        pipe._post_agent_payload = recover
+        result_2 = pipe._translate_opportunity_titles(["Power Strips"])
+        self.assertEqual(result_2, {"Power Strips": "排插"})
+        self.assertEqual(pipe._opportunity_title_zh_cache.get("Power Strips"), "排插")
+
     def test_report_query_resolves_opportunity_reference_from_markdown_table(self) -> None:
         pipe = self.make_pipeline()
         messages = [

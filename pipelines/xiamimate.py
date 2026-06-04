@@ -8780,17 +8780,30 @@ class Pipeline:
             pending.append(title)
         if not pending:
             return out
-        try:
-            fetched = self._call_opportunity_title_translator(pending)
-        except Exception as exc:  # noqa: BLE001
-            print("xiamimate.agent opportunity title translation failed:", repr(exc))
+        # 跨境调用 DeepSeek 偶发 ReadTimeout/ConnectionError；做一次重试，并且失败时
+        # 不写空串到缓存，避免一次抖动就把这批 title 永久标记为"无翻译"。
+        fetched: Dict[str, str] = {}
+        last_exc: Optional[Exception] = None
+        for attempt in range(2):
+            try:
+                fetched = self._call_opportunity_title_translator(pending)
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                print(
+                    "xiamimate.agent opportunity title translation failed (attempt %d/2):" % (attempt + 1),
+                    repr(exc),
+                )
+        if last_exc is not None:
             return out
         for title in pending:
             zh = str(fetched.get(title) or "").strip()
             if zh and not self._has_cjk(zh):
                 zh = ""
-            cache[title] = zh
+            # 只缓存成功结果；空串不写入缓存，让下一次查询可以重试。
             if zh:
+                cache[title] = zh
                 out[title] = zh
         return out
 
