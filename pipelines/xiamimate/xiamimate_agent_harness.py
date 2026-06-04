@@ -715,13 +715,17 @@ def extract_answer_contract_from_text(text: str) -> dict:
         contract.setdefault("requested_count", 5 if "top5" in normalized else None)
         contract["must_include"] = [
             "只展示用户请求数量的机会卡片",
+            "逐卡展开前先给出一张精简排名表（列：排名/机会主题/类目路径/机会得分），表中主题同样使用中文翻译（English 原文）双语",
             "每张卡片包含机会理由、关键证据、主要风险或证据边界、下一步验证",
             "不要把工具默认返回数量当成用户请求数量",
+            "卡片标题中的品类名使用「中文翻译（English 原文）」双语格式，例如「真空保温杯（Tumblers）」",
         ]
         contract["must_not_include"] = [
             "超过用户请求数量的机会排名",
             "缺少逐卡解说的裸工具表格",
+            "只有逐卡解说但未给出排名表",
             "用未返回的数据补齐机会卡片",
+            "只保留英文原文、未给出中文翻译的卡片标题",
         ]
     if contract.get("requested_count") is None:
         contract.pop("requested_count", None)

@@ -67,7 +67,7 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 10. 涉及类目归属、竞品筛选、是否排除某 ASIN 时，必须基于工具结果中的事实字段判断，优先引用 latest_snapshot.leaf_category_name / latest_snapshot.category_path，其次引用 l3_category_name；不要仅凭标题、品牌或自身知识补全类目。
 11. 当用户要求“清洗/筛选/过滤上一步候选池”，且上一步 resolve_candidates 已返回 ASIN、品牌、product_title、leaf_category_name、fine_category_name、category_path、match_score、match_reasons 等字段时，直接基于这些字段筛选；不要为了判断标题或类目路径是否包含某词而调用 top_asin_drilldown。只有用户明确要求补充销量、价格、BSR、评论、预测等候选池没有的字段，才调用下游详情工具。
 12. 当 resolve_candidates 返回 pool_quality.is_sufficient_for_analysis=false 时，按闭环流程处理，不要把当前候选池包装成完整品类结论：先引用 pool_quality.insufficient_coverage_reason 说明覆盖不足；再调用 category_resolve 获取稳定 category_id/category_path；随后用 resolve_candidates(recall_mode=hybrid 或 category, category_id/category_path, include_descendants=true) 重试本地类目池；若 pool_quality 仍不足，调用 expand_candidates 创建补池任务，并调用 candidate_expansion_status 查询 queued/waiting_token/discovering/hydrating/syncing/completed 状态和 data_readiness。只有补池 job 的 data_readiness.analysis_ready=true，或本地池已 sufficient 且 stats/trends 有有效数值时，才继续 category_benchmark、candidate_pool_stats、top_asin_drilldown 和强结论；如果 status=completed 但 data_readiness.readiness_status=history_hydration_pending 或 serving_sync_pending，要说明“ASIN 已补入但分析特征未就绪”，建议等待 hydrate/serving sync 或只给待验证框架，不要把空 stats 当成市场事实。
-13. 只有当用户还没有给出明确商品主题/关键词/ASIN、在问“找机会/发现机会/某大类下有哪些细分方向/不知道分析什么”时，才调用 opportunity_discovery 输出机会卡片；机会卡片是继续分析入口，按机会编号深入分析时，沿用 opportunities_for_llm 中该编号的 next_action.request 继续调用 resolve_candidates，并以返回的 rank/title/category_path 作为上下文。若用户已经给出明确主题（例如“评估 car vacuum 在 Temu 美国站的机会”“分析 humidifier 在 Amazon US 是否值得做”），不要调用 opportunity_discovery，即使用户句子里出现“机会”二字，也应走主题分析：resolve_candidates -> candidate_pool_stats/candidate_pool_trends/category_benchmark/top_asin_drilldown，并按需要补充 search_knowledge_base 或 web_search。机会发现最终答复必须以逐机会卡片作为主答案；当用户要求 topN/机会卡片/逐卡分析时，每张卡片固定包含“机会理由 / 关键证据 / 风险或证据边界 / 下一步验证”，只展示用户请求数量，不得只返回工具表格。每张机会卡片标题必须使用『中文翻译（English 原文）』双语形式（例如『真空保温杯（Tumblers）』），中文翻译需准确反映品类含义，不可省略；原文本身是中文或专有名词则保留原文。payload.opportunity_cards_text 中的总览表、字段解释和公式明细只能作为证据来源参考，不得替代主答案；不要丢列、改数值或补未返回的数值；同时遵守 payload.llm_summary_guidance/display_rules：保留同名主题隐藏提示；有 personalized_opportunity_score 时保留个性化分或说明排序口径；趋势展示优先使用 trend_momentum_display/trend_signal_status，不能把趋势缺失或近期为 0 简化成普通 -100%；next_action.requires_category_resolve=true 时必须提醒先 category_resolve 再做类目召回。
+13. 只有当用户还没有给出明确商品主题/关键词/ASIN、在问“找机会/发现机会/某大类下有哪些细分方向/不知道分析什么”时，才调用 opportunity_discovery 输出机会卡片；机会卡片是继续分析入口，按机会编号深入分析时，沿用 opportunities_for_llm 中该编号的 next_action.request 继续调用 resolve_candidates，并以返回的 rank/title/category_path 作为上下文。若用户已经给出明确主题（例如“评估 car vacuum 在 Temu 美国站的机会”“分析 humidifier 在 Amazon US 是否值得做”），不要调用 opportunity_discovery，即使用户句子里出现“机会”二字，也应走主题分析：resolve_candidates -> candidate_pool_stats/candidate_pool_trends/category_benchmark/top_asin_drilldown，并按需要补充 search_knowledge_base 或 web_search。机会发现最终答复必须以逐机会卡片作为主答案；当用户要求 topN/机会卡片/逐卡分析时，最终答复结构固定为：① 一句话总览（市场/平台/返回机会数）；② 一张精简排名表（Markdown 表格，表头 `| 排名 | 机会主题 | 类目路径 | 机会得分 |`，行数等于用户请求数量，类目路径过长可省中间层但保留 leaf）；③ 然后用 `### 机会 N：<名称>` 模板逐卡展开，每张卡片固定包含"机会理由 / 关键证据 / 风险或证据边界 / 下一步验证"，只展示用户请求数量，不得只返回工具表格、也不得只给逐卡解说而省略排名表。排名表中的"机会主题"列和每张卡片标题都必须使用『中文翻译（English 原文）』双语形式（例如『真空保温杯（Tumblers）』『车窗遮阳板（Windshield Sunshades）』），中文翻译需准确反映品类含义，不可省略；原文本身是中文或专有名词则保留原文不加括号。payload.opportunity_cards_text 中的总览表、字段解释和公式明细只能作为证据来源参考，不得替代主答案；不要丢列、改数值或补未返回的数值；同时遵守 payload.llm_summary_guidance/display_rules：保留同名主题隐藏提示；有 personalized_opportunity_score 时保留个性化分或说明排序口径；趋势展示优先使用 trend_momentum_display/trend_signal_status，不能把趋势缺失或近期为 0 简化成普通 -100%；next_action.requires_category_resolve=true 时必须提醒先 category_resolve 再做类目召回。
 14. 当用户明确询问销量预测、未来增长或“为什么模型看好/看空”时，优先调用 product_forecast_explain；不要把 candidate_pool_weak_forecast 的弱信号包装成正式模型预测。
 15. 不要把“用户问法”写成固定流程；按 tool_contract.capability 选择能回答问题的工具，按 evidence_contract 区分 tool_fact、derived_metric、default_assumption、hypothesis。涉及启动资金、盈亏平衡、单件利润、预算周期等计算时，调用 launch_budget_calculator，让工具产出公式和数值；最终答复可以自由组织，但必须把明确事实、计算结果、默认假设和商业判断分开。
 16. 当用户询问品牌内 top ASIN、材质细分 top ASIN、评分/评论数量分布时，优先调用 candidate_pool_slice。评论文本关键词/低分原因以及 Amazon 月搜索量目前均未接入 provider，绝不能伪造这些数据，也不要用 Google Trends / 反推伪装为月搜索量；遇到这类诉求，明确给出当前能力边界并推荐 candidate_pool_slice 的评分/评论数量分布、candidate_pool_trends.google_trends_index 等可用替代线索。
@@ -153,7 +153,11 @@ AGENT_SYNTHESIS_SYSTEM_PROMPT = """你是 XiaMimate 的 Answer Synthesizer。
 6. 不要输出内部 JSON、tool_call、planner 字段或控制标记。
 7. 如果上下文包含 answer_contract，必须按其中 requested_count、answer_shape、must_include 和 must_not_include 组织最终答复。
 8. 如果上下文包含 followup_actionability_policy，报告尾部追问必须标注当前是否可直接执行；评论关键词、Amazon 月搜索量、品牌内 top3 等缺 provider 的问题不得写成已完整支持。
-9. 当 answer_contract.entity_type=opportunity_card 时，最终答复必须使用以下逐卡模板作为主答案，不要只输出排名表：`### 机会 N：<名称>`，其下依次给出 `机会理由`、`关键证据`、`风险/证据边界`、`下一步验证`。没有对应工具字段时写“当前工具未返回该细节”，不要编造。
+9. 当 answer_contract.entity_type=opportunity_card 时，最终答复必须采用以下结构作为主答案，不要只输出排名表：
+   - 先给一段一句话总览（市场/平台/返回机会数）；
+   - 紧接一张精简排名表（Markdown 表格），表头固定为 `| 排名 | 机会主题 | 类目路径 | 机会得分 |`，行数等于用户请求数量；机会主题列必须使用「中文翻译（English 原文）」双语格式；类目路径如果过长可省略中间层，但保留 leaf 类目；缺数据时填 `当前工具未返回该细节`；
+   - 然后再用 `### 机会 N：<名称>` 模板逐卡展开，其下依次给出 `机会理由`、`关键证据`、`风险/证据边界`、`下一步验证`。
+   `<名称>` 同样使用「中文翻译（English 原文）」双语格式（示例：「真空保温杯（Tumblers）」「车窗遮阳板（Windshield Sunshades）」「手机壳套装（Case & Cover Bundles）」）；中文翻译需准确反映品类含义，不可省略中文；如果原文本身已是中文或属于专有名词、无对应中文（如 ASIN、品牌名），则保留原文不加括号。没有对应工具字段时写"当前工具未返回该细节"，不要编造。
 10. 当任一工具结果包含 provider_status=provider_required 或 missing_capability 时，必须显式说明缺失的 provider，并复述该结果中 available_alternatives 至少一条作为下一步替代验证路径，不要把 provider_required 包装成普通结论。
 """
 
@@ -351,6 +355,12 @@ class Pipeline:
         AGENT_PLANNER_MODEL: str = ""
         AGENT_PLANNER_HEARTBEAT_SECONDS: int = 5
         AGENT_PLANNER_OBSERVATION_LIMIT: int = 4
+        AGENT_PLANNER_BASE_URL: str = ""
+        AGENT_PLANNER_API_KEY: str = ""
+        AGENT_TITLE_TRANSLATOR_MODEL: str = ""
+        AGENT_TITLE_TRANSLATION_TIMEOUT: int = 20
+        AGENT_TITLE_TRANSLATOR_BASE_URL: str = ""
+        AGENT_TITLE_TRANSLATOR_API_KEY: str = ""
         HELP_FAST_TOP_K: int = 4
         HELP_CACHE_TTL_SECONDS: int = 900
         HELP_CACHE_MAX_ENTRIES: int = 128
@@ -381,6 +391,12 @@ class Pipeline:
                 "AGENT_PLANNER_MODEL": os.getenv("AGENT_PLANNER_MODEL", ""),
                 "AGENT_PLANNER_HEARTBEAT_SECONDS": int(os.getenv("AGENT_PLANNER_HEARTBEAT_SECONDS", "5") or 0),
                 "AGENT_PLANNER_OBSERVATION_LIMIT": int(os.getenv("AGENT_PLANNER_OBSERVATION_LIMIT", "4") or 4),
+                "AGENT_PLANNER_BASE_URL": os.getenv("AGENT_PLANNER_BASE_URL", ""),
+                "AGENT_PLANNER_API_KEY": os.getenv("AGENT_PLANNER_API_KEY", ""),
+                "AGENT_TITLE_TRANSLATOR_MODEL": os.getenv("AGENT_TITLE_TRANSLATOR_MODEL", ""),
+                "AGENT_TITLE_TRANSLATION_TIMEOUT": int(os.getenv("AGENT_TITLE_TRANSLATION_TIMEOUT", "20") or 20),
+                "AGENT_TITLE_TRANSLATOR_BASE_URL": os.getenv("AGENT_TITLE_TRANSLATOR_BASE_URL", ""),
+                "AGENT_TITLE_TRANSLATOR_API_KEY": os.getenv("AGENT_TITLE_TRANSLATOR_API_KEY", ""),
                 "HELP_FAST_TOP_K": int(os.getenv("HELP_FAST_TOP_K", "4")),
                 "HELP_CACHE_TTL_SECONDS": int(os.getenv("HELP_CACHE_TTL_SECONDS", "900")),
                 "HELP_CACHE_MAX_ENTRIES": int(os.getenv("HELP_CACHE_MAX_ENTRIES", "128")),
@@ -388,6 +404,7 @@ class Pipeline:
             }
         )
         self._help_answer_cache: Dict[str, dict] = {}
+        self._opportunity_title_zh_cache: Dict[str, str] = {}
         self.pipelines = self._build_agent_pipelines()
     def _ensure_agent_harness(self, body: dict):
         # mode_router 的 inlet 会把 metadata.chat_id 复制到 body['chat_id']，
@@ -6154,7 +6171,17 @@ class Pipeline:
             remaining_rounds=remaining_rounds,
         )
         planner_model_name = str(payload.get("model") or "").strip() or model_name
-        response = self._post_agent_payload(payload, model_name=planner_model_name)
+        planner_base_url = (self.valves.AGENT_PLANNER_BASE_URL or "").strip()
+        planner_api_key = (self.valves.AGENT_PLANNER_API_KEY or "").strip()
+        if planner_base_url and planner_api_key and self.valves.AGENT_PLANNER_MODEL:
+            response = self._post_llm_direct(
+                base_url=planner_base_url,
+                api_key=planner_api_key,
+                payload=payload,
+                timeout=self.valves.DIFY_REQUEST_TIMEOUT,
+            )
+        else:
+            response = self._post_agent_payload(payload, model_name=planner_model_name)
         native_tool_calls = self._filter_tool_calls_for_user_intent(self._extract_response_tool_calls(response), messages)
         if native_tool_calls:
             steps = []
@@ -7014,6 +7041,26 @@ class Pipeline:
             internal=True,
             timeout=self.valves.DIFY_REQUEST_TIMEOUT,
         )
+
+    def _post_llm_direct(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        payload: dict,
+        timeout: int,
+    ) -> dict:
+        # 直连 OpenAI 兼容 /chat/completions，绕开 chat-backend 的单模型绑定。
+        # 用于 planner / title translator 这类小副线，允许在不污染主 agent 配置的前提下
+        # 切换到独立的轻量模型。
+        normalized = (base_url or "").rstrip("/")
+        url = normalized if normalized.endswith("/chat/completions") else f"{normalized}/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        response = requests.post(url, headers=headers, json=payload, timeout=max(1, int(timeout)))
+        response.raise_for_status()
+        return response.json()
 
     def _stream_agent_final_answer_chunks(self, payload: dict, fallback_content: str, model_name: str) -> Iterator[str]:
         provider = self._get_provider(model_name)
@@ -8130,12 +8177,21 @@ class Pipeline:
         return result_text
 
     def _build_tool_observation(self, tool_call: Dict[str, Any], result: str) -> dict:
+        tool_name = str(tool_call.get("name") or "")
+        raw_text = str(result or "")
+        translations: Dict[str, str] = {}
+        if tool_name.strip() == "opportunity_discovery" and raw_text and not self._tool_result_has_error(raw_text):
+            enriched, translations = self._enrich_opportunity_discovery_raw_result(raw_text)
+            if enriched is not None:
+                raw_text = enriched
         observation = {
-            "tool_name": str(tool_call.get("name") or ""),
+            "tool_name": tool_name,
             "arguments": tool_call.get("parameters") or {},
-            "raw_result": str(result or ""),
-            "llm_result": self._format_tool_result_for_llm(tool_name=str(tool_call.get("name") or ""), result=result),
+            "raw_result": raw_text,
+            "llm_result": self._format_tool_result_for_llm(tool_name=tool_name, result=raw_text),
         }
+        if translations:
+            observation["title_translations"] = translations
         try:
             if not self._tool_result_has_error(observation["raw_result"]):
                 self.agent_harness.after_tool_observation(
@@ -8253,8 +8309,9 @@ class Pipeline:
                 "opportunity_cards_text 是机会发现的工具证据来源，不应替代主答案。"
                 "opportunities_for_llm 包含可继续分析的结构化机会入口。"
                 "最终答复可自行组织标题、摘要和解读；如果用户明确要求 topN 机会卡片或逐卡分析，应按用户请求数量裁剪并重组为卡片式解读。"
-                "主答案必须逐卡包含机会理由、关键证据、风险/证据边界和下一步验证；不要展示超过用户请求数量的机会，不要丢列、改数值或补未返回的数值；同时必须保留 llm_summary_guidance/display_rules 中要求的同名隐藏提示、个性化分、趋势状态和 category_resolve 前置提醒。"
-                "机会卡片标题必须使用『中文翻译（English 原文）』双语形式呈现，例如『真空保温杯（Tumblers）』『车载吸尘器（Car Vacuum）』；中文翻译需准确反映品类含义，不可省略或仅保留英文。若原文本身已是中文或专有名词，则只保留原文。"
+                "主答案结构固定为：① 一句话总览（市场/平台/返回机会数）；② 一张精简排名表（Markdown 表格，表头 `| 排名 | 机会主题 | 类目路径 | 机会得分 |`，行数等于用户请求数量，类目路径过长可省中间层但保留 leaf）；③ 然后按 `### 机会 N：<名称>` 模板逐卡展开，每卡包含机会理由、关键证据、风险/证据边界和下一步验证。"
+                "不要展示超过用户请求数量的机会，不要丢列、改数值或补未返回的数值，不得省略排名表也不得只给排名表而省略逐卡解说；同时必须保留 llm_summary_guidance/display_rules 中要求的同名隐藏提示、个性化分、趋势状态和 category_resolve 前置提醒。"
+                "排名表中的『机会主题』列和每张卡片标题都必须使用『中文翻译（English 原文）』双语形式（例如『真空保温杯（Tumblers）』『车载吸尘器（Car Vacuum）』）；中文翻译需准确反映品类含义，不可省略或仅保留英文。若原文本身已是中文或专有名词，则只保留原文。"
             ),
             "payload": compact_payload,
         }
@@ -8373,6 +8430,7 @@ class Pipeline:
                             "rank",
                             "opportunity_id",
                             "title",
+                            "title_zh",
                             "source",
                             "category_id",
                             "category_path",
@@ -8539,18 +8597,36 @@ class Pipeline:
         if not selected:
             return ""
         total_count = self._opportunity_count(opportunity_payload) or len(selected)
+        marketplace = self._opportunity_marketplace(observation, opportunity_payload)
+        translations = (observation or {}).get("title_translations") if isinstance(observation, dict) else None
+        if not isinstance(translations, dict):
+            translations = None
         lines = [
             "下面是本次机会发现返回的机会卡片。",
             "",
-            "市场: %s | 平台: Amazon | 实际返回机会数: %d" % (self._opportunity_marketplace(observation, opportunity_payload), len(selected)),
+            "市场: %s | 平台: Amazon | 实际返回机会数: %d" % (marketplace, len(selected)),
             "",
+            "| 排名 | 机会主题 | 类目路径 | 机会得分 |",
+            "| ---: | --- | --- | ---: |",
         ]
         for index, item in enumerate(selected, start=1):
-            title = str(item.get("title") or item.get("opportunity") or item.get("name") or "机会 %d" % index).strip()
             rank = item.get("rank") or index
+            display_title = self._opportunity_bilingual_title(item, translations)
+            if not display_title:
+                display_title = "机会 %d" % index
+            short_path = self._opportunity_short_category_path(self._first_present(item, "category_path", "category", "leaf_category_name"))
+            score_value = self._first_present(item, "opportunity_score", "score", "personalized_opportunity_score")
+            score_text = self._format_metric_value(score_value) if score_value is not None else "—"
+            lines.append("| %s | %s | %s | %s |" % (rank, display_title, short_path or "—", score_text))
+        lines.append("")
+        for index, item in enumerate(selected, start=1):
+            rank = item.get("rank") or index
+            display_title = self._opportunity_bilingual_title(item, translations)
+            if not display_title:
+                display_title = "机会 %d" % index
             lines.extend(
                 [
-                    "### 机会 %s：%s" % (rank, title),
+                    "### 机会 %s：%s" % (rank, display_title),
                     "- 机会理由：%s" % self._opportunity_reason(item),
                     "- 关键证据：%s" % self._opportunity_evidence(item),
                     "- 风险/证据边界：%s" % self._opportunity_boundary(item),
@@ -8560,6 +8636,189 @@ class Pipeline:
             )
         lines.append("当前可继续分析的机会编号共有 %d 个。" % total_count)
         return "\n".join(lines).strip()
+
+    @staticmethod
+    def _has_cjk(text: str) -> bool:
+        return any("\u4e00" <= ch <= "\u9fff" for ch in text or "")
+
+    @staticmethod
+    def _opportunity_item_title(item: Any) -> str:
+        if not isinstance(item, dict):
+            return ""
+        for key in ("title", "opportunity", "name"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _collect_opportunity_titles(self, parsed: Any) -> List[str]:
+        seen: List[str] = []
+        if not isinstance(parsed, dict):
+            return seen
+        inner = parsed.get("payload") if isinstance(parsed.get("payload"), dict) else parsed
+        opp_payload = self._extract_opportunity_payload(inner) if isinstance(inner, dict) else None
+        if not isinstance(opp_payload, dict):
+            return seen
+        for key in ("opportunities_for_llm", "opportunities"):
+            items = opp_payload.get(key)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                title = self._opportunity_item_title(item)
+                if title and title not in seen and not self._has_cjk(title):
+                    seen.append(title)
+        return seen
+
+    def _apply_opportunity_title_translations(self, parsed: Any, translations: Dict[str, str]) -> bool:
+        if not translations or not isinstance(parsed, dict):
+            return False
+        inner = parsed.get("payload") if isinstance(parsed.get("payload"), dict) else parsed
+        opp_payload = self._extract_opportunity_payload(inner) if isinstance(inner, dict) else None
+        if not isinstance(opp_payload, dict):
+            return False
+        mutated = False
+        for key in ("opportunities_for_llm", "opportunities"):
+            items = opp_payload.get(key)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("title_zh"):
+                    continue
+                title = self._opportunity_item_title(item)
+                zh = (translations.get(title) or "").strip()
+                if zh and self._has_cjk(zh):
+                    item["title_zh"] = zh
+                    mutated = True
+        return mutated
+
+    def _enrich_opportunity_discovery_raw_result(self, raw_text: str) -> "tuple[Optional[str], Dict[str, str]]":
+        parsed = self._load_tool_json_payload(raw_text)
+        if not isinstance(parsed, dict):
+            return None, {}
+        titles = self._collect_opportunity_titles(parsed)
+        if not titles:
+            return None, {}
+        translations = self._translate_opportunity_titles(titles)
+        if not translations:
+            return None, {}
+        if not self._apply_opportunity_title_translations(parsed, translations):
+            return None, translations
+        try:
+            return json.dumps(parsed, ensure_ascii=False), translations
+        except (TypeError, ValueError):
+            return None, translations
+
+    def _translate_opportunity_titles(self, titles: List[str]) -> Dict[str, str]:
+        cache = self._opportunity_title_zh_cache
+        out: Dict[str, str] = {}
+        pending: List[str] = []
+        for title in titles:
+            if not title or self._has_cjk(title):
+                continue
+            if title in cache:
+                if cache[title]:
+                    out[title] = cache[title]
+                continue
+            pending.append(title)
+        if not pending:
+            return out
+        try:
+            fetched = self._call_opportunity_title_translator(pending)
+        except Exception as exc:  # noqa: BLE001
+            print("xiamimate.agent opportunity title translation failed:", repr(exc))
+            return out
+        for title in pending:
+            zh = str(fetched.get(title) or "").strip()
+            if zh and not self._has_cjk(zh):
+                zh = ""
+            cache[title] = zh
+            if zh:
+                out[title] = zh
+        return out
+
+    def _call_opportunity_title_translator(self, titles: List[str]) -> Dict[str, str]:
+        model_name = (self.valves.AGENT_TITLE_TRANSLATOR_MODEL or self.valves.AGENT_PLANNER_MODEL or "").strip()
+        if not model_name or not titles:
+            return {}
+        system_prompt = (
+            "你是跨境电商数据助手的术语翻译模块。"
+            "将给定的英文 Amazon 细分类目/商品主题翻译为简洁的中文译名（4 字以内最佳），"
+            "保留约定俗成的中文叫法；无法翻译时给空字符串。仅输出 JSON。"
+        )
+        user_prompt = (
+            "请将下列英文条目翻译为简洁中文，输出严格 JSON：\n"
+            "{\"translations\": {\"<英文原文>\": \"<中文译名或空字符串>\", ...}}\n"
+            "约束：\n"
+            "1) 键必须完全等于输入条目（保留大小写和复数形式）；\n"
+            "2) 值只能是中文，不要包含括号、英文、解释；\n"
+            "3) 不要新增条目，也不要省略条目。\n"
+            "输入条目：\n- " + "\n- ".join(titles)
+        )
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"},
+        }
+        translator_base_url = (self.valves.AGENT_TITLE_TRANSLATOR_BASE_URL or "").strip()
+        translator_api_key = (self.valves.AGENT_TITLE_TRANSLATOR_API_KEY or "").strip()
+        if translator_base_url and translator_api_key:
+            data = self._post_llm_direct(
+                base_url=translator_base_url,
+                api_key=translator_api_key,
+                payload=payload,
+                timeout=self.valves.AGENT_TITLE_TRANSLATION_TIMEOUT,
+            )
+        else:
+            data = self._post_agent_payload(payload, model_name=model_name)
+        text = ""
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if isinstance(choices, list) and choices:
+            message = choices[0].get("message") if isinstance(choices[0], dict) else None
+            if isinstance(message, dict):
+                text = str(message.get("content") or "")
+        if not text.strip():
+            return {}
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            return {}
+        block = parsed.get("translations") if isinstance(parsed, dict) else None
+        if not isinstance(block, dict):
+            return {}
+        return {str(k): str(v) for k, v in block.items() if isinstance(k, str)}
+
+    def _opportunity_bilingual_title(self, item_or_title: Any, translations: Optional[Dict[str, str]] = None) -> str:
+        if isinstance(item_or_title, dict):
+            raw = self._opportunity_item_title(item_or_title)
+            zh = str(item_or_title.get("title_zh") or "").strip()
+        else:
+            raw = str(item_or_title or "").strip()
+            zh = ""
+        if not raw:
+            return ""
+        if self._has_cjk(raw):
+            return raw
+        if not zh and translations:
+            zh = str(translations.get(raw) or "").strip()
+        if zh and self._has_cjk(zh) and zh.lower() != raw.lower():
+            return "%s（%s）" % (zh, raw)
+        return raw
+
+    @staticmethod
+    def _opportunity_short_category_path(path: Any, max_segments: int = 3) -> str:
+        text = str(path or "").strip()
+        if not text:
+            return ""
+        segments = [seg.strip() for seg in text.split(">") if seg.strip()]
+        if len(segments) <= max_segments:
+            return " > ".join(segments)
+        return " > ".join([segments[0], "…", segments[-2], segments[-1]])
 
     def _requested_opportunity_count(self, observation: dict, opportunity_payload: dict, answer_contract: Optional[dict]) -> int:
         for value in ((answer_contract or {}).get("requested_count"), ((observation or {}).get("arguments") or {}).get("limit"), opportunity_payload.get("opportunity_count")):

@@ -610,7 +610,9 @@ class AgentNativeToolTests(unittest.TestCase):
 
         self.assertEqual(compacted["result_format"], "opportunity_evidence_block")
         self.assertIn("工具证据来源", compacted["instruction"])
-        self.assertIn("主答案必须逐卡包含机会理由", compacted["instruction"])
+        self.assertIn("每卡包含机会理由", compacted["instruction"])
+        self.assertIn("精简排名表", compacted["instruction"])
+        self.assertIn("中文翻译", compacted["instruction"])
         self.assertEqual(compacted["payload"]["opportunity_discovery_job_id"], "odisc_test")
         self.assertEqual(compacted["payload"]["result_ref"]["job_id"], "odisc_test")
         self.assertEqual(compacted["payload"]["opportunity_count"], 10)
@@ -1589,6 +1591,7 @@ class AgentNativeToolTests(unittest.TestCase):
                     {
                         "rank": 1,
                         "title": "Power Strips",
+                        "title_zh": "排插",
                         "category_id": 11,
                         "category_path": "Electronics > Power Strips",
                         "opportunity_score": 86.69,
@@ -1602,6 +1605,7 @@ class AgentNativeToolTests(unittest.TestCase):
                     {
                         "rank": 2,
                         "title": "Tumblers",
+                        "title_zh": "真空保温杯",
                         "category_path": "Home & Kitchen > Tumblers",
                         "opportunity_score": 76.25,
                         "candidate_count": 32,
@@ -1619,16 +1623,104 @@ class AgentNativeToolTests(unittest.TestCase):
             answer_contract=pipe.agent_harness.answer_contract_from_text(user_text),
         )
 
-        self.assertIn("### 机会 1：Power Strips", answer)
-        self.assertIn("### 机会 2：Tumblers", answer)
+        self.assertIn("### 机会 1：排插（Power Strips）", answer)
+        self.assertIn("### 机会 2：真空保温杯（Tumblers）", answer)
         self.assertIn("机会理由", answer)
         self.assertIn("关键证据", answer)
         self.assertIn("风险/证据边界", answer)
         self.assertIn("下一步验证", answer)
-        self.assertNotIn("| 排名 |", answer)
+        self.assertIn("| 排名 | 机会主题 | 类目路径 | 机会得分 |", answer)
+        self.assertIn("| 1 | 排插（Power Strips） |", answer)
         grade = pipe.agent_harness.grade_answer(user_text=user_text, answer_text=answer)
         self.assertEqual(grade["status"], "pass")
         self.assertNotIn("估算区间", answer)
+
+    def test_build_tool_observation_enriches_opportunity_titles_via_llm(self) -> None:
+        pipe = self.make_pipeline()
+        pipe.valves.AGENT_TITLE_TRANSLATOR_MODEL = "deepseek-v4-pro"
+        calls: List[List[str]] = []
+
+        def fake_post_agent_payload(payload: dict, model_name: str) -> dict:
+            user_text = payload["messages"][-1]["content"]
+            calls.append([line[2:] for line in user_text.splitlines() if line.startswith("- ")])
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {"translations": {"Power Strips": "排插", "Tumblers": "真空保温杯"}},
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+
+        pipe._post_agent_payload = fake_post_agent_payload
+        raw_result = json.dumps(
+            {
+                "opportunity_count": 2,
+                "opportunities_for_llm": [
+                    {"rank": 1, "title": "Power Strips", "category_path": "Electronics > Power Strips"},
+                    {"rank": 2, "title": "Tumblers", "category_path": "Home & Kitchen > Tumblers"},
+                ],
+            },
+            ensure_ascii=False,
+        )
+        observation = pipe._build_tool_observation(
+            {"name": "opportunity_discovery", "parameters": {"marketplace": "US", "limit": 2}},
+            raw_result,
+        )
+        self.assertEqual(observation.get("title_translations"), {"Power Strips": "排插", "Tumblers": "真空保温杯"})
+        enriched_payload = json.loads(observation["raw_result"])
+        titles_zh = [item.get("title_zh") for item in enriched_payload["opportunities_for_llm"]]
+        self.assertEqual(titles_zh, ["排插", "真空保温杯"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0], ["Power Strips", "Tumblers"])
+
+        # Second call with overlapping + new titles should only ask LLM for the uncached one.
+        raw_result_2 = json.dumps(
+            {
+                "opportunity_count": 2,
+                "opportunities_for_llm": [
+                    {"rank": 1, "title": "Power Strips"},
+                    {"rank": 2, "title": "Goggles"},
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+        def fake_post_agent_payload_2(payload: dict, model_name: str) -> dict:
+            calls.append([line[2:] for line in payload["messages"][-1]["content"].splitlines() if line.startswith("- ")])
+            return {"choices": [{"message": {"content": json.dumps({"translations": {"Goggles": "泳镜"}}, ensure_ascii=False)}}]}
+
+        pipe._post_agent_payload = fake_post_agent_payload_2
+        observation_2 = pipe._build_tool_observation(
+            {"name": "opportunity_discovery", "parameters": {}},
+            raw_result_2,
+        )
+        self.assertEqual(observation_2.get("title_translations"), {"Power Strips": "排插", "Goggles": "泳镜"})
+        self.assertEqual(calls[1], ["Goggles"])
+
+    def test_build_tool_observation_skips_translation_when_model_not_configured(self) -> None:
+        pipe = self.make_pipeline()
+        called = {"value": False}
+
+        def fail_post(*args, **kwargs):
+            called["value"] = True
+            raise AssertionError("translator must not be invoked when model is unset")
+
+        pipe._post_agent_payload = fail_post
+        raw_result = json.dumps(
+            {"opportunity_count": 1, "opportunities_for_llm": [{"rank": 1, "title": "Power Strips"}]},
+            ensure_ascii=False,
+        )
+        observation = pipe._build_tool_observation(
+            {"name": "opportunity_discovery", "parameters": {}}, raw_result
+        )
+        self.assertFalse(called["value"])
+        self.assertNotIn("title_translations", observation)
+        self.assertNotIn("title_zh", observation["raw_result"])
 
     def test_report_query_resolves_opportunity_reference_from_markdown_table(self) -> None:
         pipe = self.make_pipeline()
