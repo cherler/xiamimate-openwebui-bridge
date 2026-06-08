@@ -30,6 +30,36 @@
 }
 #xm-nav .xm-brand:hover { color: #f08050; }
 
+#xm-nav .xm-menu {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: space-between;
+  min-width: 0;
+}
+
+#xm-nav .xm-nav-toggle {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 32px;
+  margin-left: auto;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 8px;
+  color: #d7d7e3;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+}
+#xm-nav .xm-nav-toggle:hover {
+  color: #ffffff;
+  background: rgba(255,255,255,0.1);
+  border-color: rgba(255,255,255,0.18);
+}
+
 #xm-nav .xm-links {
   display: flex;
   align-items: center;
@@ -283,30 +313,81 @@ body.xm-nav-active .workspace-topbar .top-home-link { display: none !important; 
 body.xm-nav-active .workspace-topbar .top-utility-actions { display: none !important; }
 
 @media (max-width: 960px) {
+  /* Mobile: keep the always-visible bar a predictable single row (44px),
+     collapse the full menu into a tap-to-open drawer overlay so it never
+     occludes the page content underneath. */
   #xm-nav {
-    height: auto;
-    min-height: 36px;
-    padding-top: 6px;
-    padding-bottom: 6px;
-    align-items: flex-start;
-    gap: 10px;
-    flex-wrap: wrap;
+    height: 44px;
+    min-height: 44px;
+    padding: 0 12px;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: nowrap;
+    gap: 8px;
   }
-  #xm-nav .xm-links,
+  #xm-nav .xm-nav-toggle { display: inline-flex; }
+
+  /* Drawer overlay: positioned below the bar, hidden until toggled open.
+     Being absolutely positioned, it overlays content instead of pushing it,
+     so the reserved body padding stays a constant 44px. */
+  #xm-nav .xm-menu {
+    position: absolute;
+    top: 44px;
+    left: 0;
+    right: 0;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: flex-start;
+    gap: 8px;
+    background: #0d0d14;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+    box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+    padding: 10px 12px 14px;
+    max-height: calc(100vh - 44px);
+    overflow-y: auto;
+    display: none;
+  }
+  #xm-nav.xm-open .xm-menu { display: flex; }
+
+  #xm-nav .xm-links {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+  }
+  #xm-nav .xm-links a {
+    padding: 10px 12px;
+    font-size: 15px;
+  }
   #xm-nav .xm-right {
     flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 6px;
+    padding-top: 10px;
+    border-top: 1px solid rgba(255,255,255,0.06);
   }
+  #xm-nav .xm-right .xm-action-link {
+    flex: 1 1 calc(50% - 8px);
+    justify-content: center;
+    min-height: 40px;
+  }
+  #xm-nav .xm-right #xm-auth-actions {
+    flex: 1 1 100%;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
   html.xm-nav-active { overflow: auto !important; }
   body.xm-nav-active {
-    padding-top: 69px !important;
+    padding-top: 44px !important;
     height: auto !important;
     min-height: 100vh !important;
     overflow: auto !important;
   }
-  body.xm-nav-active .h-screen            { height:     calc(100vh  - 69px) !important; }
-  body.xm-nav-active .h-\[100dvh\]       { height:     calc(100dvh - 69px) !important; }
-  body.xm-nav-active .min-h-screen        { min-height: calc(100vh  - 69px) !important; }
-  body.xm-nav-active .min-h-\[100dvh\]   { min-height: calc(100dvh - 69px) !important; }
-  body.xm-nav-active .max-h-\[100dvh\]   { max-height: calc(100dvh - 69px) !important; }
-  body.xm-nav-active .max-h-dvh           { max-height: calc(100dvh - 69px) !important; }
+  body.xm-nav-active .h-screen            { height:     calc(100vh  - 44px) !important; }
+  body.xm-nav-active .h-\[100dvh\]       { height:     calc(100dvh - 44px) !important; }
+  body.xm-nav-active .min-h-screen        { min-height: calc(100vh  - 44px) !important; }
+  body.xm-nav-active .min-h-\[100dvh\]   { min-height: calc(100dvh - 44px) !important; }
+  body.xm-nav-active .max-h-\[100dvh\]   { max-height: calc(100dvh - 44px) !important; }
+  body.xm-nav-active .max-h-dvh           { max-height: calc(100dvh - 44px) !important; }
 }

@@ -332,23 +332,55 @@
   var el = document.createElement('div');
   el.id = 'xm-nav';
   el.innerHTML =
-    '<div class="xm-links">' +
-      '<a href="/" class="xm-brand">\uD83E\uDD90 \u867E\u7C73\u9009\u54C1</a>' +
-      '<a href="/"' + cls('/') + '>\u5BF9\u8BDD</a>' +
-      '<a href="/portal/account' + portalLinkSuffix + '"' + cls('/portal/account') + '>\u8D26\u6237\u7BA1\u7406</a>' +
-      '<a href="/portal/product"' + cls('/portal/product') + '>\u4EA7\u54C1\u4ECB\u7ECD</a>' +
-      '<a href="/portal/guide"' + cls('/portal/guide') + '>\u4F7F\u7528\u6307\u5357</a>' +
-      '<a href="/portal/products' + portalLinkSuffix + '"' + cls('/portal/products') + '>\u8BA2\u9605\u4E0E\u5145\u503C</a>' +
-    '</div>' +
-    '<div class="xm-right">' +
+    '<a href="/" class="xm-brand">\uD83E\uDD90 \u867E\u7C73\u9009\u54C1</a>' +
+    '<button type="button" class="xm-nav-toggle" id="xm-nav-toggle" aria-label="\u83DC\u5355" aria-expanded="false">\u2630</button>' +
+    '<div class="xm-menu">' +
+      '<div class="xm-links">' +
+        '<a href="/"' + cls('/') + '>\u5BF9\u8BDD</a>' +
+        '<a href="/portal/account' + portalLinkSuffix + '"' + cls('/portal/account') + '>\u8D26\u6237\u7BA1\u7406</a>' +
+        '<a href="/portal/product"' + cls('/portal/product') + '>\u4EA7\u54C1\u4ECB\u7ECD</a>' +
+        '<a href="/portal/guide"' + cls('/portal/guide') + '>\u4F7F\u7528\u6307\u5357</a>' +
+        '<a href="/portal/products' + portalLinkSuffix + '"' + cls('/portal/products') + '>\u8BA2\u9605\u4E0E\u5145\u503C</a>' +
+      '</div>' +
+      '<div class="xm-right">' +
       '<span id="xm-auth-actions">' + authActionsHtml(logged) + '</span>' +
       '<a href="#" id="xm-email-link" class="xm-action-link" aria-label="\u90AE\u4EF6\u8054\u7CFB" title="\u90AE\u4EF6\u8054\u7CFB">' + mailIcon() + '<span class="xm-action-text">\u90AE\u4EF6</span></a>' +
       '<button type="button" class="xm-action-link xm-action-button" id="xm-wechat-trigger" aria-label="\u4F01\u5FAE\u8054\u7CFB" title="\u4F01\u5FAE\u8054\u7CFB">' + wechatIcon() + '<span class="xm-action-text">\u4F01\u5FAE</span></button>' +
       '<button type="button" class="xm-action-link xm-action-button xm-official-account-link" id="xm-official-account-trigger" aria-label="\u516C\u4F17\u53F7" title="\u516C\u4F17\u53F7">' + officialAccountIcon() + '<span class="xm-action-text">\u516C\u4F17\u53F7</span></button>' +
       '<a href="' + defaultContact.feedback_url + '" id="xm-feedback-link" target="_blank" rel="noreferrer" class="xm-action-link" aria-label="\u610F\u89C1\u53CD\u9988" title="\u610F\u89C1\u53CD\u9988">' + feedbackIcon() + '<span class="xm-action-text">\u53CD\u9988</span></a>' +
+      '</div>' +
     '</div>';
 
   document.body.prepend(el);
+
+  var navToggle = el.querySelector('#xm-nav-toggle');
+  var navMenu = el.querySelector('.xm-menu');
+  function closeNavMenu() {
+    el.classList.remove('xm-open');
+    if (navToggle) { navToggle.setAttribute('aria-expanded', 'false'); }
+  }
+  if (navToggle) {
+    navToggle.addEventListener('click', function(e) {
+      e.preventDefault();
+      e.stopPropagation();
+      var open = el.classList.toggle('xm-open');
+      navToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+  }
+  if (navMenu) {
+    // Event delegation survives re-renders of #xm-auth-actions.
+    navMenu.addEventListener('click', function(e) {
+      var target = e.target;
+      if (target && target.closest && target.closest('a, button')) {
+        closeNavMenu();
+      }
+    });
+  }
+  document.addEventListener('click', function(e) {
+    if (el.classList.contains('xm-open') && !el.contains(e.target)) {
+      closeNavMenu();
+    }
+  });
 
   var modal = document.createElement('div');
   modal.id = 'xm-contact-modal';
