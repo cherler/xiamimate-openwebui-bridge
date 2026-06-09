@@ -6034,6 +6034,18 @@ class Pipeline:
                 tn = (entry or {}).get("tool_name")
                 fp = (entry or {}).get("params_fingerprint")
                 if tn and fp:
+                    # 状态轮询型工具（如 candidate_expansion_status）不进入 executed 签名，
+                    # 否则 planner 会按"匹配已执行签名就不重复执行"的规则直接复述旧 summary，
+                    # 导致已 completed 的扩池任务仍被报成 queued。这类工具每轮都应真实重查。
+                    if tn in agent_harness.STATUS_POLL_REFRESH_TOOLS:
+                        continue
+                    # 超出新鲜窗口的旧签名不再作为"已执行、勿重复"提示喂给 planner，
+                    # 否则 planner 会复述过期 summary；放行后让它可按需重新取最新数据。
+                    ts = (entry or {}).get("recorded_at")
+                    if isinstance(ts, (int, float)) and (
+                        time.time() - float(ts)
+                    ) > agent_harness.CROSS_TURN_DEDUP_FRESHNESS_SECONDS:
+                        continue
                     executed_signatures.append(f"{tn}::{fp}")
         planner_messages.append(
             {
@@ -6058,6 +6070,9 @@ class Pipeline:
                             "仅当用户明确要求『重新跑/刷新/换 window/换 marketplace 等不同参数』时才允许用不同入参重跑同名工具。"
                             "对于 resolve_candidates / category_resolve 这类只负责获取候选池/类目句柄的 prerequisite 工具，"
                             "只要 session_memory.last_candidate_pool.pool_id 或 last_category_id 已存在，就视为已完成，禁止再次调用。"
+                            "但 candidate_expansion_status 等状态查询类工具属于例外：后台任务状态会随时间变化（queued→discovering→hydrating→completed），"
+                            "只要用户在询问补池/任务进度或数据是否就绪，就必须重新调用该工具获取最新 status 与 data_readiness，"
+                            "绝不能复述 session_memory 里上一轮的旧状态摘要。"
                             "如果已有工具足够回答，请返回 action.type=final 和 final_answer。"
                             "如果需要继续执行新的工具，只返回一个 action.type=tool 的下一步动作，不要一次性规划完整路线。"
                         ),

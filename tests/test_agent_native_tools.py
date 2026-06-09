@@ -2579,8 +2579,88 @@ class AgentMultiTurnSessionMemoryTests(unittest.TestCase):
         # top_asin_drilldown 同参数应被丢掉
         self.assertNotIn("top_asin_drilldown", [n for n, _ in kept])
 
+    def test_status_poll_tool_is_not_cross_turn_deduped(self) -> None:
+        """状态轮询型工具（candidate_expansion_status）即使跨轮同参也必须重新执行，
+        否则已 completed 的扩池任务会被复述成上一轮的 queued 旧状态。"""
+        pipe = self.make_pipeline()
+        pipe._ensure_agent_harness({"chat_id": "chat-status-poll"})
+        # 上一轮已查过同样入参的扩池状态（当时返回 queued）
+        pipe.agent_harness.after_tool_observation(
+            tool_call={"name": "candidate_expansion_status", "parameters": {"marketplace": "US"}},
+            result=json.dumps({"success": True, "data": {"jobs": [{"status": "queued"}]}}),
+            compact_result="status-queued",
+        )
 
-class DownlistedToolsAndPlannerJsonLeakGuardTests(unittest.TestCase):
+        # 本轮 planner 又拍上同参数的状态查询；必须保留以便真实重查
+        steps = [
+            {"tool_call": {"name": "candidate_expansion_status", "parameters": {"marketplace": "US"}}},
+        ]
+        filtered = pipe.agent_harness.filter_redundant_planner_steps(steps, "theme_analysis", [])
+        kept_names = [s["tool_call"]["name"] for s in filtered]
+        self.assertIn("candidate_expansion_status", kept_names)
+
+    def test_status_poll_tool_still_deduped_within_same_request(self) -> None:
+        """同一请求内重复的同参状态查询仍应去重，避免一轮里查两次。"""
+        pipe = self.make_pipeline()
+        pipe._ensure_agent_harness({"chat_id": "chat-status-poll-intra"})
+        steps = [
+            {"tool_call": {"name": "candidate_expansion_status", "parameters": {"marketplace": "US"}}},
+            {"tool_call": {"name": "candidate_expansion_status", "parameters": {"marketplace": "US"}}},
+        ]
+        filtered = pipe.agent_harness.filter_redundant_planner_steps(steps, "theme_analysis", [])
+        kept_names = [s["tool_call"]["name"] for s in filtered]
+        self.assertEqual(kept_names, ["candidate_expansion_status"])
+
+    def test_failed_tool_result_is_not_cached_for_dedup(self) -> None:
+        """失败/错误结果不得进入跨轮去重缓存：否则下一轮同参会被去重拦截、复述失败旧结果。
+        本轮 planner 再次拍上同名同参工具时必须放行重试。"""
+        pipe = self.make_pipeline()
+        pipe._ensure_agent_harness({"chat_id": "chat-failed-cache"})
+        params = {"candidate_pool_id": "p1", "window_days": 30}
+        # 上一轮该工具返回结构化错误（非中文前缀报错），不应被记入去重缓存
+        pipe.agent_harness.after_tool_observation(
+            tool_call={"name": "candidate_pool_trends", "parameters": params},
+            result=json.dumps({"status": "error", "error": "upstream timeout"}),
+            compact_result=json.dumps({"status": "error", "error": "upstream timeout"}),
+        )
+        snapshot = pipe.agent_harness.session_snapshot() or {}
+        recent = snapshot.get("recent_tool_calls") or []
+        self.assertEqual(recent, [], "失败结果不应写入 recent_tool_calls")
+
+        # 本轮 planner 重新拍上同参 trends，必须保留以便重试
+        steps = [{"tool_call": {"name": "candidate_pool_trends", "parameters": params}}]
+        filtered = pipe.agent_harness.filter_redundant_planner_steps(steps, "theme_analysis", [])
+        kept_names = [s["tool_call"]["name"] for s in filtered]
+        self.assertIn("candidate_pool_trends", kept_names)
+
+    def test_stale_cross_turn_signature_is_refreshed_after_freshness_window(self) -> None:
+        """超出新鲜窗口的旧签名应放行重跑，避免长对话复述过期结果；窗口内仍去重。"""
+        from xiamimate import agent_harness
+
+        pipe = self.make_pipeline()
+        pipe._ensure_agent_harness({"chat_id": "chat-stale-refresh"})
+        params = {"candidate_pool_id": "p1", "window_days": 30}
+        pipe.agent_harness.after_tool_observation(
+            tool_call={"name": "candidate_pool_trends", "parameters": params},
+            result=json.dumps({"success": True, "data": {"trend_phase": "flat"}}),
+            compact_result="trends-flat",
+        )
+        steps = [{"tool_call": {"name": "candidate_pool_trends", "parameters": params}}]
+
+        # 窗口内：仍应去重
+        fresh = pipe.agent_harness.filter_redundant_planner_steps(steps, "theme_analysis", [])
+        self.assertNotIn("candidate_pool_trends", [s["tool_call"]["name"] for s in fresh])
+
+        # 把记录时间手动回拨到新鲜窗口之外，模拟长对话过期
+        store = pipe.agent_harness.session_store
+        entry = store._sessions.get("chat-stale-refresh")
+        for call in (entry.get("last_tool_calls") or {}).values():
+            call["recorded_at"] = call["recorded_at"] - agent_harness.CROSS_TURN_DEDUP_FRESHNESS_SECONDS - 60
+
+        stale = pipe.agent_harness.filter_redundant_planner_steps(steps, "theme_analysis", [])
+        self.assertIn("candidate_pool_trends", [s["tool_call"]["name"] for s in stale])
+
+
     """覆盖两件事：
     1. asin_review_insights / amazon_keyword_demand 已从 agent 可见 registry 和 scene policy 中下线。
     2. 当 planner LLM 把 planner 调度 JSON 当成文本返回时，harness 不会把这段 JSON 当 final_answer 吐给用户。

@@ -39,6 +39,53 @@ def _summarize_parameters(parameters: Any, limit: int = 240) -> str:
     return text
 
 
+# 状态轮询型工具：返回的是后台任务/数据就绪的实时状态（如扩池任务从 queued→completed）。
+# 这类工具的入参在多轮里几乎不变，但每次必须真实重查，绝不能被跨轮 (tool, params) 签名去重拦截，
+# 否则会用首轮的 queued 旧 summary 反复复述，造成"任务一直排队"的假象。
+# 仅在同一请求内按相同入参去重，跨轮一律放行重新执行。
+STATUS_POLL_REFRESH_TOOLS: set[str] = {
+    "candidate_expansion_status",
+}
+
+# 跨轮去重的"新鲜窗口"：同一 (tool, params) 只有在该窗口内才视为"刚跑过、可安全复用"。
+# 一旦超过窗口，说明上次结果可能已过期（价格/榜单/机会/库存等会随时间变化），就放行重跑取最新数据，
+# 避免把首轮旧摘要在长对话里反复当成最新结果复述。状态轮询型工具不受此约束（永远重查）。
+# session 缓存 TTL 为 2 小时，这里取更短的新鲜窗口让长对话能自然刷新。
+CROSS_TURN_DEDUP_FRESHNESS_SECONDS: float = 30 * 60
+
+# 失败结果的文本特征：这些短语出现在结果开头通常代表工具未成功执行。
+_TOOL_RESULT_FAILURE_PHRASES: Tuple[str, ...] = (
+    "执行失败",
+    "请求失败",
+    "检索失败",
+    "搜索失败",
+    "调用失败",
+    "未配置",
+)
+
+
+def tool_result_is_unusable(result: Any, compact_result: str = "") -> bool:
+    """判断一次工具结果是否属于失败/错误，不应进入跨轮去重缓存。
+
+    跨轮去重一旦记录某个 (tool, params) 签名，后续轮相同入参会被直接拦截并复述其 summary。
+    若把失败/错误结果写进缓存，用户在后面几轮就会反复拿到"工具其实从未成功过"的错误旧结果。
+    因此这里在记录边界做一道稳健判断：除了前缀型中文报错，还要识别结构化 JSON 错误标记。
+    """
+    head = str(compact_result or result or "").strip()[:200]
+    if any(phrase in head for phrase in _TOOL_RESULT_FAILURE_PHRASES):
+        return True
+    payload = _coerce_payload(result)
+    if isinstance(payload, dict):
+        status = str(payload.get("status") or "").strip().lower()
+        if status in {"error", "failed", "failure"}:
+            return True
+        if payload.get("ok") is False or payload.get("success") is False:
+            return True
+        if payload.get("error") or payload.get("errors"):
+            return True
+    return False
+
+
 class SessionContextStore:
     """跨轮会话级结构化上下文。
 
@@ -1148,6 +1195,7 @@ class AgentHarness:
                             "params_fingerprint": entry.get("params_fingerprint"),
                             "params_preview": entry.get("params_preview"),
                             "summary": entry.get("summary"),
+                            "recorded_at": entry.get("recorded_at"),
                         }
                     )
             if recent:
@@ -1197,7 +1245,9 @@ class AgentHarness:
 
         if updates:
             self.session_store.update(self.chat_id, updates)
-        if compact_result:
+        # 失败/错误结果不得进入跨轮去重缓存：否则下一轮相同入参会被同签名去重拦截，
+        # 直接复述这条失败摘要，用户会拿到"工具其实没成功过"的错误旧结果。
+        if compact_result and not tool_result_is_unusable(result, compact_result):
             self.session_store.record_tool_result(self.chat_id, tool_name, compact_result, parameters=parameters)
 
     def new_observation_store(self) -> ObservationStore:
@@ -1294,6 +1344,7 @@ class AgentHarness:
         # 通用跨轮去重：用 (tool_name, params_fingerprint) 作为唯一签名；
         # session 里已经执行过完全相同入参的工具调用一律跳过，参数不同则放行（例如 trends 不同 window_days）。
         session_signatures: set[str] = set()
+        session_signature_recorded_at: dict[str, float] = {}
         session_prerequisite_tools: set[str] = set()
         snapshot = self.session_snapshot() or {}
         if isinstance(snapshot, dict):
@@ -1301,13 +1352,26 @@ class AgentHarness:
                 tn = (entry or {}).get("tool_name")
                 fp = (entry or {}).get("params_fingerprint")
                 if tn and fp:
-                    session_signatures.add(f"{tn}::{fp}")
+                    sig = f"{tn}::{fp}"
+                    session_signatures.add(sig)
+                    ts = (entry or {}).get("recorded_at")
+                    if isinstance(ts, (int, float)):
+                        session_signature_recorded_at[sig] = float(ts)
             # 结构性兜底：prerequisite 工具的产物已在 session，无论参数是否略有差异都不应再跑
             pool = snapshot.get("last_candidate_pool")
             if isinstance(pool, dict) and pool.get("pool_id"):
                 session_prerequisite_tools.add("resolve_candidates")
             if snapshot.get("last_category_id") or snapshot.get("last_category_path"):
                 session_prerequisite_tools.add("category_resolve")
+
+        now = time.time()
+
+        def _signature_is_fresh(sig: str) -> bool:
+            # 无时间戳（历史数据）按新鲜处理，保持既有去重行为；有时间戳则按新鲜窗口判定。
+            ts = session_signature_recorded_at.get(sig)
+            if ts is None:
+                return True
+            return (now - ts) <= CROSS_TURN_DEDUP_FRESHNESS_SECONDS
 
         kept: List[dict] = []
         planned_signatures: set[str] = set()
@@ -1320,8 +1384,20 @@ class AgentHarness:
                 continue
             fingerprint = tool_call_fingerprint(tool_call.get("parameters") or {})
             signature = f"{tool_name}::{fingerprint}"
-            # 1) 跨轮同签名去重（通用）
-            if signature in session_signatures or signature in planned_signatures:
+            # 0) 状态轮询型工具：每轮都必须真实重查，仅在同一请求内去重，
+            #    跨轮 session_signatures / prerequisite 句柄一律不拦截，避免复述 queued 旧状态。
+            if tool_name in STATUS_POLL_REFRESH_TOOLS:
+                if signature in planned_signatures:
+                    continue
+                kept.append(step)
+                planned_signatures.add(signature)
+                planned_names.add(tool_name)
+                continue
+            # 1) 跨轮同签名去重（通用）：仅在新鲜窗口内才拦截；
+            #    超出新鲜窗口的旧签名放行重跑，避免长对话里复述已过期的旧结果。
+            if signature in planned_signatures:
+                continue
+            if signature in session_signatures and _signature_is_fresh(signature):
                 continue
             # 2) 跨轮 prerequisite 句柄兜底（候选池/类目）
             if tool_name in session_prerequisite_tools:
