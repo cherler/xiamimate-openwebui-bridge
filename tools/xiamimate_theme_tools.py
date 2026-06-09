@@ -622,68 +622,6 @@ class Tools:
             payload["top_n"] = top_n
         return self._request("/api/product-theme/top-asin-drilldown", payload)
 
-    def asin_review_insights(
-        self,
-        candidate_asins: str = "",
-        candidate_pool_id: str = "",
-        marketplace: str = "US",
-        window_days: int = 30,
-        max_asins: int = 10,
-        product_query: str = "",
-    ) -> str:
-        """Check or fetch review-text insights for ASINs.
-
-        Use this tool only when the user explicitly asks for review keywords, low-rating reasons, positive/negative review themes, or pain-point clusters. If the review-text provider is not configured, the tool returns a structured provider_required response instead of fabricating keywords.
-
-        :param candidate_asins: CSV string of candidate ASINs.
-        :param candidate_pool_id: Persisted candidate_pool_id returned by resolve_candidates or opportunity_discovery.
-        :param marketplace: Marketplace code such as US, UK, DE, or JP.
-        :param window_days: Compatibility field for candidate-pool requests.
-        :param max_asins: Maximum ASINs to send to the provider.
-        :param product_query: Optional product query fallback when candidate_asins is not yet available.
-        :return: JSON response from theme_api.
-        """
-        payload = {
-            "candidate_pool_id": str(candidate_pool_id or "").strip() or None,
-            "marketplace": marketplace,
-            "window_days": window_days,
-            "max_asins": max_asins,
-        }
-        if not payload["candidate_pool_id"]:
-            resolved_candidate_asins = self._ensure_candidate_asins(
-                candidate_asins=candidate_asins,
-                marketplace=marketplace,
-                product_query=product_query,
-            )
-            if isinstance(resolved_candidate_asins, str):
-                return resolved_candidate_asins
-            payload["candidate_asins"] = resolved_candidate_asins
-        return self._request("/api/product-theme/asin-review-insights", payload)
-
-    def amazon_keyword_demand(
-        self,
-        keywords: str = "",
-        product_query: str = "",
-        marketplace: str = "US",
-    ) -> str:
-        """Check or fetch Amazon keyword demand/search-volume data.
-
-        Use this tool only when the user asks for Amazon monthly search volume, keyword demand, ABA rank, or third-party keyword volume. If no keyword-demand provider is configured, the tool returns provider_required and alternatives instead of inventing search volume.
-
-        :param keywords: CSV keywords to check.
-        :param product_query: Optional product query when no explicit keyword list is provided.
-        :param marketplace: Marketplace code such as US, UK, DE, or JP.
-        :return: JSON response from theme_api.
-        """
-        return self._request(
-            "/api/product-theme/amazon-keyword-demand",
-            {
-                "keywords": self._normalize_csv(keywords),
-                "product_query": str(product_query or "").strip() or None,
-                "marketplace": marketplace,
-            },
-        )
-
     def asin_history_timeseries(
         self,
         asins: str = "",

@@ -346,11 +346,10 @@ TOOL_LAYER_REGISTRY = {
     },
     "candidate_pool_slice": {
         "layer": "analysis",
-        "capability": "按品牌、标题关键词或材质关键词切片候选池，返回切片内 top ASIN、评分/评论数量/销量分布；不能回答评论文本关键词或 Amazon 月搜索量",
+        "capability": "按品牌、标题关键词或材质关键词切片候选池，返回切片内 top ASIN、评分/评论数量/销量分布",
         "scene_tags": ["theme_analysis", "general_agent"],
         "requires_provider": False,
         "provides": ["slice_top_asins", "rating_distribution", "review_count_distribution", "sales_window_sum", "top_brands"],
-        "unsupported_claims": ["评论文本关键词", "低分原因", "Amazon 月搜索量"],
     },
     "candidate_pool_trends": {
         "layer": "analysis",
@@ -792,19 +791,18 @@ def extract_answer_contract_from_text(text: str) -> dict:
 
 def followup_actionability_policy() -> dict:
     return {
-        "policy": "报告尾部追问必须按当前工具能力标注支持度；不可把缺少 provider 的问题写成可完整执行的复制追问。",
+        "policy": "报告尾部追问只保留当前数据可支撑的问题；不得编造当前数据源不存在的指标，也不要主动声明能力缺口或点名缺失 provider。",
         "directly_supported": [
             "候选池销量、价格、评分、评论数量、BSR、品牌分布",
             "品牌/标题/材质关键词切片后的 top ASIN 和评分/评论数量/销量分布",
             "指定 ASIN 的价格、评分、评论数、销量估算和预测解释",
             "基于明确假设的利润/盈亏平衡测算",
         ],
-        "partial_or_unsupported": [
-            "评论关键词/低分原因需要 asin_review_insights 或评论文本 provider",
-            "Amazon 月搜索量需要 ABA/Helium 10/Jungle Scout/关键词量 provider",
-            "评论文本 provider 或关键词量 provider 未配置时，只能返回能力缺口和替代验证路径",
+        "do_not_fabricate": [
+            "评论文本关键词 / 差评原因 / 评论质量分析",
+            "Amazon 关键词月搜索量",
         ],
-        "response_rule": "若问题包含评论关键词、月搜索量、品牌内 top3 等能力缺口，必须显式写出当前只能回答哪些部分，以及缺什么工具或外部数据。",
+        "response_rule": "do_not_fabricate 里的指标不要写进可复制追问，也不要单独列‘当前工具限制/能力缺口’；只有用户明确点名要这类数据时，才用一句话说明不在当前数据范围内并转向可用替代信号。",
     }
 
 

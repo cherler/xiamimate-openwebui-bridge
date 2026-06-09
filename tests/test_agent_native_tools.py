@@ -1443,7 +1443,7 @@ class AgentNativeToolTests(unittest.TestCase):
         # 已从 agent 可见工具中下线；planner 不应再被允许调用，规范化返回为 None 表示拒绝。
         self.assertIsNone(normalized)
 
-    def test_report_followup_questions_are_annotated_by_actionability(self) -> None:
+    def test_report_followup_questions_are_not_annotated_with_provider_notes(self) -> None:
         pipe = self.make_pipeline()
         answer = """# Amazon 美国 3D Printing Filament 深度选品分析报告
 
@@ -1456,15 +1456,15 @@ class AgentNativeToolTests(unittest.TestCase):
 
         rendered = pipe._prepare_workflow_answer(answer)
 
-        self.assertIn("下一步验证问题（已按当前工具能力标注）", rendered)
-        self.assertIn("能力边界提示", rendered)
-        self.assertIn("评论文本分析 provider", rendered)
-        self.assertIn("关键词量 provider", rendered)
-        self.assertIn("需评论文本 provider", rendered)
-        self.assertIn("需关键词量 provider", rendered)
-        self.assertNotIn("下一步可复制追问", rendered)
+        # 两个工具已真实下线：报告尾部不再被注入能力边界/provider 提示，原文标题保持不变。
+        self.assertIn("下一步可复制追问", rendered)
+        self.assertNotIn("能力边界提示", rendered)
+        self.assertNotIn("评论文本分析 provider", rendered)
+        self.assertNotIn("关键词量 provider", rendered)
+        self.assertNotIn("需评论文本 provider", rendered)
+        self.assertNotIn("需关键词量 provider", rendered)
 
-    def test_report_followup_provider_required_rewrites_direct_markers(self) -> None:
+    def test_report_followup_direct_markers_are_left_untouched(self) -> None:
         pipe = self.make_pipeline()
         answer = """## 下一步验证问题
 
@@ -1474,11 +1474,12 @@ class AgentNativeToolTests(unittest.TestCase):
 
         rendered = pipe._prepare_workflow_answer(answer)
 
-        self.assertIn("需评论文本 provider：评论质量分析", rendered)
-        self.assertIn("需关键词量 provider：Power Strips", rendered)
-        self.assertIn("provider_required", rendered)
-        self.assertNotIn("✅ 评论质量分析", rendered)
-        self.assertNotIn("可直接执行：Power Strips", rendered)
+        # 不再改写为 provider_required 标记；原有标记保留。
+        self.assertNotIn("需评论文本 provider：", rendered)
+        self.assertNotIn("需关键词量 provider：", rendered)
+        self.assertNotIn("provider_required", rendered)
+        self.assertIn("评论质量分析", rendered)
+        self.assertIn("Power Strips", rendered)
 
     def test_agent_grader_flags_opportunity_table_without_card_fields(self) -> None:
         pipe = self.make_pipeline()

@@ -67,10 +67,13 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 10. 涉及类目归属、竞品筛选、是否排除某 ASIN 时，必须基于工具结果中的事实字段判断，优先引用 latest_snapshot.leaf_category_name / latest_snapshot.category_path，其次引用 l3_category_name；不要仅凭标题、品牌或自身知识补全类目。
 11. 当用户要求“清洗/筛选/过滤上一步候选池”，且上一步 resolve_candidates 已返回 ASIN、品牌、product_title、leaf_category_name、fine_category_name、category_path、match_score、match_reasons 等字段时，直接基于这些字段筛选；不要为了判断标题或类目路径是否包含某词而调用 top_asin_drilldown。只有用户明确要求补充销量、价格、BSR、评论、预测等候选池没有的字段，才调用下游详情工具。
 12. 当 resolve_candidates 返回 pool_quality.is_sufficient_for_analysis=false 时，按闭环流程处理，不要把当前候选池包装成完整品类结论：先引用 pool_quality.insufficient_coverage_reason 说明覆盖不足；再调用 category_resolve 获取稳定 category_id/category_path；随后用 resolve_candidates(recall_mode=hybrid 或 category, category_id/category_path, include_descendants=true) 重试本地类目池；若 pool_quality 仍不足，调用 expand_candidates 创建补池任务，并调用 candidate_expansion_status 查询 queued/waiting_token/discovering/hydrating/syncing/completed 状态和 data_readiness。只有补池 job 的 data_readiness.analysis_ready=true，或本地池已 sufficient 且 stats/trends 有有效数值时，才继续 category_benchmark、candidate_pool_stats、top_asin_drilldown 和强结论；如果 status=completed 但 data_readiness.readiness_status=history_hydration_pending 或 serving_sync_pending，要说明“ASIN 已补入但分析特征未就绪”，建议等待 hydrate/serving sync 或只给待验证框架，不要把空 stats 当成市场事实。
-13. 只有当用户还没有给出明确商品主题/关键词/ASIN、在问“找机会/发现机会/某大类下有哪些细分方向/不知道分析什么”时，才调用 opportunity_discovery 输出机会卡片；机会卡片是继续分析入口，按机会编号深入分析时，沿用 opportunities_for_llm 中该编号的 next_action.request 继续调用 resolve_candidates，并以返回的 rank/title/category_path 作为上下文。若用户已经给出明确主题（例如“评估 car vacuum 在 Temu 美国站的机会”“分析 humidifier 在 Amazon US 是否值得做”），不要调用 opportunity_discovery，即使用户句子里出现“机会”二字，也应走主题分析：resolve_candidates -> candidate_pool_stats/candidate_pool_trends/category_benchmark/top_asin_drilldown，并按需要补充 search_knowledge_base 或 web_search。机会发现最终答复必须以逐机会卡片作为主答案；当用户要求 topN/机会卡片/逐卡分析时，最终答复结构固定为：① 一句话总览（市场/平台/返回机会数）；② 一张精简排名表（Markdown 表格，表头 `| 排名 | 机会主题 | 类目路径 | 机会得分 |`，行数等于用户请求数量，类目路径过长可省中间层但保留 leaf）；③ 然后用 `### 机会 N：<名称>` 模板逐卡展开，每张卡片固定包含"机会理由 / 关键证据 / 风险或证据边界 / 下一步验证"，只展示用户请求数量，不得只返回工具表格、也不得只给逐卡解说而省略排名表。排名表中的"机会主题"列和每张卡片标题都必须使用『中文翻译（English 原文）』双语形式（例如『真空保温杯（Tumblers）』『车窗遮阳板（Windshield Sunshades）』），中文翻译需准确反映品类含义，不可省略；原文本身是中文或专有名词则保留原文不加括号。payload.opportunity_cards_text 中的总览表、字段解释和公式明细只能作为证据来源参考，不得替代主答案；不要丢列、改数值或补未返回的数值；同时遵守 payload.llm_summary_guidance/display_rules：保留同名主题隐藏提示；有 personalized_opportunity_score 时保留个性化分或说明排序口径；趋势展示优先使用 trend_momentum_display/trend_signal_status，不能把趋势缺失或近期为 0 简化成普通 -100%；next_action.requires_category_resolve=true 时必须提醒先 category_resolve 再做类目召回。
+   - 选品验证路径是自适应的，不是固定的“stats→trends→benchmark→drilldown”流水线，也没有“必须全部通过才算完整”的关卡。某一个维度数据不足，只代表该维度暂时待校准，不要据此宣布“当前选品验证路径还不完整”，更不要把“换关键词”当成唯一收尾。
+   - 具体到 category_benchmark：当返回 benchmark_is_precise=false，或 pool_representativeness 偏低、uncategorized_asin_count 较多（锚点只代表候选池里少数 ASIN、多数 ASIN 还没解析出本地 L3 类目）时，这只是“类目基准”这一个维度的证据边界。应照常给出 candidate_pool_stats 盘面、candidate_pool_slice 切片自我对标、top_asin_drilldown 头部下钻、forecast 等其它维度能支撑的结论，只把基准维度标注为“待校准/仅供参考”。
+   - 下一步建议要按实际成因从多条路径里自由选择，而不是套模板：补池/类目特征未就绪→建议等待 hydrate/serving sync 后重查；锚点代表性低但池子本身相关→用候选池内部切片和头部下钻做自我对标；召回明显混入无关品→建议用更精准的类目或关键词重建候选池；确属长尾→说明并转向可用替代信号。换关键词只是其中一个可选项，不是默认答复。
+13. 只有当用户还没有给出明确商品主题/关键词/ASIN、在问“找机会/发现机会/某大类下有哪些细分方向/不知道分析什么”时，才调用 opportunity_discovery 输出机会卡片；机会卡片是继续分析入口，按机会编号深入分析时，沿用 opportunities_for_llm 中该编号的 next_action.request 继续调用 resolve_candidates，并以返回的 rank/title/category_path 作为上下文。若用户已经给出明确主题（例如“评估 car vacuum 在 Temu 美国站的机会”“分析 humidifier 在 Amazon US 是否值得做”），不要调用 opportunity_discovery，即使用户句子里出现“机会”二字，也应走主题分析：先 resolve_candidates 拿到候选池，再按当前问题和已返回数据自由编排 candidate_pool_stats / candidate_pool_trends / category_benchmark / top_asin_drilldown 等工具（不必固定顺序、也不必全部调用），并按需要补充 search_knowledge_base 或 web_search。机会发现最终答复必须以逐机会卡片作为主答案；当用户要求 topN/机会卡片/逐卡分析时，最终答复结构固定为：① 一句话总览（市场/平台/返回机会数）；② 一张精简排名表（Markdown 表格，表头 `| 排名 | 机会主题 | 类目路径 | 机会得分 |`，行数等于用户请求数量，类目路径过长可省中间层但保留 leaf）；③ 然后用 `### 机会 N：<名称>` 模板逐卡展开，每张卡片固定包含"机会理由 / 关键证据 / 风险或证据边界 / 下一步验证"，只展示用户请求数量，不得只返回工具表格、也不得只给逐卡解说而省略排名表。排名表中的"机会主题"列和每张卡片标题都必须使用『中文翻译（English 原文）』双语形式（例如『真空保温杯（Tumblers）』『车窗遮阳板（Windshield Sunshades）』），中文翻译需准确反映品类含义，不可省略；原文本身是中文或专有名词则保留原文不加括号。payload.opportunity_cards_text 中的总览表、字段解释和公式明细只能作为证据来源参考，不得替代主答案；不要丢列、改数值或补未返回的数值；同时遵守 payload.llm_summary_guidance/display_rules：保留同名主题隐藏提示；有 personalized_opportunity_score 时保留个性化分或说明排序口径；趋势展示优先使用 trend_momentum_display/trend_signal_status，不能把趋势缺失或近期为 0 简化成普通 -100%；next_action.requires_category_resolve=true 时必须提醒先 category_resolve 再做类目召回。
 14. 当用户明确询问销量预测、未来增长或“为什么模型看好/看空”时，优先调用 product_forecast_explain；不要把 candidate_pool_weak_forecast 的弱信号包装成正式模型预测。
 15. 不要把“用户问法”写成固定流程；按 tool_contract.capability 选择能回答问题的工具，按 evidence_contract 区分 tool_fact、derived_metric、default_assumption、hypothesis。涉及启动资金、盈亏平衡、单件利润、预算周期等计算时，调用 launch_budget_calculator，让工具产出公式和数值；最终答复可以自由组织，但必须把明确事实、计算结果、默认假设和商业判断分开。
-16. 当用户询问品牌内 top ASIN、材质细分 top ASIN、评分/评论数量分布时，优先调用 candidate_pool_slice。评论文本关键词/低分原因以及 Amazon 月搜索量目前均未接入 provider，绝不能伪造这些数据，也不要用 Google Trends / 反推伪装为月搜索量；遇到这类诉求，明确给出当前能力边界并推荐 candidate_pool_slice 的评分/评论数量分布、candidate_pool_trends.google_trends_index 等可用替代线索。
+16. 当用户询问品牌内 top ASIN、材质细分 top ASIN、评分/评论数量分布时，优先调用 candidate_pool_slice。禁止编造当前数据源不存在的指标：评论文本关键词/差评原因/评论质量、Amazon 关键词月搜索量等都不要凭空给数值，也不要用 Google Trends / 反推伪装成月搜索量。不要主动声明“工具限制/能力缺口”，也不要罗列缺哪些工具或 provider；只有当用户明确点名要这类数据时，才用一句话说明它不在当前数据范围内，并自然转向可用的评分/评论数量分布、销量、BSR、趋势指数等替代信号，其余情况完全不要提及。
 
 工具调用规则：
 - 当你决定调用工具时，直接输出工具调用指令，不要在工具调用之前添加任何文字（如"好的，我来帮你…"等）。
@@ -152,7 +155,7 @@ AGENT_SYNTHESIS_SYSTEM_PROMPT = """你是 XiaMimate 的 Answer Synthesizer。
 5. 若工具证据不足，明确说明还缺什么，不要假装结论已被验证。
 6. 不要输出内部 JSON、tool_call、planner 字段或控制标记。
 7. 如果上下文包含 answer_contract，必须按其中 requested_count、answer_shape、must_include 和 must_not_include 组织最终答复。
-8. 如果上下文包含 followup_actionability_policy，报告尾部追问必须标注当前是否可直接执行；评论关键词、Amazon 月搜索量、品牌内 top3 等缺 provider 的问题不得写成已完整支持。
+8. 如果上下文包含 followup_actionability_policy，报告尾部追问只保留当前数据可支撑的问题；禁止编造当前数据源不存在的指标（如评论文本关键词、Amazon 月搜索量），也不要主动罗列“工具限制/能力缺口”或点名缺哪个 provider。
 9. 当 answer_contract.entity_type=opportunity_card 时，最终答复必须采用以下结构作为主答案，不要只输出排名表：
    - 先给一段一句话总览（市场/平台/返回机会数）；
    - 紧接一张精简排名表（Markdown 表格），表头固定为 `| 排名 | 机会主题 | 类目路径 | 机会得分 |`，行数等于用户请求数量；机会主题列必须使用「中文翻译（English 原文）」双语格式；类目路径如果过长可省略中间层，但保留 leaf 类目；缺数据时填 `当前工具未返回该细节`；
@@ -2883,111 +2886,9 @@ class Pipeline:
         return "", payload_comment
 
     def _annotate_report_followup_actionability(self, text: str) -> str:
-        rendered = str(text or "")
-        if not rendered.strip():
-            return rendered
-
-        has_followup_section = bool(re.search(r"^#{2,4}\s*(?:下一步|🔁\s*下一步).*(?:追问|问题|建议)", rendered, flags=re.MULTILINE))
-        has_unsupported_prompt = any(
-            marker in rendered
-            for marker in (
-                "评论关键词",
-                "评分分布 + 关键词",
-                "低分原因",
-                "评论质量",
-                "差评",
-                "评论痛点",
-                "月搜索量",
-                "ABA",
-                "Helium10",
-                "JungleScout",
-                "品牌SUNLU",
-                "品牌 SUNLU",
-            )
-        )
-        if not has_followup_section and not has_unsupported_prompt:
-            return rendered
-
-        rendered = re.sub(
-            r"^(#{2,4}\s*)下一步可复制追问\s*$",
-            r"\1下一步验证问题（已按当前工具能力标注）",
-            rendered,
-            flags=re.MULTILINE,
-        )
-        rendered = re.sub(
-            r"^(#{2,4}\s*)🔁\s*下一步追问\s*$",
-            r"\1下一步验证问题（已按当前工具能力标注）",
-            rendered,
-            flags=re.MULTILINE,
-        )
-
-        note = (
-            "> 能力边界提示：当前虾米选品可直接查询候选池销量、价格、评分、评论数量、BSR、品牌分布和利润测算；"
-            "品牌/标题/材质维度 top ASIN 可用 candidate_pool_slice；评论关键词需要评论文本分析 provider，Amazon 月搜索量需要 ABA/第三方关键词量 provider。"
-        )
-        if "能力边界提示" not in rendered:
-            rendered = re.sub(
-                r"(#{2,4}\s*下一步验证问题（已按当前工具能力标注）\s*\n)",
-                r"\1\n" + note + "\n",
-                rendered,
-                count=1,
-            )
-            if "下一步验证问题（已按当前工具能力标注）" not in rendered and has_unsupported_prompt:
-                rendered = rendered.rstrip() + "\n\n" + note
-
-        lines = []
-        for line in rendered.splitlines():
-            updated = self._rewrite_provider_required_followup_line(line)
-            if ("品牌SUNLU" in updated or "品牌 SUNLU" in updated or "SUNLU/Creality" in updated) and "candidate_pool_slice" not in updated:
-                updated += "（品牌内 top ASIN 可直接调用 candidate_pool_slice，输出评分/评论数量/销量分布；评论关键词仍需评论文本分析 provider。）"
-            lines.append(updated)
-        return "\n".join(lines)
-
-    def _rewrite_provider_required_followup_line(self, line: str) -> str:
-        updated = str(line or "")
-        if not updated.strip():
-            return updated
-        review_terms = (
-            "评论关键词",
-            "评分分布 + 关键词",
-            "低分原因",
-            "评论质量",
-            "差评关键词",
-            "差评集中",
-            "评论痛点",
-            "1-3 星差评",
-            "1–3 星差评",
-            "1～3 星差评",
-        )
-        keyword_terms = ("月搜索量", "Amazon 搜索量", "amazon 搜索量", "ABA", "Helium10", "JungleScout")
-        review_note = "（provider_required：真实评论关键词、低分原因或评论质量分析需评论文本分析 provider；当前仅能直接验证评分/评论数量分布。）"
-        keyword_note = "（provider_required：精确 Amazon 月搜索量需 ABA/Helium10/JungleScout 或自有关键词量 provider；当前只能用趋势指数、ASIN 销量和评论量作替代验证。）"
-        if any(term in updated for term in review_terms):
-            updated = self._force_provider_required_marker(updated, "需评论文本 provider")
-            if "评论文本分析 provider" not in updated and "review_text_provider" not in updated and review_note not in updated:
-                updated += review_note
-        if any(term in updated for term in keyword_terms):
-            updated = self._force_provider_required_marker(updated, "需关键词量 provider")
-            if "关键词量 provider" not in updated and keyword_note not in updated:
-                updated += keyword_note
-        return updated
-
-    def _force_provider_required_marker(self, line: str, marker: str) -> str:
-        updated = str(line or "")
-        if "provider_required" in updated or marker in updated:
-            return updated
-        updated = re.sub(r"(?:✅\s*)?可直接执行\s*[：:]?", marker + "：", updated)
-        updated = re.sub(r"(?:✅\s*)?直接执行\s*[：:]?", marker + "：", updated)
-        updated = updated.replace("✅", "")
-        stripped = updated.lstrip()
-        prefix_len = len(updated) - len(stripped)
-        prefix = updated[:prefix_len]
-        if re.match(r"^(?:[-*]\s*)?(?:\d+[\.、)]\s*)?(?:\*\*)?需", stripped):
-            return updated
-        numbered = re.match(r"^((?:[-*]\s*)?(?:\d+[\.、)]\s*))(.+)$", stripped)
-        if numbered:
-            return prefix + numbered.group(1) + marker + "：" + numbered.group(2).strip()
-        return prefix + marker + "：" + stripped
+        # 已下线评论文本/关键词量 provider 的对外声明：报告尾部不再注入“能力边界提示”，
+        # 也不再把追问改写成“需 provider”。反编造由 prompt 静默约束负责，此处保持原文不变。
+        return str(text or "")
 
     def _append_report_refund_visibility_note(self, text: str, payload: dict) -> str:
         rendered = str(text or "").rstrip()
