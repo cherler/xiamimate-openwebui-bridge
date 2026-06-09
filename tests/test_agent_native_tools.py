@@ -2660,6 +2660,76 @@ class AgentMultiTurnSessionMemoryTests(unittest.TestCase):
         stale = pipe.agent_harness.filter_redundant_planner_steps(steps, "theme_analysis", [])
         self.assertIn("candidate_pool_trends", [s["tool_call"]["name"] for s in stale])
 
+    def test_force_refresh_bypasses_cross_turn_dedup_and_strips_flag(self) -> None:
+        """planner 在 parameters 里加 force_refresh=true 时，即使跨轮同签名也应放行重跑，
+        且该控制标记必须从入参中剥离，不能传给真实工具。"""
+        pipe = self.make_pipeline()
+        pipe._ensure_agent_harness({"chat_id": "chat-force-refresh"})
+        params = {"candidate_pool_id": "p1"}
+        # 上一轮已缓存 stats（补池前的旧统计）
+        pipe.agent_harness.after_tool_observation(
+            tool_call={"name": "candidate_pool_stats", "parameters": params},
+            result=json.dumps({"success": True, "data": {"pool_size": 12}}),
+            compact_result="stats-12",
+        )
+
+        # 不加 force_refresh：窗口内同签名被去重
+        deduped = pipe.agent_harness.filter_redundant_planner_steps(
+            [{"tool_call": {"name": "candidate_pool_stats", "parameters": dict(params)}}],
+            "theme_analysis",
+            [],
+        )
+        self.assertNotIn("candidate_pool_stats", [s["tool_call"]["name"] for s in deduped])
+
+        # 加 force_refresh=true：放行重跑，且标记被剥离
+        step = {"tool_call": {"name": "candidate_pool_stats", "parameters": {**params, "force_refresh": True}}}
+        kept = pipe.agent_harness.filter_redundant_planner_steps([step], "theme_analysis", [])
+        kept_names = [s["tool_call"]["name"] for s in kept]
+        self.assertIn("candidate_pool_stats", kept_names)
+        self.assertNotIn("force_refresh", kept[0]["tool_call"]["parameters"])
+        self.assertEqual(kept[0]["tool_call"]["parameters"], params)
+
+    def test_force_refresh_accepts_string_truthy_values(self) -> None:
+        """force_refresh 兼容字符串 'true' 等真值写法。"""
+        pipe = self.make_pipeline()
+        pipe._ensure_agent_harness({"chat_id": "chat-force-refresh-str"})
+        params = {"candidate_pool_id": "p1"}
+        pipe.agent_harness.after_tool_observation(
+            tool_call={"name": "candidate_pool_stats", "parameters": params},
+            result=json.dumps({"success": True, "data": {"pool_size": 12}}),
+            compact_result="stats-12",
+        )
+        step = {"tool_call": {"name": "candidate_pool_stats", "parameters": {**params, "force_refresh": "true"}}}
+        kept = pipe.agent_harness.filter_redundant_planner_steps([step], "theme_analysis", [])
+        self.assertIn("candidate_pool_stats", [s["tool_call"]["name"] for s in kept])
+        self.assertNotIn("force_refresh", kept[0]["tool_call"]["parameters"])
+
+    def test_force_refresh_still_deduped_within_same_request(self) -> None:
+        """同一请求内重复的 force_refresh 同签名仍应去重，避免一轮里刷新两次。"""
+        pipe = self.make_pipeline()
+        pipe._ensure_agent_harness({"chat_id": "chat-force-refresh-intra"})
+        steps = [
+            {"tool_call": {"name": "candidate_pool_stats", "parameters": {"candidate_pool_id": "p1", "force_refresh": True}}},
+            {"tool_call": {"name": "candidate_pool_stats", "parameters": {"candidate_pool_id": "p1", "force_refresh": True}}},
+        ]
+        kept = pipe.agent_harness.filter_redundant_planner_steps(steps, "theme_analysis", [])
+        self.assertEqual([s["tool_call"]["name"] for s in kept], ["candidate_pool_stats"])
+
+    def test_session_snapshot_labels_cached_results_with_age(self) -> None:
+        """session_memory.recent_tool_calls 应标注 cached=true 与 cached_age_seconds，供 planner 判断是否刷新。"""
+        pipe = self.make_pipeline()
+        pipe._ensure_agent_harness({"chat_id": "chat-cache-label"})
+        pipe.agent_harness.after_tool_observation(
+            tool_call={"name": "candidate_pool_stats", "parameters": {"candidate_pool_id": "p1"}},
+            result=json.dumps({"success": True, "data": {"pool_size": 12}}),
+            compact_result="stats-12",
+        )
+        snapshot = pipe.agent_harness.session_snapshot() or {}
+        recent = snapshot.get("recent_tool_calls") or []
+        self.assertTrue(recent)
+        self.assertTrue(recent[0].get("cached"))
+        self.assertIsInstance(recent[0].get("cached_age_seconds"), int)
+
 
     """覆盖两件事：
     1. asin_review_insights / amazon_keyword_demand 已从 agent 可见 registry 和 scene policy 中下线。

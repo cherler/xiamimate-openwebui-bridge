@@ -6073,6 +6073,14 @@ class Pipeline:
                             "但 candidate_expansion_status 等状态查询类工具属于例外：后台任务状态会随时间变化（queued→discovering→hydrating→completed），"
                             "只要用户在询问补池/任务进度或数据是否就绪，就必须重新调用该工具获取最新 status 与 data_readiness，"
                             "绝不能复述 session_memory 里上一轮的旧状态摘要。"
+                            "【缓存标记】session_memory.recent_tool_calls 里的每条结果都带 cached=true 和 cached_age_seconds，"
+                            "表示它是之前轮次缓存的结果、不是本轮实时重查。当底层数据可能已经变化时（最典型：扩池/补池任务刚 completed，"
+                            "候选池新增了 ASIN，但 candidate_pool_stats / candidate_pool_trends / category_benchmark / top_asin_drilldown "
+                            "等工具入参只含 pool_id、签名没变，会被去重直接复述补池前的旧统计），这些缓存结果就已过期、不可直接采信。"
+                            "【强制刷新权限】此时请在该工具调用的 parameters 里显式加上 force_refresh=true，"
+                            "即可绕过跨轮去重、强制真实重新调用工具拿最新结果（该标记只控制刷新，不会传给工具本身）。"
+                            "判断准则：只要你怀疑缓存结果可能已过期（数据源刚发生变更、用户明确要求最新/刷新、补池刚完成等），就加 force_refresh=true 重查；"
+                            "若数据稳定且 cached_age_seconds 不大，可继续复用缓存以节省调用。"
                             "如果已有工具足够回答，请返回 action.type=final 和 final_answer。"
                             "如果需要继续执行新的工具，只返回一个 action.type=tool 的下一步动作，不要一次性规划完整路线。"
                         ),
@@ -8149,6 +8157,16 @@ class Pipeline:
     def _execute_tool_call(self, tool_call: Dict[str, Any], billing_context: dict, truncate: bool = True) -> str:
         tool_name = tool_call["name"]
         parameters = tool_call.get("parameters") or {}
+        # 防御性剥离：force_refresh 等是去重控制标记（通常已在 filter 阶段移除），
+        # 绝不能作为关键字参数传给真实工具方法，否则 method(**parameters) 会因未知参数报 TypeError。
+        if isinstance(parameters, dict) and any(
+            k in parameters for k in ("force_refresh", "_force_refresh", "_refresh", "refresh")
+        ):
+            parameters = {
+                k: v
+                for k, v in parameters.items()
+                if k not in ("force_refresh", "_force_refresh", "_refresh", "refresh")
+            }
         public_parameters = {
             key: value
             for key, value in dict(parameters or {}).items()

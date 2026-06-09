@@ -86,6 +86,17 @@ def tool_result_is_unusable(result: Any, compact_result: str = "") -> bool:
     return False
 
 
+def _coerce_bool_flag(value: Any) -> bool:
+    """把 planner 可能给出的多种"真值"形式（true / "true" / 1 / "yes" 等）归一为布尔。"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "y", "on", "refresh"}
+    return False
+
+
 class SessionContextStore:
     """跨轮会话级结构化上下文。
 
@@ -1186,16 +1197,25 @@ class AgentHarness:
             }
         tool_calls = snapshot.get("last_tool_calls")
         if tool_calls:
+            now = time.time()
             recent = []
             for _composite_key, entry in list(tool_calls.items())[-6:]:
                 if isinstance(entry, dict):
+                    recorded_at = entry.get("recorded_at")
+                    age_seconds = None
+                    if isinstance(recorded_at, (int, float)):
+                        age_seconds = max(0, int(now - recorded_at))
                     recent.append(
                         {
                             "tool_name": entry.get("tool_name"),
                             "params_fingerprint": entry.get("params_fingerprint"),
                             "params_preview": entry.get("params_preview"),
                             "summary": entry.get("summary"),
-                            "recorded_at": entry.get("recorded_at"),
+                            "recorded_at": recorded_at,
+                            # 明确标注：这些是之前轮次缓存下来的结果，不是本轮实时重查。
+                            # planner 可据此判断是否需要 force_refresh 重新取最新数据。
+                            "cached": True,
+                            "cached_age_seconds": age_seconds,
                         }
                     )
             if recent:
@@ -1382,11 +1402,30 @@ class AgentHarness:
             if not tool_name:
                 kept.append(step)
                 continue
+            # force_refresh：planner 显式要求绕过跨轮缓存、强制真实重查（例如扩池完成后候选池内容已变，
+            # 而 candidate_pool_stats 等工具入参签名没变，旧统计会被当成最新复述）。
+            # 该标记仅用于控制去重，绝不能传给真实工具调用，否则下游可能因未知参数报错——这里先剥离。
+            parameters = tool_call.get("parameters")
+            force_refresh = False
+            if isinstance(parameters, dict):
+                for flag_key in ("force_refresh", "_force_refresh", "_refresh", "refresh"):
+                    if flag_key in parameters:
+                        if _coerce_bool_flag(parameters.pop(flag_key)):
+                            force_refresh = True
             fingerprint = tool_call_fingerprint(tool_call.get("parameters") or {})
             signature = f"{tool_name}::{fingerprint}"
             # 0) 状态轮询型工具：每轮都必须真实重查，仅在同一请求内去重，
             #    跨轮 session_signatures / prerequisite 句柄一律不拦截，避免复述 queued 旧状态。
             if tool_name in STATUS_POLL_REFRESH_TOOLS:
+                if signature in planned_signatures:
+                    continue
+                kept.append(step)
+                planned_signatures.add(signature)
+                planned_names.add(tool_name)
+                continue
+            # 0.5) force_refresh：planner 主动要求刷新，跨轮一律放行真实重查，
+            #      仅保留同一请求内去重（避免一轮里把同一刷新重复执行两次）。
+            if force_refresh:
                 if signature in planned_signatures:
                     continue
                 kept.append(step)
