@@ -340,6 +340,7 @@
         '<a href="/portal/account' + portalLinkSuffix + '"' + cls('/portal/account') + '>\u8D26\u6237\u7BA1\u7406</a>' +
         '<a href="/portal/product"' + cls('/portal/product') + '>\u4EA7\u54C1\u4ECB\u7ECD</a>' +
         '<a href="/portal/guide"' + cls('/portal/guide') + '>\u4F7F\u7528\u6307\u5357</a>' +
+        '<a href="/portal/tools"' + cls('/portal/tools') + '>\u514D\u8D39\u5DE5\u5177</a>' +
         '<a href="/portal/products' + portalLinkSuffix + '"' + cls('/portal/products') + '>\u8BA2\u9605\u4E0E\u5145\u503C</a>' +
       '</div>' +
       '<div class="xm-right">' +
