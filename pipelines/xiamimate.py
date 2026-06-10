@@ -364,6 +364,10 @@ class Pipeline:
         AGENT_TITLE_TRANSLATION_TIMEOUT: int = 20
         AGENT_TITLE_TRANSLATOR_BASE_URL: str = ""
         AGENT_TITLE_TRANSLATOR_API_KEY: str = ""
+        # 翻译副线优先用非推理模式：DeepSeek v4 系列在 extra_body/请求体里通过
+        # {"thinking": {"type": "disabled"}} 关闭思维链，避免推理模型把 token 全放进
+        # reasoning_content 而 content 为空导致译文解析失败。
+        AGENT_TITLE_TRANSLATOR_DISABLE_THINKING: bool = True
         AGENT_OPPORTUNITY_BYPASS_SYNTHESIS: bool = True
         HELP_FAST_TOP_K: int = 4
         HELP_CACHE_TTL_SECONDS: int = 900
@@ -401,6 +405,7 @@ class Pipeline:
                 "AGENT_TITLE_TRANSLATION_TIMEOUT": int(os.getenv("AGENT_TITLE_TRANSLATION_TIMEOUT", "20") or 20),
                 "AGENT_TITLE_TRANSLATOR_BASE_URL": os.getenv("AGENT_TITLE_TRANSLATOR_BASE_URL", ""),
                 "AGENT_TITLE_TRANSLATOR_API_KEY": os.getenv("AGENT_TITLE_TRANSLATOR_API_KEY", ""),
+                "AGENT_TITLE_TRANSLATOR_DISABLE_THINKING": (os.getenv("AGENT_TITLE_TRANSLATOR_DISABLE_THINKING", "true").strip().lower() not in {"0", "false", "no", "off", ""}),
                 "AGENT_OPPORTUNITY_BYPASS_SYNTHESIS": (os.getenv("AGENT_OPPORTUNITY_BYPASS_SYNTHESIS", "true").strip().lower() not in {"0", "false", "no", "off", ""}),
                 "HELP_FAST_TOP_K": int(os.getenv("HELP_FAST_TOP_K", "4")),
                 "HELP_CACHE_TTL_SECONDS": int(os.getenv("HELP_CACHE_TTL_SECONDS", "900")),
@@ -8731,6 +8736,7 @@ class Pipeline:
                 )
         if last_exc is not None:
             return out
+        applied = 0
         for title in pending:
             zh = str(fetched.get(title) or "").strip()
             if zh and not self._has_cjk(zh):
@@ -8739,6 +8745,15 @@ class Pipeline:
             if zh:
                 cache[title] = zh
                 out[title] = zh
+                applied += 1
+        if applied == 0:
+            # 翻译调用本身没抛异常，但一条有效译文都没拿到（常见于推理模型 content 为空 /
+            # 解析失败 / 模型漏键）。显式告警，区别于上面的异常路径，便于线上排查。
+            print(
+                "xiamimate.agent opportunity title translation returned empty:",
+                "pending=%d fetched_keys=%d sample=%r"
+                % (len(pending), len(fetched), pending[:3]),
+            )
         return out
 
     def _call_opportunity_title_translator(self, titles: List[str]) -> Dict[str, str]:
@@ -8768,6 +8783,11 @@ class Pipeline:
             "temperature": 0.0,
             "response_format": {"type": "json_object"},
         }
+        # 翻译副线优先关闭思维链：DeepSeek v4 系列（deepseek-v4-flash 等）默认 thinking=enabled，
+        # 偶发把全部 token 放进 reasoning_content 而 content 为空，导致译文解析失败。
+        # 关闭后用非推理模式直出 JSON，速度更快、空 content 概率更低。
+        if getattr(self.valves, "AGENT_TITLE_TRANSLATOR_DISABLE_THINKING", True):
+            payload["thinking"] = {"type": "disabled"}
         translator_base_url = (self.valves.AGENT_TITLE_TRANSLATOR_BASE_URL or "").strip()
         translator_api_key = (self.valves.AGENT_TITLE_TRANSLATOR_API_KEY or "").strip()
         if translator_base_url and translator_api_key:
@@ -8780,19 +8800,41 @@ class Pipeline:
         else:
             data = self._post_agent_payload(payload, model_name=model_name)
         text = ""
+        finish_reason = ""
+        reasoning_text = ""
         choices = data.get("choices") if isinstance(data, dict) else None
         if isinstance(choices, list) and choices:
-            message = choices[0].get("message") if isinstance(choices[0], dict) else None
+            first = choices[0] if isinstance(choices[0], dict) else {}
+            finish_reason = str(first.get("finish_reason") or "")
+            message = first.get("message") if isinstance(first.get("message"), dict) else None
             if isinstance(message, dict):
                 text = str(message.get("content") or "")
-        if not text.strip():
+                reasoning_text = str(message.get("reasoning_content") or "")
+        # content 为空时回退到 reasoning_content：推理模型偶发把可解析的 JSON 留在思维链字段里。
+        primary = text if text.strip() else reasoning_text
+        if not primary.strip():
+            print(
+                "xiamimate.agent title translator empty content:",
+                "model=%s finish_reason=%s has_reasoning=%s titles=%d"
+                % (model_name, finish_reason or "?", bool(reasoning_text.strip()), len(titles)),
+            )
             return {}
-        try:
-            parsed = json.loads(text)
-        except (TypeError, ValueError):
+        # 解析加固：剥离 ```json 围栏 / <think> 块 / 抽取首个 JSON 对象（复用通用提取器）。
+        parsed = self._extract_json_value_from_text(primary)
+        if not isinstance(parsed, dict):
+            print(
+                "xiamimate.agent title translator non-json content:",
+                "model=%s finish_reason=%s preview=%r"
+                % (model_name, finish_reason or "?", primary.strip()[:200]),
+            )
             return {}
         block = parsed.get("translations") if isinstance(parsed, dict) else None
         if not isinstance(block, dict):
+            print(
+                "xiamimate.agent title translator missing 'translations' key:",
+                "model=%s top_keys=%s"
+                % (model_name, list(parsed.keys())[:8] if isinstance(parsed, dict) else None),
+            )
             return {}
         return {str(k): str(v) for k, v in block.items() if isinstance(k, str)}
 
