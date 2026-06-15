@@ -114,12 +114,12 @@ class SessionContextStore:
         self,
         ttl_seconds: int = 2 * 60 * 60,
         max_sessions: int = 512,
-        max_tool_result_chars: int = 1200,
+        max_tool_result_chars: int = 4000,
         max_tool_results: int = 8,
     ):
         self.ttl_seconds = max(60, int(ttl_seconds or 7200))
         self.max_sessions = max(1, int(max_sessions or 512))
-        self.max_tool_result_chars = max(200, int(max_tool_result_chars or 1200))
+        self.max_tool_result_chars = max(200, int(max_tool_result_chars or 4000))
         self.max_tool_results = max(1, int(max_tool_results or 8))
         self._sessions: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
         self._lock = threading.RLock()
@@ -180,7 +180,8 @@ class SessionContextStore:
             return
         truncated = str(compact_result or "")
         if len(truncated) > self.max_tool_result_chars:
-            truncated = truncated[: self.max_tool_result_chars] + "...(truncated)"
+            # 内部标记，勿外露给用户；仅用于跨轮记忆容量控制。
+            truncated = truncated[: self.max_tool_result_chars] + " <internal_only 已截断>"
         fingerprint = tool_call_fingerprint(parameters)
         params_preview = _summarize_parameters(parameters)
         composite_key = f"{normalized_tool}::{fingerprint}"
@@ -466,7 +467,19 @@ def planner_observation_context(
     tool_observations: List[dict],
     truncate_text: Callable[[str, int], str],
     limit: int = 6,
+    *,
+    digest_older: bool = True,
+    newest_budget: int = 12000,
+    older_budget: int = 6000,
 ) -> List[dict]:
+    """Build the observation context fed to planner/synthesizer.
+
+    - Planner step (digest_older=True): older observations are compressed to a
+      head+tail digest because the planner only needs to decide the next action.
+    - Synthesis step (digest_older=False): older observations keep their full
+      numeric payload (truncated to older_budget instead of digested), because
+      the user-facing answer is built here and must not lose tool numbers.
+    """
     window = (tool_observations or [])[-max(1, limit) :]
     items: List[dict] = []
     last_index = len(window) - 1
@@ -474,12 +487,16 @@ def planner_observation_context(
         result_text = str(observation.get("llm_result") or "")
         if idx == last_index:
             # Newest observation: keep full content (with a safety cap to avoid runaway payloads).
-            result_payload = truncate_text(result_text, 12000)
+            result_payload = truncate_text(result_text, newest_budget)
             digest = False
-        else:
-            # Older observations: planner already saw them; compress to head+tail digest.
+        elif digest_older:
+            # Planner: older observations already seen; compress to head+tail digest.
             result_payload = _digest_observation_result(result_text)
             digest = True
+        else:
+            # Synthesis: keep older observations' numbers, only cap length by truncation.
+            result_payload = truncate_text(result_text, older_budget)
+            digest = False
         item = {
             "tool_name": str(observation.get("tool_name") or "").strip(),
             "arguments": observation.get("arguments") or {},
@@ -1344,8 +1361,19 @@ class AgentHarness:
         tool_observations: List[dict],
         truncate_text: Callable[[str, int], str],
         limit: int = 6,
+        *,
+        digest_older: bool = True,
+        newest_budget: int = 12000,
+        older_budget: int = 6000,
     ) -> List[dict]:
-        return planner_observation_context(tool_observations, truncate_text, limit=limit)
+        return planner_observation_context(
+            tool_observations,
+            truncate_text,
+            limit=limit,
+            digest_older=digest_older,
+            newest_budget=newest_budget,
+            older_budget=older_budget,
+        )
 
     def observed_tool_names(self, tool_observations: List[dict]) -> List[str]:
         return observed_tool_names(tool_observations)

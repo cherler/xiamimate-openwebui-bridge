@@ -74,6 +74,7 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 14. 当用户明确询问销量预测、未来增长或“为什么模型看好/看空”时，优先调用 product_forecast_explain；不要把 candidate_pool_weak_forecast 的弱信号包装成正式模型预测。
 15. 不要把“用户问法”写成固定流程；按 tool_contract.capability 选择能回答问题的工具，按 evidence_contract 区分 tool_fact、derived_metric、default_assumption、hypothesis。涉及启动资金、盈亏平衡、单件利润、预算周期等计算时，调用 launch_budget_calculator，让工具产出公式和数值；最终答复可以自由组织，但必须把明确事实、计算结果、默认假设和商业判断分开。
 16. 当用户询问品牌内 top ASIN、材质细分 top ASIN、评分/评论数量分布时，优先调用 candidate_pool_slice。禁止编造当前数据源不存在的指标：评论文本关键词/差评原因/评论质量、Amazon 关键词月搜索量等都不要凭空给数值，也不要用 Google Trends / 反推伪装成月搜索量。不要主动声明“工具限制/能力缺口”，也不要罗列缺哪些工具或 provider；只有当用户明确点名要这类数据时，才用一句话说明它不在当前数据范围内，并自然转向可用的评分/评论数量分布、销量、BSR、趋势指数等替代信号，其余情况完全不要提及。
+17. 工具结果是经过内部精简/截断后的中间产物。其中出现的 `compaction_note`、`original_chars`、`result_format`、`result_digest`、`<internal_only…>`、`…[omitted N chars]…`、`...(truncated)`、`[结果已截断]` 等都是内部格式标记，绝对不能复述给用户，也不能据此对用户说“数据因压缩/缓存/截断未能展示”“缓存结果未能完整返回”“完整数据被截断”之类的话。如果某个具体数值在当前结果里确实没有，就直接省略该点、或改用其它已返回字段，或在必要时重新调用对应工具，而不是向用户描述内部压缩/缓存状态。用户应当只看到结论与证据，而不是工具结果的存储/压缩细节。
 
 工具调用规则：
 - 当你决定调用工具时，直接输出工具调用指令，不要在工具调用之前添加任何文字（如"好的，我来帮你…"等）。
@@ -162,6 +163,7 @@ AGENT_SYNTHESIS_SYSTEM_PROMPT = """你是 XiaMimate 的 Answer Synthesizer。
    - 然后再用 `### 机会 N：<名称>` 模板逐卡展开，其下依次给出 `机会理由`、`关键证据`、`风险/证据边界`、`下一步验证`。
    `<名称>` 同样使用「中文翻译（English 原文）」双语格式（示例：「真空保温杯（Tumblers）」「车窗遮阳板（Windshield Sunshades）」「手机壳套装（Case & Cover Bundles）」）；中文翻译需准确反映品类含义，不可省略中文；如果原文本身已是中文或属于专有名词、无对应中文（如 ASIN、品牌名），则保留原文不加括号。没有对应工具字段时写"当前工具未返回该细节"，不要编造。
 10. 当任一工具结果包含 provider_status=provider_required 或 missing_capability 时，必须显式说明缺失的 provider，并复述该结果中 available_alternatives 至少一条作为下一步替代验证路径，不要把 provider_required 包装成普通结论。
+11. 上下文里的工具结果是经过内部精简/截断后的中间产物。`compaction_note`、`original_chars`、`result_format`、`result_digest`、`<internal_only…>`、`…[omitted N chars]…`、`...(truncated)`、`[结果已截断]` 等都是内部格式标记，绝对不能出现在答复里，也不能据此对用户说“数据因压缩/缓存/截断未能展示”“缓存结果未能完整返回”“完整数据在压缩后被截断”之类的话。某个数值若当前结果里确实没有，就省略该点或改用其它已返回字段，不要描述内部存储/压缩状态；用户只应看到结论与证据。
 """
 
 TOOL_LAYER_REGISTRY = agent_harness.TOOL_LAYER_REGISTRY
@@ -5660,6 +5662,20 @@ class Pipeline:
             limit=effective_limit,
         )
 
+    def _synthesis_observation_context(self, tool_observations: List[dict], limit: Optional[int] = None) -> List[dict]:
+        # 合成阶段（生成用户最终答复）必须保留所有工具结果中的数值，
+        # 不能像 planner 那样把历史 observation 压成 head+tail 摘要，
+        # 否则像 candidate_pool_stats 这类“非最后一步”的统计数值会丢失。
+        effective_limit = int(limit) if limit is not None else 8
+        return self.agent_harness.planner_observation_context(
+            tool_observations,
+            lambda text, budget: self._truncate_text_for_llm(text, budget=int(budget or 16000)),
+            limit=effective_limit,
+            digest_older=False,
+            newest_budget=16000,
+            older_budget=12000,
+        )
+
     def _observed_tool_names(self, tool_observations: List[dict]) -> List[str]:
         return self.agent_harness.observed_tool_names(tool_observations)
 
@@ -6228,7 +6244,7 @@ class Pipeline:
         synthesis_context = self.agent_harness.synthesis_context(
             planner_notes,
             tool_observations,
-            self._planner_observation_context,
+            self._synthesis_observation_context,
             trace=agent_trace,
             limit_reached=limit_reached,
             answer_contract=self._answer_contract_from_messages(messages),
@@ -8120,7 +8136,10 @@ class Pipeline:
                 meta={"tool_name": tool_name, "result_preview": result_text[:500]},
             )
         if truncate and len(result_text) > 12000:
-            return "%s\n\n[结果已截断，原始长度 %d 字符]" % (result_text[:12000], len(result_text))
+            return "%s\n\n<internal_only 已截断，仅保留前 12000/%d 字符；这是内部格式标记，勿向用户复述压缩/截断状态>" % (
+                result_text[:12000],
+                len(result_text),
+            )
         return result_text
 
     def _build_tool_observation(self, tool_call: Dict[str, Any], result: str) -> dict:
@@ -8150,7 +8169,7 @@ class Pipeline:
             print("xiamimate.agent session-context update failed:", repr(exc))
         return observation
 
-    def _format_tool_result_for_llm(self, tool_name: str, result: str, budget: int = 9000) -> str:
+    def _format_tool_result_for_llm(self, tool_name: str, result: str, budget: int = 14000) -> str:
         result_text = str(result or "").strip()
         if not result_text:
             return "工具返回为空。"
@@ -8176,7 +8195,7 @@ class Pipeline:
             "tool_name": tool_name,
             "result_format": "compacted_json",
             "original_chars": len(result_text),
-            "compaction_note": "Large arrays/strings may be shortened; use visible counts and omitted markers when reasoning.",
+            "compaction_note": "internal_only: 这是工具结果的内部精简视图。直接使用其中已展示的数值与计数作答；切勿向用户复述压缩/截断/缓存等内部状态，也不要因为这里看不到某个字段就对用户说“数据因压缩未能展示/未能完整返回”。如确需缺失字段，请改用其它已返回字段或省略该点。",
             "payload": compact_payload,
         }
         rendered = json.dumps(envelope, ensure_ascii=False, indent=2)
@@ -9344,7 +9363,11 @@ class Pipeline:
     def _truncate_text_for_llm(self, text: str, budget: int) -> str:
         if len(text) <= budget:
             return text
-        return "%s\n\n[结果已压缩截断，原始长度 %d 字符]" % (text[:budget], len(text))
+        return "%s\n\n<internal_only 已截断，仅保留前 %d/%d 字符；这是内部格式标记，勿向用户复述压缩/截断状态>" % (
+            text[:budget],
+            budget,
+            len(text),
+        )
 
     def _fallback_answer_from_tool_observations(self, tool_observations: List[dict], error: str = "") -> str:
         opportunity_fallback = self._fallback_opportunity_answer_from_observations(tool_observations)
