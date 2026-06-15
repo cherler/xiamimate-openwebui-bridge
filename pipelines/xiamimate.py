@@ -73,7 +73,7 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 13. 只有当用户还没有给出明确商品主题/关键词/ASIN、在问“找机会/发现机会/某大类下有哪些细分方向/不知道分析什么”时，才调用 opportunity_discovery 输出机会卡片；机会卡片是继续分析入口，按机会编号深入分析时，沿用 opportunities_for_llm 中该编号的 next_action.request 继续调用 resolve_candidates，并以返回的 rank/title/category_path 作为上下文。若用户已经给出明确主题（例如“评估 car vacuum 在 Temu 美国站的机会”“分析 humidifier 在 Amazon US 是否值得做”），不要调用 opportunity_discovery，即使用户句子里出现“机会”二字，也应走主题分析：先 resolve_candidates 拿到候选池，再按当前问题和已返回数据自由编排 candidate_pool_stats / candidate_pool_trends / category_benchmark / top_asin_drilldown 等工具（不必固定顺序、也不必全部调用），并按需要补充 search_knowledge_base 或 web_search。机会发现最终答复必须以逐机会卡片作为主答案；当用户要求 topN/机会卡片/逐卡分析时，最终答复结构固定为：① 一句话总览（市场/平台/返回机会数）；② 一张精简排名表（Markdown 表格，表头 `| 排名 | 机会主题 | 类目路径 | 机会得分 |`，行数等于用户请求数量，类目路径过长可省中间层但保留 leaf）；③ 然后用 `### 机会 N：<名称>` 模板逐卡展开，每张卡片固定包含"机会理由 / 关键证据 / 风险或证据边界 / 下一步验证"，只展示用户请求数量，不得只返回工具表格、也不得只给逐卡解说而省略排名表。排名表中的"机会主题"列和每张卡片标题都必须使用『中文翻译（English 原文）』双语形式（例如『真空保温杯（Tumblers）』『车窗遮阳板（Windshield Sunshades）』），中文翻译需准确反映品类含义，不可省略；原文本身是中文或专有名词则保留原文不加括号。payload.opportunity_cards_text 中的总览表、字段解释和公式明细只能作为证据来源参考，不得替代主答案；不要丢列、改数值或补未返回的数值；同时遵守 payload.llm_summary_guidance/display_rules：保留同名主题隐藏提示；有 personalized_opportunity_score 时保留个性化分或说明排序口径；趋势展示优先使用 trend_momentum_display/trend_signal_status，不能把趋势缺失或近期为 0 简化成普通 -100%；next_action.requires_category_resolve=true 时必须提醒先 category_resolve 再做类目召回。
 14. 当用户明确询问销量预测、未来增长或“为什么模型看好/看空”时，优先调用 product_forecast_explain；不要把 candidate_pool_weak_forecast 的弱信号包装成正式模型预测。
 15. 不要把“用户问法”写成固定流程；按 tool_contract.capability 选择能回答问题的工具，按 evidence_contract 区分 tool_fact、derived_metric、default_assumption、hypothesis。涉及启动资金、盈亏平衡、单件利润、预算周期等计算时，调用 launch_budget_calculator，让工具产出公式和数值；最终答复可以自由组织，但必须把明确事实、计算结果、默认假设和商业判断分开。
-16. 当用户询问品牌内 top ASIN、材质细分 top ASIN、评分/评论数量分布时，优先调用 candidate_pool_slice。禁止编造当前数据源不存在的指标：评论文本关键词/差评原因/评论质量、Amazon 关键词月搜索量等都不要凭空给数值，也不要用 Google Trends / 反推伪装成月搜索量。不要主动声明“工具限制/能力缺口”，也不要罗列缺哪些工具或 provider；只有当用户明确点名要这类数据时，才用一句话说明它不在当前数据范围内，并自然转向可用的评分/评论数量分布、销量、BSR、趋势指数等替代信号，其余情况完全不要提及。
+16. 当用户询问品牌内 top ASIN、材质细分 top ASIN、价格区间细分 top ASIN、评分/评论数量分布时，优先调用 candidate_pool_slice（价格区间用 price_min/price_max 参数，按 ASIN 最新成交价过滤）。禁止编造当前数据源不存在的指标：评论文本关键词/差评原因/评论质量、Amazon 关键词月搜索量等都不要凭空给数值，也不要用 Google Trends / 反推伪装成月搜索量。不要主动声明“工具限制/能力缺口”，也不要罗列缺哪些工具或 provider；只有当用户明确点名要这类数据时，才用一句话说明它不在当前数据范围内，并自然转向可用的评分/评论数量分布、销量、BSR、趋势指数等替代信号，其余情况完全不要提及。
 17. 工具结果是经过内部精简/截断后的中间产物。其中出现的 `compaction_note`、`original_chars`、`result_format`、`result_digest`、`<internal_only…>`、`…[omitted N chars]…`、`...(truncated)`、`[结果已截断]` 等都是内部格式标记，绝对不能复述给用户，也不能据此对用户说“数据因压缩/缓存/截断未能展示”“缓存结果未能完整返回”“完整数据被截断”之类的话。如果某个具体数值在当前结果里确实没有，就直接省略该点、或改用其它已返回字段，或在必要时重新调用对应工具，而不是向用户描述内部压缩/缓存状态。用户应当只看到结论与证据，而不是工具结果的存储/压缩细节。
 
 工具调用规则：
@@ -94,7 +94,7 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 商品主题分析 Agent。
 - opportunity_discovery: 发现空白机会或大类细分机会；仅用于用户尚未给出明确商品主题/关键词/ASIN 的场景
 - opportunity_discovery_job: 按机会发现 job_id 回取完整机会卡片和结构化证据
 - candidate_pool_stats: 候选池描述统计，优先使用 resolve_candidates 返回的 candidate_pool_id
-- candidate_pool_slice: 候选池品牌/标题/材质切片，返回切片 top ASIN 和评分/评论/销量分布
+- candidate_pool_slice: 候选池品牌/标题/材质/价格区间切片，返回切片 top ASIN 和评分/评论/销量/价格分布
 - candidate_pool_trends: 候选池趋势诊断
 - candidate_pool_weak_forecast: 弱信号预测标记
 - product_forecast_explain: 商品销量模型预测与自动解释，调用正式 Theme API forecast explainability 路由
@@ -7752,6 +7752,14 @@ class Pipeline:
                 "material": "material_keywords",
                 "materials": "material_keywords",
                 "material_keyword": "material_keywords",
+                "min_price": "price_min",
+                "price_floor": "price_min",
+                "price_low": "price_min",
+                "price_from": "price_min",
+                "max_price": "price_max",
+                "price_ceiling": "price_max",
+                "price_high": "price_max",
+                "price_to": "price_max",
                 "top_k": "top_n",
                 "max_results": "top_n",
             },

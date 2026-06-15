@@ -347,10 +347,10 @@ TOOL_LAYER_REGISTRY = {
     },
     "candidate_pool_slice": {
         "layer": "analysis",
-        "capability": "按品牌、标题关键词或材质关键词切片候选池，返回切片内 top ASIN、评分/评论数量/销量分布",
+        "capability": "按品牌、标题关键词、材质关键词或价格区间切片候选池，返回切片内 top ASIN、评分/评论数量/销量/价格分布",
         "scene_tags": ["theme_analysis", "general_agent"],
         "requires_provider": False,
-        "provides": ["slice_top_asins", "rating_distribution", "review_count_distribution", "sales_window_sum", "top_brands"],
+        "provides": ["slice_top_asins", "rating_distribution", "review_count_distribution", "price_distribution", "sales_window_sum", "top_brands"],
     },
     "candidate_pool_trends": {
         "layer": "analysis",

@@ -73,11 +73,13 @@ class FakeAgentTools:
         brand_include: str = "",
         title_keywords: str = "",
         material_keywords: str = "",
+        price_min: float = None,
+        price_max: float = None,
         sort_by: str = "sales_window_sum",
         top_n: int = 3,
         product_query: str = "",
     ) -> str:
-        """Slice candidate pool by brand, title, or material."""
+        """Slice candidate pool by brand, title, material, or price range."""
         return ""
 
     def asin_review_insights(
@@ -1418,6 +1420,8 @@ class AgentNativeToolTests(unittest.TestCase):
                         "pool_id": "11111111-1111-4111-8111-111111111111",
                         "brands": ["SUNLU", "Creality"],
                         "material": "PLA",
+                        "min_price": 20,
+                        "max_price": 50,
                         "top_n": 30,
                     },
                 )
@@ -1430,6 +1434,8 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertEqual(params["candidate_pool_id"], "11111111-1111-4111-8111-111111111111")
         self.assertEqual(params["brand_include"], ["SUNLU", "Creality"])
         self.assertEqual(params["material_keywords"], "PLA")
+        self.assertEqual(params["price_min"], 20)
+        self.assertEqual(params["price_max"], 50)
         self.assertEqual(params["top_n"], 20)
 
     def test_amazon_keyword_demand_tool_is_downlisted(self) -> None:

@@ -398,13 +398,15 @@ class Tools:
         brand_include: str = "",
         title_keywords: str = "",
         material_keywords: str = "",
+        price_min: float = None,
+        price_max: float = None,
         sort_by: str = "sales_window_sum",
         top_n: int = 3,
         product_query: str = "",
     ) -> str:
-        """Slice a candidate pool by brand, title keyword, or material keyword and return top ASINs plus slice-level distributions.
+        """Slice a candidate pool by brand, title keyword, material keyword, or price range and return top ASINs plus slice-level distributions.
 
-        Use this tool when users ask for brand-specific top ASINs, material-specific opportunity matrices, or a filtered subset of an existing candidate pool. It uses local ASIN snapshot data and can answer rating/review-count/sales distributions, but not review-text keywords or Amazon keyword search volume.
+        Use this tool when users ask for brand-specific top ASINs, material-specific opportunity matrices, price-band subsets, or a filtered subset of an existing candidate pool. It uses local ASIN snapshot data and can answer rating/review-count/sales/price distributions, but not review-text keywords or Amazon keyword search volume.
 
         :param candidate_asins: CSV string of candidate ASINs.
         :param candidate_pool_id: Persisted candidate_pool_id returned by resolve_candidates or opportunity_discovery.
@@ -413,6 +415,8 @@ class Tools:
         :param brand_include: CSV brand names to include, e.g. SUNLU,Creality.
         :param title_keywords: CSV product title/category keywords to include.
         :param material_keywords: CSV material keywords to include, e.g. carbon fiber,matte,silk.
+        :param price_min: Minimum latest effective price (inclusive) for the slice, e.g. 20.
+        :param price_max: Maximum latest effective price (inclusive) for the slice, e.g. 50.
         :param sort_by: sales_window_sum, sales_daily_avg, review_count, rating, bsr, or price.
         :param top_n: Number of ASINs to return from the slice.
         :param product_query: Optional product query fallback when candidate_asins is not yet available.
@@ -425,6 +429,8 @@ class Tools:
             "brand_include": self._normalize_csv(brand_include),
             "title_keywords": self._normalize_csv(title_keywords),
             "material_keywords": self._normalize_csv(material_keywords),
+            "price_min": price_min,
+            "price_max": price_max,
             "sort_by": sort_by,
             "top_n": top_n,
         }
