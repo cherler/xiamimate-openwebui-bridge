@@ -1596,11 +1596,22 @@ class AgentNativeToolTests(unittest.TestCase):
                         "category_id": 11,
                         "category_path": "Electronics > Power Strips",
                         "opportunity_score": 86.69,
+                        "personalized_opportunity_score": 84.12,
                         "sales_window_sum": 930110.88,
                         "trend_momentum_display": "销量 +175.42% / 趋势 近期趋势缺失",
                         "candidate_count": 62,
                         "row_count": 611,
                         "confidence": "medium",
+                        "metric_explanations": {
+                            "opportunity_score": {
+                                "components": {
+                                    "demand_score": {"score": 92.3, "weight": 0.2, "weighted_points": 18.46},
+                                    "trend_score": {"score": 88.0, "weight": 0.2, "weighted_points": 17.6},
+                                    "competition_headroom_score": {"score": 70.0, "weight": 0.15, "weighted_points": 10.5},
+                                    "price_fit_score": {"score": 68.0, "weight": 0.15, "weighted_points": 10.2},
+                                }
+                            }
+                        },
                         "next_action": {"request": {"product_query": "Power Strips", "category_id": 11, "category_path": "Electronics > Power Strips"}},
                     },
                     {
@@ -1628,6 +1639,9 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertIn("### 机会 2：真空保温杯（Tumblers）", answer)
         self.assertIn("机会理由", answer)
         self.assertIn("关键证据", answer)
+        self.assertIn("得分推导", answer)
+        self.assertIn("需求 92.3×20%=18.46", answer)
+        self.assertIn("趋势 88×20%=17.6", answer)
         self.assertIn("风险/证据边界", answer)
         self.assertIn("下一步验证", answer)
         self.assertIn("| 排名 | 机会主题 | 类目路径 | 机会得分 |", answer)

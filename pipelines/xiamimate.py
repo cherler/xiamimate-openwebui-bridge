@@ -8916,11 +8916,19 @@ class Pipeline:
     def _opportunity_evidence(self, item: dict) -> str:
         parts = []
         score = self._first_present(item, "opportunity_score", "score")
-        if score is not None:
-            parts.append("机会得分 %s" % self._format_metric_value(score))
         personalized = self._first_present(item, "personalized_opportunity_score", "personalized_score")
-        if personalized is not None:
-            parts.append("个性化分 %s" % self._format_metric_value(personalized))
+        score_part = ""
+        if score is not None:
+            score_part = "机会得分 %s" % self._format_metric_value(score)
+            if personalized is not None:
+                score_part += "（个性化分 %s）" % self._format_metric_value(personalized)
+            derivation = self._opportunity_score_derivation(item)
+            if derivation:
+                score_part += "，得分推导：%s" % derivation
+        elif personalized is not None:
+            score_part = "个性化分 %s" % self._format_metric_value(personalized)
+        if score_part:
+            parts.append(score_part)
         sales = self._first_present(item, "sales_window_sum", "window_sales_sum", "estimated_daily_sales_sum", "estimated_sales_window")
         if sales is not None:
             parts.append("窗口销量估算 %s" % self._format_metric_value(sales))
@@ -8938,6 +8946,80 @@ class Pipeline:
         if sample_bits:
             parts.append("样本 " + ", ".join(sample_bits))
         return "；".join(parts) if parts else "当前工具未返回结构化证据字段，请以机会编号继续做候选池验证。"
+
+    def _opportunity_score_derivation(self, item: dict, max_components: int = 4) -> str:
+        explanations = item.get("metric_explanations") if isinstance(item, dict) else None
+        if not isinstance(explanations, dict):
+            return ""
+        score_explanation = explanations.get("opportunity_score")
+        if not isinstance(score_explanation, dict):
+            return ""
+        components = score_explanation.get("components")
+        if not isinstance(components, dict) or not components:
+            return ""
+
+        rendered = []
+        for key, detail in components.items():
+            if not isinstance(detail, dict):
+                continue
+            score = self._coerce_float(detail.get("score"))
+            weight = self._coerce_float(detail.get("weight"))
+            weighted = self._coerce_float(detail.get("weighted_points"))
+            if weighted is None and score is not None and weight is not None:
+                weighted = round(score * weight, 2)
+            if score is None or weight is None or weighted is None:
+                continue
+            rendered.append(
+                {
+                    "label": self._opportunity_score_component_label(str(key)),
+                    "score": score,
+                    "weight": weight,
+                    "weighted": weighted,
+                }
+            )
+        if not rendered:
+            return ""
+        rendered.sort(key=lambda x: x.get("weighted", 0.0), reverse=True)
+        pieces = []
+        for component in rendered[: max(1, int(max_components or 4))]:
+            pieces.append(
+                "%s %s×%s=%s"
+                % (
+                    component["label"],
+                    self._format_metric_value(component["score"]),
+                    self._format_weight_percent(component["weight"]),
+                    self._format_metric_value(component["weighted"]),
+                )
+            )
+        return "；".join(pieces)
+
+    def _opportunity_score_component_label(self, key: str) -> str:
+        mapping = {
+            "demand_score": "需求",
+            "trend_score": "趋势",
+            "competition_headroom_score": "竞争空间",
+            "price_fit_score": "价格适配",
+            "forecast_growth_score": "预测增长",
+            "coverage_gap_score": "覆盖差距",
+            "evidence_quality_score": "证据质量",
+        }
+        normalized = str(key or "").strip().lower()
+        return mapping.get(normalized, str(key or "分项"))
+
+    def _format_weight_percent(self, weight: Any) -> str:
+        numeric = self._coerce_float(weight)
+        if numeric is None:
+            return str(weight)
+        pct = numeric * 100.0
+        return ("%.2f" % pct).rstrip("0").rstrip(".") + "%"
+
+    def _coerce_float(self, value: Any) -> Optional[float]:
+        if value in (None, "", [], {}):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def _opportunity_boundary(self, item: dict) -> str:
         for key in ("risk", "risks", "boundary", "evidence_boundary", "confidence_note"):
