@@ -22,11 +22,15 @@ COMMAND_TO_MODE = {
 }
 
 
+AGENT_PROFILES = {"deepseek", "minimax"}
+
+
 class Pipeline:
     class Valves(BaseModel):
         pipelines: List[str] = ["*"]
         priority: int = 0
         model_prefix: str = "xiamimate"
+        default_profile: str = "deepseek"
 
     def __init__(self):
         self.type = "filter"
@@ -36,8 +40,20 @@ class Pipeline:
                 "pipelines": ["*"],
                 "priority": 0,
                 "model_prefix": os.getenv("XIAMIMATE_MODEL_PREFIX", "xiamimate"),
+                "default_profile": os.getenv("AGENT_MODEL_DEFAULT_PROFILE", "deepseek"),
             }
         )
+
+    def _default_agent_model(self) -> str:
+        profile = str(self.valves.default_profile or "").strip().lower()
+        if profile not in AGENT_PROFILES:
+            profile = "deepseek"
+        return "%s.agent-%s" % (self.valves.model_prefix, profile)
+
+    def _is_xiamimate_agent_model(self, model_id: str) -> bool:
+        normalized = str(model_id or "").strip().lower()
+        prefix = str(self.valves.model_prefix or "xiamimate").strip().lower()
+        return normalized.startswith("%s.agent-" % prefix)
 
     async def on_startup(self):
         print("on_startup:xiamimate_mode_router")
@@ -68,7 +84,10 @@ class Pipeline:
             return body
 
         target_mode = COMMAND_TO_MODE[command]
-        body["model"] = "%s.agent" % self.valves.model_prefix
+        # 仅在当前模型不是已注册的 XiaMimate agent profile 时才回退到默认 profile，
+        # 否则保留用户显式选择的 profile（例如 xiamimate.agent-deepseek）。
+        if not self._is_xiamimate_agent_model(body.get("model")):
+            body["model"] = self._default_agent_model()
         body["xiamimate_mode"] = target_mode
         self._apply_mode_features(body, target_mode)
         self._write_message_text(last_user_message, remainder)

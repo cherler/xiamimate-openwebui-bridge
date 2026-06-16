@@ -313,6 +313,11 @@ WORKFLOW_SUGGESTION_PROMPTS = [
     },
 ]
 
+AGENT_MODEL_DESCRIPTION = (
+    "虾米选品（XiaMimate）是一款面向跨境电商卖家的选品智能体，围绕 Amazon、TikTok Shop、Temu 构建平台知识库，"
+    "结合 Keepa 商品数据、Google Trends 趋势信号、联网实时查询、商品预测算法与主题分析工作流，帮助用户更快完成机会发现、趋势验证、竞品分析和选品决策。"
+)
+
 WORKFLOW_NODE_LABELS = {
     "n02_normalize": "商品归一化",
     "n03_parse_normalized_intent": "参数解析",
@@ -495,8 +500,6 @@ class Pipeline:
 
     def _pipeline_id_for_profile(self, profile: str) -> str:
         normalized = str(profile or "").strip().lower()
-        if normalized == self._default_agent_profile():
-            return "agent"
         return "agent-%s" % normalized
 
     def _build_agent_pipelines(self) -> List[dict]:
@@ -513,11 +516,12 @@ class Pipeline:
                 continue
             seen_ids.add(pipeline_id)
             label = self._label_for_profile(profile)
-            description = "虾米选品的智能体模式，支持 /help 知识库帮助、/report 报告编排，并兼容 /workflow 旧入口。当前模型：%s。" % label
+            description = AGENT_MODEL_DESCRIPTION
             pipelines.append(
                 {
                     "id": pipeline_id,
-                    "name": "Agent" if pipeline_id == "agent" else "Agent · %s" % label,
+                    "name": "Agent · %s" % label,
+                    "description": description,
                     "info": {
                         "meta": {
                             "description": description,
@@ -544,6 +548,8 @@ class Pipeline:
             return override
 
         effective_model_id = str(body.get("model") or model_id or "").strip().lower()
+        if effective_model_id.endswith(".agent") or effective_model_id == "agent":
+            return self._default_agent_profile()
         for profile in self._configured_agent_profiles():
             explicit_pipeline_id = "agent-%s" % profile
             if effective_model_id.endswith(".%s" % explicit_pipeline_id) or effective_model_id == explicit_pipeline_id:
@@ -552,10 +558,7 @@ class Pipeline:
         return self._default_agent_profile()
 
     def _response_model_for_profile(self, profile: str, requested_model_id: str) -> str:
-        effective_model_id = str(requested_model_id or "").strip().lower()
-        explicit_pipeline_id = "agent-%s" % str(profile or "").strip().lower()
-        selected_pipeline_id = explicit_pipeline_id if effective_model_id.endswith(".%s" % explicit_pipeline_id) or effective_model_id == explicit_pipeline_id else self._pipeline_id_for_profile(profile)
-        return "%s.%s" % (self.id, selected_pipeline_id)
+        return "%s.%s" % (self.id, self._pipeline_id_for_profile(profile))
 
     def _get_provider(self, model_name: Optional[str] = None) -> ProviderStrategy:
         """Resolve the LLM provider strategy based on the selected model name."""

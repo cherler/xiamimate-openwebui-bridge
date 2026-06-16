@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import sys
@@ -12,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "pipelines"))
 
 import xiamimate  # noqa: E402
+import xiamimate_mode_router  # noqa: E402
 
 
 class FakeAgentTools:
@@ -211,6 +213,46 @@ class AgentNativeToolTests(unittest.TestCase):
         pipe._charge_billing_event = lambda **kwargs: {"points_charged": 0}
         pipe._refund_billing_event = lambda **kwargs: None
         return pipe
+
+    def test_mode_router_redirects_stale_agent_model_to_default_explicit_id(self) -> None:
+        router = xiamimate_mode_router.Pipeline()
+        router.valves.default_profile = "minimax"
+        body = {
+            "model": "xiamimate.agent",
+            "messages": [{"role": "user", "content": "/agent 分析挂脖风扇"}],
+        }
+        result = asyncio.run(router.inlet(body))
+        self.assertEqual(result["model"], "xiamimate.agent-minimax")
+        self.assertEqual(result["xiamimate_mode"], "agent")
+
+    def test_mode_router_preserves_explicit_profile_selection(self) -> None:
+        router = xiamimate_mode_router.Pipeline()
+        router.valves.default_profile = "minimax"
+        body = {
+            "model": "xiamimate.agent-deepseek",
+            "messages": [{"role": "user", "content": "/report 标准报告"}],
+        }
+        result = asyncio.run(router.inlet(body))
+        self.assertEqual(result["model"], "xiamimate.agent-deepseek")
+        self.assertEqual(result["xiamimate_mode"], "report")
+
+    def test_default_profile_uses_explicit_pipeline_id_and_label(self) -> None:
+        pipe = self.make_pipeline()
+        pipe.valves.AGENT_MODEL_DEFAULT_PROFILE = "minimax"
+        pipe.pipelines = pipe._build_agent_pipelines()
+
+        self.assertEqual([entry["id"] for entry in pipe.pipelines], ["agent-minimax", "agent-deepseek"])
+        self.assertEqual([entry["name"] for entry in pipe.pipelines], ["Agent · MiniMax M2.7", "Agent · DeepSeek V4 Pro"])
+        self.assertTrue(all(entry["description"] == xiamimate.AGENT_MODEL_DESCRIPTION for entry in pipe.pipelines))
+        self.assertTrue(all(entry["info"]["meta"]["description"] == xiamimate.AGENT_MODEL_DESCRIPTION for entry in pipe.pipelines))
+
+    def test_legacy_agent_alias_resolves_to_default_explicit_pipeline_id(self) -> None:
+        pipe = self.make_pipeline()
+        pipe.valves.AGENT_MODEL_DEFAULT_PROFILE = "minimax"
+        pipe.pipelines = pipe._build_agent_pipelines()
+
+        self.assertEqual(pipe._resolve_agent_profile(model_id="xiamimate.agent", body={"model": "xiamimate.agent"}), "minimax")
+        self.assertEqual(pipe._response_model_for_profile("minimax", "xiamimate.agent"), "xiamimate.agent-minimax")
 
     def test_openwebui_internal_task_bypasses_billing_and_agent_tools(self) -> None:
         pipe = self.make_pipeline()
