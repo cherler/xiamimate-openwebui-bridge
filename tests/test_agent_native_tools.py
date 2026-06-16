@@ -2654,6 +2654,99 @@ class AgentMultiTurnSessionMemoryTests(unittest.TestCase):
         kept_names = [s["tool_call"]["name"] for s in filtered]
         self.assertIn("candidate_pool_trends", kept_names)
 
+    def test_prerequisite_resolve_candidates_runs_again_when_theme_changes(self) -> None:
+        """上一轮已为某主题建池后，下一轮换了全新商品主题时，resolve_candidates 不能被
+        prerequisite 句柄兜底静默删空；必须放行重新解析，否则用户拿到"工具执行结果为空"。"""
+        pipe = self.make_pipeline()
+        pipe._ensure_agent_harness({"chat_id": "chat-theme-switch"})
+        # 上一轮：挂脖风扇建池成功
+        pipe.agent_harness.after_tool_observation(
+            tool_call={"name": "resolve_candidates", "parameters": {"product_query": "挂脖风扇", "marketplace": "US"}},
+            result=json.dumps(
+                {
+                    "success": True,
+                    "data": {
+                        "candidate_pool_id": "pool-neckfan",
+                        "candidate_asins": ["B0GSHZN1C3", "B0B1HQVNL4", "B0GLGCCYV4"],
+                        "candidate_pool_size": 3,
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            compact_result="pool-neckfan",
+        )
+        snapshot = pipe.agent_harness.session_snapshot() or {}
+        self.assertEqual(snapshot["last_candidate_pool"]["pool_id"], "pool-neckfan")
+
+        # 下一轮：换成"加湿器"，planner 规划 resolve_candidates(product_query=加湿器)
+        steps = [{"tool_call": {"name": "resolve_candidates", "parameters": {"product_query": "加湿器", "marketplace": "US"}}}]
+        filtered = pipe.agent_harness.filter_redundant_planner_steps(steps, "theme_analysis", [])
+        self.assertIn(
+            "resolve_candidates",
+            [s["tool_call"]["name"] for s in filtered],
+            "换了新商品主题时 resolve_candidates 必须放行重跑",
+        )
+
+    def test_prerequisite_resolve_candidates_still_skipped_for_same_theme(self) -> None:
+        """同一商品主题、候选池已在 session 时，仍按原有语义跳过重复 resolve_candidates。"""
+        pipe = self.make_pipeline()
+        pipe._ensure_agent_harness({"chat_id": "chat-theme-same"})
+        pipe.agent_harness.after_tool_observation(
+            tool_call={"name": "resolve_candidates", "parameters": {"product_query": "humidifier", "marketplace": "US"}},
+            result=json.dumps(
+                {
+                    "success": True,
+                    "data": {
+                        "candidate_pool_id": "pool-humidifier",
+                        "candidate_asins": ["B001ABCD12", "B002EFGH34"],
+                        "candidate_pool_size": 2,
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            compact_result="pool-humidifier",
+        )
+        # 同主题（大小写/空白不同也算同主题）
+        steps = [{"tool_call": {"name": "resolve_candidates", "parameters": {"product_query": " Humidifier ", "marketplace": "US"}}}]
+        filtered = pipe.agent_harness.filter_redundant_planner_steps(steps, "theme_analysis", [])
+        self.assertNotIn(
+            "resolve_candidates",
+            [s["tool_call"]["name"] for s in filtered],
+            "同主题候选池已存在时仍应复用、跳过重复解析",
+        )
+
+    def test_bare_theme_query_infers_product_query(self) -> None:
+        """裸查询（如"挂脖风扇top3的asin"）必须能推断出 product_query，否则
+        planner 偶发漏填 product_query 时，resolve_candidates 会在 enforce 阶段被删空。"""
+        pipe = self.make_pipeline()
+        cases = [
+            ("挂脖风扇top3的asin", "挂脖风扇"),
+            ("加湿器top3的asin", "加湿器"),
+            ("车载吸尘器销量怎么样", "车载吸尘器"),
+            ("请给我加湿器的top3 asin", "加湿器"),
+            ("neck fan top3 asin", "neck fan"),
+        ]
+        for text, expected in cases:
+            messages = [{"role": "user", "content": text}]
+            inferred = pipe._infer_theme_product_query(messages)
+            self.assertEqual(inferred, expected, f"裸查询 {text!r} 应推断出 {expected!r}")
+
+    def test_bare_theme_query_overrides_stale_session_product_query(self) -> None:
+        """换主题的裸查询应优先于 session 里上一轮的旧 product_query，
+        避免 enforce/repair 阶段把新主题 resolve_candidates 误填成旧主题。"""
+        pipe = self.make_pipeline()
+        pipe._ensure_agent_harness({"chat_id": "chat-bare-switch"})
+        pipe.agent_harness.after_tool_observation(
+            tool_call={"name": "resolve_candidates", "parameters": {"product_query": "挂脖风扇", "marketplace": "US"}},
+            result=json.dumps(
+                {"success": True, "data": {"candidate_pool_id": "pool-neckfan", "candidate_asins": ["B0GSHZN1C3"]}},
+                ensure_ascii=False,
+            ),
+            compact_result="pool-neckfan",
+        )
+        messages = [{"role": "user", "content": "加湿器top3的asin"}]
+        self.assertEqual(pipe._infer_theme_product_query(messages), "加湿器")
+
     def test_stale_cross_turn_signature_is_refreshed_after_freshness_window(self) -> None:
         """超出新鲜窗口的旧签名应放行重跑，避免长对话复述过期结果；窗口内仍去重。"""
         from xiamimate import agent_harness

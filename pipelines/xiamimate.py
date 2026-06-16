@@ -5715,9 +5715,46 @@ class Pipeline:
                 match = re.search(pattern, text, flags=re.IGNORECASE)
                 if match:
                     return str(match.group(1) or "").strip(" ：:，,。")[:120]
+        # 兜底 1：从"裸商品查询"里抽取主题。像"挂脖风扇top3的asin"/"加湿器候选池"/"车载吸尘器销量怎么样"
+        # 这类没有"评估/分析 X 在"句式的提问，上面的窄模式都匹配不到，会导致 resolve_candidates 缺
+        # product_query 被 _repair_theme_resolve_step 判空丢弃，整条计划被清空（validation=empty）。
+        # 这里在回退到 session 旧主题之前，先尝试剥掉前导动词与尾部分析性修饰，取出核心商品词。
+        for text in user_texts:
+            bare = self._extract_bare_product_query(text)
+            if bare:
+                return bare
         snapshot = self._session_snapshot()
         fallback = str(snapshot.get("last_product_query") or "").strip()
         return fallback[:120] if fallback else ""
+
+    @staticmethod
+    def _extract_bare_product_query(text: str) -> str:
+        """从裸商品提问里抽取核心商品主题词，例如：
+        "挂脖风扇top3的asin" -> "挂脖风扇"；"加湿器候选池" -> "加湿器"；"车载吸尘器销量怎么样" -> "车载吸尘器"。
+
+        仅做轻量启发式：去掉前导命令/动词/礼貌词，去掉尾部 top-N / asin / 候选池 / 销量 等分析性修饰，
+        剩余 1~40 字的短词才视为有效主题；抽不出就返回空串，交给上层继续走 session 兜底。
+        """
+        t = str(text or "").strip()
+        if not t:
+            return ""
+        # 去掉前导命令、礼貌词与动词
+        t = re.sub(r"^\s*/(?:agent|tool|web|report|help|wf|workflow)\b\s*", "", t, flags=re.IGNORECASE)
+        t = re.sub(r"^(?:请|帮我|麻烦|给我|我想|我要|想|要|看看|看一下|帮忙)+\s*", "", t)
+        t = re.sub(r"^(?:分析|评估|判断|研究|拆解|查询|查|看|获取|返回|列出|找|搜索|解析)\s*(?:下|一下)?\s*", "", t)
+        # 去掉尾部分析性修饰（top-N / 排名 / asin / 候选池 / 销量 / 怎么样 等）
+        t = re.sub(r"\s*的?\s*(?:top\s*\d+|前\s*\d+\s*名?|top|排名|榜单).*$", "", t, flags=re.IGNORECASE)
+        t = re.sub(
+            r"\s*的?\s*(?:asin|候选池|候选|销量|数据|评分|评论|趋势|机会|怎么样|如何|详情|信息|分析).*$",
+            "",
+            t,
+            flags=re.IGNORECASE,
+        )
+        t = t.strip(" \t，,。.；;：:、!！?？的了呢吗")
+        if 1 <= len(t) <= 40:
+            return t[:120]
+        return ""
+
 
     def _session_snapshot(self) -> Dict[str, Any]:
         try:

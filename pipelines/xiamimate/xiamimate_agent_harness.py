@@ -39,6 +39,22 @@ def _summarize_parameters(parameters: Any, limit: int = 240) -> str:
     return text
 
 
+def _normalize_theme_key(text: Any) -> str:
+    """把商品主题/关键词归一化为可比较的键，用于判断"是否换了新商品主题"。
+
+    仅做大小写、空白与标点归一，不做中英互译；调用方只需要区分"同一主题"与"不同主题"，
+    例如 挂脖风扇 vs 加湿器 必然不同，归一后即可安全比较。
+    """
+    if text is None:
+        return ""
+    value = str(text).strip().lower()
+    if not value:
+        return ""
+    # 去掉标点/分隔符，仅保留字母数字与中日韩等文字字符，避免 "neck fan" vs "neck-fan" 误判为不同。
+    value = re.sub(r"[\s\-_/，,。.;；:：、|]+", "", value)
+    return value
+
+
 # 状态轮询型工具：返回的是后台任务/数据就绪的实时状态（如扩池任务从 queued→completed）。
 # 这类工具的入参在多轮里几乎不变，但每次必须真实重查，绝不能被跨轮 (tool, params) 签名去重拦截，
 # 否则会用首轮的 queued 旧 summary 反复复述，造成"任务一直排队"的假象。
@@ -1209,6 +1225,8 @@ class AgentHarness:
                 "asins_preview": (pool.get("asins") or [])[:8],
                 "asins_total": len(pool.get("asins") or []),
                 "leaf_categories": pool.get("leaf_categories"),
+                # 记录该候选池对应的商品主题，供跨轮 prerequisite 去重判断是否换了新主题。
+                "product_query": pool.get("product_query") or snapshot.get("last_product_query"),
             }
         tool_calls = snapshot.get("last_tool_calls")
         if tool_calls:
@@ -1269,6 +1287,9 @@ class AgentHarness:
                 pool = _extract_candidate_pool(payload)
                 if pool:
                     if not pool.get("pool_id") and product_query:
+                        pool["product_query"] = product_query
+                    # 始终记录该候选池对应的商品主题，供跨轮 prerequisite 去重判断是否换了新主题。
+                    if product_query and not pool.get("product_query"):
                         pool["product_query"] = product_query
                     updates["last_candidate_pool"] = pool
             if tool_name == "category_resolve":
@@ -1392,6 +1413,10 @@ class AgentHarness:
         session_signatures: set[str] = set()
         session_signature_recorded_at: dict[str, float] = {}
         session_prerequisite_tools: set[str] = set()
+        # session 里已缓存候选池/类目对应的商品主题（归一化后）；用于判断 planner 这一轮
+        # 是否换了一个全新的商品主题。换主题时 prerequisite 句柄不再适用，必须放行重新解析。
+        session_pool_theme_key: str = ""
+        session_category_theme_key: str = ""
         snapshot = self.session_snapshot() or {}
         if isinstance(snapshot, dict):
             for entry in snapshot.get("recent_tool_calls") or []:
@@ -1407,8 +1432,12 @@ class AgentHarness:
             pool = snapshot.get("last_candidate_pool")
             if isinstance(pool, dict) and pool.get("pool_id"):
                 session_prerequisite_tools.add("resolve_candidates")
+                session_pool_theme_key = _normalize_theme_key(
+                    pool.get("product_query") or snapshot.get("last_product_query")
+                )
             if snapshot.get("last_category_id") or snapshot.get("last_category_path"):
                 session_prerequisite_tools.add("category_resolve")
+                session_category_theme_key = _normalize_theme_key(snapshot.get("last_product_query"))
 
         now = time.time()
 
@@ -1464,9 +1493,33 @@ class AgentHarness:
                 continue
             if signature in session_signatures and _signature_is_fresh(signature):
                 continue
-            # 2) 跨轮 prerequisite 句柄兜底（候选池/类目）
+            # 2) 跨轮 prerequisite 句柄兜底（候选池/类目）：
+            #    仅当本轮请求仍指向 session 里已缓存的同一个商品主题时才跳过；
+            #    一旦 planner 这一轮换了新主题（例如上一轮"挂脖风扇"已建池，这一轮问"加湿器"），
+            #    必须放行重新解析，否则会把唯一的 resolve_candidates/category_resolve 步骤静默删空，
+            #    执行器拿到空计划 → 直接回复"工具执行结果为空"，无论用户怎么改提示词都无法触发工具。
             if tool_name in session_prerequisite_tools:
-                continue
+                requested_theme_key = ""
+                if isinstance(parameters, dict):
+                    requested_theme_key = _normalize_theme_key(
+                        parameters.get("product_query")
+                        or parameters.get("category")
+                        or parameters.get("category_path")
+                        or parameters.get("query")
+                    )
+                cached_theme_key = (
+                    session_pool_theme_key
+                    if tool_name == "resolve_candidates"
+                    else session_category_theme_key
+                )
+                # 只有"两边主题都已知且不同"才判定为换主题、放行重跑；
+                # 主题缺失/无法比较时保持原有"复用 prerequisite 句柄"的保守行为。
+                theme_switched = bool(
+                    requested_theme_key and cached_theme_key and requested_theme_key != cached_theme_key
+                )
+                if not theme_switched:
+                    continue
+
             # 3) 同一请求内 single-execution 工具按 tool_name 去重（保留原有语义）
             if tool_name in single_execution_tools and (tool_name in already_seen_names or tool_name in planned_names):
                 continue
