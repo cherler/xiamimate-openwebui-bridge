@@ -380,6 +380,8 @@ class Pipeline:
         HELP_CACHE_TTL_SECONDS: int = 900
         HELP_CACHE_MAX_ENTRIES: int = 128
         XIAMIMATE_MODEL_PREFIX: str = "xiamimate"
+        # 商品工作台证据图：默认关闭。开启后在报告答案顶部叠加 SVG 证据图 + 工作台入口。
+        WORKSPACE_EVIDENCE_ENABLED: bool = False
 
     def __init__(self):
         self.type = "manifold"
@@ -418,6 +420,7 @@ class Pipeline:
                 "HELP_CACHE_TTL_SECONDS": int(os.getenv("HELP_CACHE_TTL_SECONDS", "900")),
                 "HELP_CACHE_MAX_ENTRIES": int(os.getenv("HELP_CACHE_MAX_ENTRIES", "128")),
                 "XIAMIMATE_MODEL_PREFIX": os.getenv("XIAMIMATE_MODEL_PREFIX", "xiamimate"),
+                "WORKSPACE_EVIDENCE_ENABLED": (os.getenv("WORKSPACE_EVIDENCE_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}),
             }
         )
         self._help_answer_cache: Dict[str, dict] = {}
@@ -1283,7 +1286,7 @@ class Pipeline:
                     description="%s门控失败，已退款" % charge_description,
                     mode_tag=mode_tag,
                 )
-            return self._chat_response(content=self._prepare_workflow_answer(answer), model=model)
+            return self._chat_response(content=self._prepare_workflow_answer(answer, body=body), model=model)
 
         return self._chat_response(content=json.dumps(response, ensure_ascii=False, indent=2), model=model)
 
@@ -2677,7 +2680,7 @@ class Pipeline:
                                     description=gate_refund_description,
                                     mode_tag="%s_stream" % mode_tag,
                                 )
-                            prepared_answer, _payload_comment = self._prepare_workflow_answer_parts(buffered_answer) if buffered_answer else ("", None)
+                            prepared_answer, _payload_comment = self._prepare_workflow_answer_parts(buffered_answer, body=body) if buffered_answer else ("", None)
                             if prepared_answer and not answer_started:
                                 answer_started = True
                                 final_stage = self._format_dify_progress(mode_tag, 100, "执行完成，正在整理最终结果")
@@ -2723,7 +2726,7 @@ class Pipeline:
                             description=gate_refund_description,
                             mode_tag="%s_stream" % mode_tag,
                         )
-                    final_answer, _payload_comment = self._prepare_workflow_answer_parts(raw_answer) if buffered_answer_mode else (raw_answer, None)
+                    final_answer, _payload_comment = self._prepare_workflow_answer_parts(raw_answer, body=body) if buffered_answer_mode else (raw_answer, None)
                     final_stage = self._format_dify_progress(mode_tag, 100, "执行完成，正在整理最终结果")
                     if final_stage not in emitted_progress:
                         emitted_progress.add(final_stage)
@@ -2872,11 +2875,13 @@ class Pipeline:
 
         return ""
 
-    def _prepare_workflow_answer(self, answer_text: str) -> str:
-        rendered, _payload_comment = self._prepare_workflow_answer_parts(answer_text)
+    def _prepare_workflow_answer(self, answer_text: str, body: Optional[dict] = None) -> str:
+        rendered, _payload_comment = self._prepare_workflow_answer_parts(answer_text, body=body)
         return rendered
 
-    def _prepare_workflow_answer_parts(self, answer_text: str) -> Tuple[str, Optional[str]]:
+    def _prepare_workflow_answer_parts(
+        self, answer_text: str, body: Optional[dict] = None
+    ) -> Tuple[str, Optional[str]]:
         answer_text = self._strip_outer_markdown_fence(answer_text)
         visible_text, payload = self._extract_structured_workflow_payload(answer_text)
         if not payload:
@@ -2887,11 +2892,13 @@ class Pipeline:
         rendered = self._render_structured_workflow_payload(payload, fallback_summary=visible_text)
         rendered = self._append_report_refund_visibility_note(rendered, payload)
         rendered = self._annotate_report_followup_actionability(rendered)
+        rendered = self._maybe_render_evidence_block(rendered, payload, body)
         payload_comment = self._build_structured_payload_comment(payload)
         if rendered:
             return rendered.rstrip(), payload_comment
         if visible_text:
             visible_text = self._annotate_report_followup_actionability(visible_text)
+            visible_text = self._maybe_render_evidence_block(visible_text, payload, body)
             return self._append_report_refund_visibility_note(visible_text, payload).rstrip(), payload_comment
         return "", payload_comment
 
@@ -2914,6 +2921,184 @@ class Pipeline:
             return rendered
         note = "\n\n> %s" % REPORT_REFUND_VISIBILITY_NOTE
         return (rendered + note).strip() if rendered else REPORT_REFUND_VISIBILITY_NOTE
+
+    # ------------------------------------------------------------------
+    # 商品工作台证据图（P0-1）：答案出口的最后一层可选包装。
+    # 三重保险：① 全局开关；② 无 workspace_payload 即跳过；③ try/except 兜底回原答案。
+    # 任一环节失败，用户看到的就是“当前的答案”，不会更差。
+    # ------------------------------------------------------------------
+    def _maybe_render_evidence_block(
+        self, answer: str, payload: Optional[dict], body: Optional[dict]
+    ) -> str:
+        answer = str(answer or "")
+        if not self.valves.WORKSPACE_EVIDENCE_ENABLED:
+            return answer  # 开关关闭 → 原样返回，零行为变化
+        if not body or not isinstance(payload, dict):
+            return answer
+        workspace_payload = self._extract_workspace_payload(payload)
+        if not workspace_payload:
+            # 契约字段缺失时，从本地已组装的选品报告里就地合成（只取真实特征，不编造）。
+            workspace_payload = self._build_workspace_payload_from_report(payload, body)
+        if not workspace_payload:
+            return answer  # 既无契约字段也无法从报告合成 → 原样返回，不编造
+        try:
+            upsert_data = self._upsert_workspace_for_evidence(body, workspace_payload)
+            block = self._build_evidence_block_markdown(upsert_data)
+            if not block:
+                return answer
+            return "%s\n\n%s" % (block, answer)
+        except Exception as exc:  # noqa: BLE001 — 证据图失败绝不影响对话
+            try:
+                print("[xiamimate] evidence block render failed, fallback to plain answer:", str(exc)[:300])
+            except Exception:
+                pass
+            return answer
+
+    def _extract_workspace_payload(self, payload: dict) -> Optional[dict]:
+        """从结构化报告 payload 里取 theme-api 附加的 workspace_payload（契约字段）。"""
+        if not isinstance(payload, dict):
+            return None
+        candidate = payload.get("workspace_payload")
+        if isinstance(candidate, dict) and candidate:
+            return candidate
+        # 兼容嵌套在 report_payload 下
+        report_payload = payload.get("report_payload")
+        if isinstance(report_payload, dict):
+            nested = report_payload.get("workspace_payload")
+            if isinstance(nested, dict) and nested:
+                return nested
+        return None
+
+    def _build_workspace_payload_from_report(
+        self, payload: dict, body: Optional[dict]
+    ) -> Optional[dict]:
+        """从本地已组装的选品报告 payload 合成工作台载荷（端到端连接层，纯真实特征）。
+
+        仅当报告确实是选品报告（有 raw_endpoint_results/coverage_status/data_tables）时生效；
+        证据只取能从报告里直接读到的真实数值，读不到就留空（对应证据图自动不渲染），绝不编造。
+        """
+        if not isinstance(payload, dict):
+            return None
+        if not self._is_selection_report_payload(payload):
+            return None
+        meta = self._build_selection_report_meta(payload)
+        product_query = str(meta.get("product_query") or "").strip()
+        if not product_query:
+            return None
+        features = self._extract_selection_report_features(payload)
+        evidence = self._build_workspace_evidence_from_features(features)
+        return {
+            "schema_version": "xiamimate_workspace_contract_v1",
+            "theme_key": product_query.lower(),
+            "title": product_query,
+            "brief": {
+                "product_theme": product_query,
+                "marketplace": meta.get("marketplace") or None,
+            },
+            "evidence": evidence,
+        }
+
+    def _build_workspace_evidence_from_features(self, features: dict) -> dict:
+        """把选品报告特征映射成工作台证据数据（与 chat-backend chart_render 的字段约定一致）。"""
+        features = features if isinstance(features, dict) else {}
+        forecast_rows = features.get("forecast_top_asins_rows") or []
+        # 趋势：按周聚合 Top ASIN 预测周销量（w1..w4），形成真实的销量轨迹。
+        trend_series: List[float] = []
+        for week in (1, 2, 3, 4):
+            week_sum = self._selection_sum_field(
+                forecast_rows,
+                [
+                    "predicted_weekly_sales_w%d" % week,
+                    "预测周销量W%d" % week,
+                ],
+            )
+            if week_sum is not None:
+                trend_series.append(week_sum)
+        risk_lights = self._normalize_workspace_risk_lights(features.get("risk_flags"))
+        return {
+            "schema_version": "xiamimate_workspace_contract_v1",
+            "trend_series": trend_series,
+            "price_band": {},
+            "competition_score": None,
+            "forecast_band": {},
+            "risk_lights": risk_lights,
+        }
+
+    def _normalize_workspace_risk_lights(self, flags: Any) -> List[dict]:
+        """把报告里的风险标记规整成证据图风险灯结构 [{name, level}]。"""
+        if not isinstance(flags, list):
+            return []
+        severity_map = {
+            "high": "bad",
+            "critical": "bad",
+            "severe": "bad",
+            "medium": "warn",
+            "moderate": "warn",
+            "low": "good",
+            "info": "good",
+        }
+        out: List[dict] = []
+        for flag in flags:
+            if isinstance(flag, dict):
+                name = (
+                    flag.get("name")
+                    or flag.get("label")
+                    or flag.get("flag")
+                    or flag.get("message")
+                    or flag.get("title")
+                )
+                raw_level = str(flag.get("level") or flag.get("severity") or "").strip().lower()
+                level = severity_map.get(raw_level, raw_level if raw_level in {"good", "warn", "bad"} else "warn")
+            else:
+                name = str(flag).strip()
+                level = "warn"
+            if not name:
+                continue
+            out.append({"name": str(name)[:40], "level": level})
+            if len(out) >= 5:
+                break
+        return out
+
+    def _upsert_workspace_for_evidence(self, body: dict, workspace_payload: dict) -> dict:
+        """调 chat-backend 内部接口落库，拿回 workspace_id / evidence_charts / workspace_url。"""
+        theme_key = str(workspace_payload.get("theme_key") or "").strip()
+        title = str(workspace_payload.get("title") or theme_key or "未命名工作台").strip()
+        request_body = {
+            "user_id": self._user_id(body),
+            "theme_key": theme_key or "unknown",
+            "title": title,
+            "brief": workspace_payload.get("brief") or {},
+            "evidence": workspace_payload.get("evidence") or {},
+        }
+        return self._chat_backend_request(
+            method="POST",
+            path="/internal/workspace/upsert-from-analysis",
+            body=request_body,
+            internal=True,
+            timeout=self.valves.CHAT_BACKEND_TIMEOUT,
+        )
+
+    def _build_evidence_block_markdown(self, upsert_data: dict) -> str:
+        """把证据图与工作台入口拼成可内联进气泡的 Markdown 区块。"""
+        if not isinstance(upsert_data, dict):
+            return ""
+        charts = upsert_data.get("evidence_charts") or []
+        workspace_url = str(upsert_data.get("workspace_url") or "").strip()
+        lines: List[str] = []
+        image_parts: List[str] = []
+        for chart in charts:
+            if not isinstance(chart, dict):
+                continue
+            svg_url = str(chart.get("svg_url") or "").strip()
+            title = str(chart.get("title") or "证据图").strip()
+            if svg_url:
+                image_parts.append("![%s](%s)" % (title, svg_url))
+        if image_parts:
+            lines.append("**核心证据**")
+            lines.append(" ".join(image_parts))
+        if workspace_url:
+            lines.append("[打开商品工作台 →](%s)" % workspace_url)
+        return "\n\n".join(lines).strip()
 
     def _strip_outer_markdown_fence(self, answer_text: str) -> str:
         text = str(answer_text or "")
