@@ -25,6 +25,8 @@ services:
       OPENAI_API_BASE_URL: http://pipelines:9099/v1
       OPENAI_API_KEY: ${PIPELINES_API_KEY}
       WEBUI_SECRET_KEY: ${OPEN_WEBUI_SECRET_KEY}
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
+      TRANSFORMERS_OFFLINE: ${TRANSFORMERS_OFFLINE:-0}
     volumes:
       - ./data/open-webui:/app/backend/data
       - ./tools:/opt/xiamimate/tools:ro
