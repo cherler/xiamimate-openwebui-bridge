@@ -576,6 +576,12 @@ class Pipeline:
         """Resolve the LLM provider strategy based on the selected model name."""
         return get_provider(model_name or self._model_name_for_profile(self._default_agent_profile()))
 
+    def _planner_model_name_for_agent(self, model_name: str) -> str:
+        selected_model_name = str(model_name or "").strip() or self._model_name_for_profile(self._default_agent_profile())
+        if self._provider_profile_for_model_name(selected_model_name):
+            return selected_model_name
+        return str(self.valves.AGENT_PLANNER_MODEL or "").strip() or selected_model_name
+
     def pipe(
         self,
         user_message: str,
@@ -1679,7 +1685,7 @@ class Pipeline:
                 for chunk in self._split_text(final_answer):
                     answer_started = True
                     yield emit_text_chunk(chunk)
-        except RuntimeError as exc:
+        except Exception as exc:
             trace_status = "error"
             close_chunk = close_reasoning_chunk()
             if close_chunk is not None:
@@ -5999,7 +6005,7 @@ class Pipeline:
     ) -> dict:
         # planner 单独走轻量模型时，filter_payload 仍用 agent provider 以兼容字段过滤，
         # 但 payload.model 改成 planner_model_name，让 chat-backend 路由到轻量模型。
-        planner_model_name = str(self.valves.AGENT_PLANNER_MODEL or "").strip() or model_name or self._model_name_for_profile(self._default_agent_profile())
+        planner_model_name = self._planner_model_name_for_agent(model_name)
         provider = self._get_provider(planner_model_name)
         payload = provider.filter_payload(body)
         payload["model"] = planner_model_name
@@ -6191,7 +6197,8 @@ class Pipeline:
         planner_model_name = str(payload.get("model") or "").strip() or model_name
         planner_base_url = (self.valves.AGENT_PLANNER_BASE_URL or "").strip()
         planner_api_key = (self.valves.AGENT_PLANNER_API_KEY or "").strip()
-        if planner_base_url and planner_api_key and self.valves.AGENT_PLANNER_MODEL:
+        configured_planner_model = str(self.valves.AGENT_PLANNER_MODEL or "").strip()
+        if planner_base_url and planner_api_key and configured_planner_model and planner_model_name == configured_planner_model:
             response = self._post_llm_direct(
                 base_url=planner_base_url,
                 api_key=planner_api_key,

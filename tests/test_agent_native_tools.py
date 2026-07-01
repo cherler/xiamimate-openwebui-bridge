@@ -278,6 +278,55 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertEqual(observed_requests[0]["body"]["provider_profile"], "apiyi")
         self.assertEqual(observed_requests[0]["body"]["payload"]["messages"][0]["content"], "hi")
 
+    def test_apiyi_profile_ignores_global_deepseek_planner_override(self) -> None:
+        pipe = self.make_pipeline()
+        pipe.valves.AGENT_PLANNER_MODEL = "deepseek-v4-flash"
+        pipe.valves.AGENT_PLANNER_BASE_URL = "https://api.deepseek.com"
+        pipe.valves.AGENT_PLANNER_API_KEY = "test-key"
+        observed_requests = []
+
+        def post_llm_direct(**kwargs):
+            raise AssertionError("GPT-5.5 profile should not use the global direct planner override")
+
+        def chat_backend_request(**kwargs):
+            observed_requests.append(copy.deepcopy(kwargs))
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "answer_ready": True,
+                                    "final_answer": "ok",
+                                    "reasoning_summary": "done",
+                                    "stop_reason": "done",
+                                    "action_type": "final",
+                                    "steps": [],
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+
+        pipe._post_llm_direct = post_llm_direct
+        pipe._chat_backend_request = chat_backend_request
+
+        plan = pipe._plan_agent_next_steps(
+            messages=[{"role": "user", "content": "/agent 分析 portable blender"}],
+            body={"model": "xiamimate.agent-apiyi", "messages": []},
+            model_name="gpt-5.5",
+            mode="agent",
+            scene="theme_analysis",
+            tool_observations=[],
+            remaining_rounds=3,
+        )
+
+        self.assertTrue(plan["answer_ready"], plan)
+        self.assertEqual(observed_requests[0]["path"], "/internal/provider/openai/chat-completions")
+        self.assertEqual(observed_requests[0]["body"]["provider_profile"], "apiyi")
+        self.assertEqual(observed_requests[0]["body"]["payload"]["model"], "gpt-5.5")
+
     def test_mode_router_preserves_apiyi_profile_selection(self) -> None:
         router = xiamimate_mode_router.Pipeline()
         body = {
@@ -1103,6 +1152,28 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertEqual([call["name"] for call in executed_tools], ["category_resolve"])
         self.assertEqual(executed_tools[0]["parameters"]["category_query"], "Humidifiers")
         self.assertIn("category_resolve", answer)
+
+    def test_agent_stream_converts_non_runtime_provider_error_to_done_event(self) -> None:
+        pipe = self.make_pipeline()
+
+        def plan_agent_next_steps(**kwargs) -> dict:
+            raise ValueError("Response payload is not completed")
+
+        pipe._plan_agent_next_steps = plan_agent_next_steps
+        chunks = list(
+            pipe._run_agent_stream(
+                messages=[{"role": "user", "content": "/agent 分析 portable blender"}],
+                body={},
+                model="xiamimate.agent-apiyi",
+                model_name="gpt-5.5",
+                billing_context={"api_key": "test", "user_id": "test-user"},
+                mode="agent",
+            )
+        )
+        output = b"".join(chunks).decode("utf-8", errors="replace")
+
+        self.assertIn("Response payload is not completed", output)
+        self.assertIn("data: [DONE]", output)
 
     def test_react_action_protocol_executes_one_tool_per_round(self) -> None:
         pipe = self.make_pipeline()
