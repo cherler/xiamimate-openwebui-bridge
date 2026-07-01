@@ -305,16 +305,16 @@ WORKFLOW_SUGGESTION_PROMPTS = [
         "content": "/help 新手卖家第一次使用虾米选品，给我 5 条可以直接复制的提示词，并说明分别适合什么场景。",
     },
     {
-        "title": ["/tool 示例", "humidifier 原生工具验证路径"],
-        "content": "/tool 请用原生工具帮我拆解 humidifier 在 Amazon 美国站的选品验证路径：先解析候选池，再说明应该继续看 stats、trends、benchmark、top ASIN 还是补池。",
+        "title": ["/tool 示例", "humidifier 商品方向排雷"],
+        "content": "/tool 请先给 humidifier 在 Amazon 美国站做商品方向排雷：解析候选池后，优先判断样本覆盖、竞争强度、价格带、评论壁垒和是否需要补池。",
     },
     {
-        "title": ["/report quick", "pet hair remover 快速判断"],
-        "content": "/report quick 请快速判断 pet hair remover 在 Amazon 美国站是否值得继续看，并给出 3 个最关键验证指标。",
+        "title": ["/report quick", "pet hair remover 红黄绿判断"],
+        "content": "/report quick 请给 pet hair remover 在 Amazon 美国站做新手排雷体检，先输出绿灯/黄灯/红灯判断，再列出 3 个最关键风险指标。",
     },
     {
-        "title": ["/web 示例", "TikTok Shop 美国站最新政策"],
-        "content": "/web 请搜索最近 30 天 TikTok Shop 美国站入驻、履约、广告和合规政策变化，并按卖家影响排序。",
+        "title": ["/web 示例", "带电小家电合规排雷"],
+        "content": "/web 请搜索最近 30 天 Amazon 美国站带电小家电上架、认证和召回相关风险，并按新手卖家的排雷优先级排序。",
     },
 ]
 
@@ -828,39 +828,39 @@ class Pipeline:
         if "5" not in normalized_query and "五" not in normalized_query:
             return ""
 
-        return """好的！以下是为新手卖家精选的 5 条可直接复制的选品提示词，按从轻到重的使用顺序排列：
+        return """好的！以下是为新手卖家精选的 5 条可直接复制的排雷提示词，按从轻到重的使用顺序排列：
 
-### 1. 拆解选品验证路径（/tool）
-
-```
-/tool 请用原生工具帮我拆解 humidifier 在 Amazon 美国站的选品验证路径：先解析候选池，再说明应该继续看 stats、trends、benchmark、top ASIN 还是补池。
-```
-
-适合场景：你心里已经有一个大致品类方向（比如 humidifier），但还不确定该从哪里下手、该看哪些数据指标。这条提示词会让系统一步步拆解验证路径，帮你建立“先看什么、后看什么”的分析框架。
-
-### 2. 快速判断品类是否值得继续（/report quick）
+### 1. 商品方向排雷（/tool）
 
 ```
-/report quick 请快速判断 pet hair remover 在 Amazon 美国站是否值得继续看，并给出 3 个最关键验证指标。
+/tool 请先给 humidifier 在 Amazon 美国站做商品方向排雷：解析候选池后，优先判断样本覆盖、竞争强度、价格带、评论壁垒和是否需要补池。
 ```
 
-适合场景：你有好几个候选品类，想快速筛掉明显没机会的，锁定值得深挖的方向。quick 报告速度快、结论精炼，适合做早期漏斗过滤。
+适合场景：你心里已经有一个大致品类方向（比如 humidifier），但还不确定这个方向有没有明显坑。这条提示词会先做低成本体检，而不是一上来跑完整长报告。
 
-### 3. 深度调研市场机会（/report standard）
-
-```
-/report standard 请调研 kitchen organizer 在 Amazon 美国市场的机会，并输出适合新卖家的切入建议、目标价格带和差异化方向。
-```
-
-适合场景：你已经锁定某个品类、想认真评估是否值得投入。standard 报告会给出完整的市场机会判断，还会针对新卖家身份给出价格带建议和差异化方向，非常适合做立项前的深度功课。
-
-### 4. 追踪平台政策变化（/web）
+### 2. 红黄绿快速判断（/report quick）
 
 ```
-/web 请搜索最近 30 天 TikTok Shop 美国站入驻、履约、广告和合规政策变化，并按卖家影响排序。
+/report quick 请给 pet hair remover 在 Amazon 美国站做新手排雷体检，先输出绿灯/黄灯/红灯判断，再列出 3 个最关键风险指标。
 ```
 
-适合场景：你想了解最新平台入驻条件、物流履约规则或广告合规动态，尤其是 TikTok Shop 这类政策变化频繁的渠道。这条提示词会从外部抓取最新信息并按影响程度排序，帮你避开合规风险。
+适合场景：你有好几个候选品类，想快速筛掉不适合新手继续投入的方向。quick 报告要先给结论，再告诉你最大的不确定性在哪里。
+
+### 3. ASIN 体检（/report standard）
+
+```
+/report standard 请体检 ASIN B0GG8YFVV1 在 Amazon 美国站是否值得新手跟进，重点看销量/价格/BSR/评论变化、头部压力和主要风险。
+```
+
+适合场景：你已经看到一个竞品或样品，想判断能不能继续研究。standard 更适合围绕明确 ASIN 或明确商品词做体检，而不是泛泛找机会。
+
+### 4. 合规风险排雷（/web）
+
+```
+/web 请搜索最近 30 天 Amazon 美国站带电小家电上架、认证和召回相关风险，并按新手卖家的排雷优先级排序。
+```
+
+适合场景：你的商品可能涉及认证、侵权、召回、平台限制或运输风险。先用 /web 查最新外部信息，再决定是否继续测款。
 
 ### 5. 查询更多提示词模板（/help）
 
@@ -870,7 +870,7 @@ class Pipeline:
 
 适合场景：上面的 4 条用完之后，你还想要更多针对自己情况的提示词。直接告诉 /help 你的身份和阶段，系统会从知识库里匹配最相关的示例，不用自己从零想 prompt。
 
-使用建议：新手建议按 1 -> 2 -> 3 的顺序推进，先用 /tool 理清思路，再用 /report quick 快速筛选，方向明确后再上 /report standard 做深度调研；/web 则随时用来补充外部最新信息。"""
+使用建议：新手建议按 1 -> 2 -> 3 的顺序推进，先用 /tool 做商品方向排雷，再用 /report quick 拿红黄绿初判，方向或 ASIN 明确后再上 /report standard 体检；/web 则用来补认证、召回、政策和站外风险。"""
 
     def _synthesize_help_answer(self, query: str, knowledge_result: str, body: dict, model_name: str) -> str:
         if not knowledge_result:

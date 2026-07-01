@@ -149,8 +149,8 @@ class Pipeline:
 
     def _fallback_prompt(self, mode: str) -> str:
         prompts = {
-            "agent": "请分析这个商品主题，并在需要时调用工具。",
-            "tool": "请只调用必要工具，不要联网搜索。",
+            "agent": "请先围绕这个商品主题做排雷判断，并在需要时调用工具。",
+            "tool": "请只调用必要工具做商品方向排雷，不要联网搜索。",
             "web": "请基于联网搜索结果给出总结。",
             "workflow": "",
         }
