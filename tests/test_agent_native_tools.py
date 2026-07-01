@@ -249,10 +249,44 @@ class AgentNativeToolTests(unittest.TestCase):
         pipe.valves.AGENT_MODEL_DEFAULT_PROFILE = "minimax"
         pipe.pipelines = pipe._build_agent_pipelines()
 
-        self.assertEqual([entry["id"] for entry in pipe.pipelines], ["agent-minimax", "agent-deepseek"])
-        self.assertEqual([entry["name"] for entry in pipe.pipelines], ["Agent · MiniMax M2.7", "Agent · DeepSeek V4 Pro"])
+        self.assertEqual([entry["id"] for entry in pipe.pipelines], ["agent-minimax", "agent-deepseek", "agent-apiyi"])
+        self.assertEqual(
+            [entry["name"] for entry in pipe.pipelines],
+            ["Agent · MiniMax M2.7", "Agent · DeepSeek V4 Pro", "Agent · GPT-5.5"],
+        )
         self.assertTrue(all(entry["description"] == xiamimate.AGENT_MODEL_DESCRIPTION for entry in pipe.pipelines))
         self.assertTrue(all(entry["info"]["meta"]["description"] == xiamimate.AGENT_MODEL_DESCRIPTION for entry in pipe.pipelines))
+
+    def test_apiyi_profile_uses_gpt55_model_and_provider_profile(self) -> None:
+        pipe = self.make_pipeline()
+        observed_requests = []
+
+        def chat_backend_request(**kwargs):
+            observed_requests.append(copy.deepcopy(kwargs))
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+        pipe._chat_backend_request = chat_backend_request
+
+        self.assertEqual(pipe._model_name_for_profile("apiyi"), "gpt-5.5")
+        self.assertEqual(pipe._label_for_profile("apiyi"), "GPT-5.5")
+        pipe._post_agent_payload(
+            {"messages": [{"role": "user", "content": "hi"}], "temperature": 0.0},
+            model_name="gpt-5.5",
+        )
+
+        self.assertEqual(observed_requests[0]["path"], "/internal/provider/openai/chat-completions")
+        self.assertEqual(observed_requests[0]["body"]["provider_profile"], "apiyi")
+        self.assertEqual(observed_requests[0]["body"]["payload"]["messages"][0]["content"], "hi")
+
+    def test_mode_router_preserves_apiyi_profile_selection(self) -> None:
+        router = xiamimate_mode_router.Pipeline()
+        body = {
+            "model": "xiamimate.agent-apiyi",
+            "messages": [{"role": "user", "content": "/agent 分析便携咖啡机"}],
+        }
+        result = asyncio.run(router.inlet(body))
+        self.assertEqual(result["model"], "xiamimate.agent-apiyi")
+        self.assertEqual(result["xiamimate_mode"], "agent")
 
     def test_legacy_agent_alias_resolves_to_default_explicit_pipeline_id(self) -> None:
         pipe = self.make_pipeline()
@@ -1038,6 +1072,37 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertEqual(answer, "Humidifiers 类目解析完成。")
         self.assertEqual([call["name"] for call in executed_tools], ["category_resolve"])
         self.assertEqual(executed_tools[0]["parameters"]["category_query"], "Humidifiers")
+
+    def test_explicit_tool_request_runs_when_planner_provider_fails(self) -> None:
+        pipe = self.make_pipeline()
+        executed_tools = []
+
+        def plan_agent_next_steps(**kwargs) -> dict:
+            raise RuntimeError("Response payload is not completed")
+
+        pipe._plan_agent_next_steps = plan_agent_next_steps
+
+        def execute_tool_call(tool_call: dict, billing_context: dict, truncate: bool = True) -> str:
+            executed_tools.append(copy.deepcopy(tool_call))
+            return json.dumps({"success": True, "data": {"category_id": 17685839011}}, ensure_ascii=False)
+
+        pipe._execute_tool_call = execute_tool_call
+        answer = pipe._run_agent_loop(
+            messages=[
+                {
+                    "role": "user",
+                    "content": "/tool 请调用 category_resolve，把 Humidifiers 解析成 Amazon/Keepa 美国站稳定类目 ID。",
+                }
+            ],
+            body={},
+            billing_context={"api_key": "test"},
+            model_name="gpt-5.5",
+            mode="tool",
+        )
+
+        self.assertEqual([call["name"] for call in executed_tools], ["category_resolve"])
+        self.assertEqual(executed_tools[0]["parameters"]["category_query"], "Humidifiers")
+        self.assertIn("category_resolve", answer)
 
     def test_react_action_protocol_executes_one_tool_per_round(self) -> None:
         pipe = self.make_pipeline()

@@ -359,10 +359,12 @@ class Pipeline:
         CHAT_BACKEND_SERVICE_SECRET: str = ""
         CHAT_BACKEND_SERVICE_NAME: str = "open-webui-pipeline"
         AGENT_OPENAI_MODEL: str = "deepseek-v4-pro"
+        AGENT_OPENAI_APIYI_MODEL: str = "gpt-5.5"
         AGENT_ANTHROPIC_MODEL: str = "MiniMax-M2.7-highspeed"
         AGENT_MODEL_DEFAULT_PROFILE: str = "deepseek"
-        AGENT_MODEL_PROFILES: str = "deepseek,minimax"
+        AGENT_MODEL_PROFILES: str = "deepseek,minimax,apiyi"
         AGENT_MODEL_DEEPSEEK_LABEL: str = "DeepSeek V4 Pro"
+        AGENT_MODEL_APIYI_LABEL: str = "GPT-5.5"
         AGENT_MODEL_MINIMAX_LABEL: str = "MiniMax M2.7"
         AGENT_MAX_TOOL_ROUNDS: int = 12
         AGENT_TRACE_SINK_PATH: str = ""
@@ -400,10 +402,12 @@ class Pipeline:
                 "CHAT_BACKEND_SERVICE_SECRET": os.getenv("CHAT_BACKEND_SERVICE_SECRET", ""),
                 "CHAT_BACKEND_SERVICE_NAME": os.getenv("CHAT_BACKEND_SERVICE_NAME", "open-webui-pipeline"),
                 "AGENT_OPENAI_MODEL": os.getenv("AGENT_OPENAI_MODEL", "deepseek-v4-pro"),
+                "AGENT_OPENAI_APIYI_MODEL": os.getenv("AGENT_OPENAI_APIYI_MODEL", "gpt-5.5"),
                 "AGENT_ANTHROPIC_MODEL": os.getenv("AGENT_ANTHROPIC_MODEL", "MiniMax-M2.7-highspeed"),
                 "AGENT_MODEL_DEFAULT_PROFILE": os.getenv("AGENT_MODEL_DEFAULT_PROFILE", "deepseek"),
-                "AGENT_MODEL_PROFILES": os.getenv("AGENT_MODEL_PROFILES", "deepseek,minimax"),
+                "AGENT_MODEL_PROFILES": os.getenv("AGENT_MODEL_PROFILES", "deepseek,minimax,apiyi"),
                 "AGENT_MODEL_DEEPSEEK_LABEL": os.getenv("AGENT_MODEL_DEEPSEEK_LABEL", "DeepSeek V4 Pro"),
+                "AGENT_MODEL_APIYI_LABEL": os.getenv("AGENT_MODEL_APIYI_LABEL", "GPT-5.5"),
                 "AGENT_MODEL_MINIMAX_LABEL": os.getenv("AGENT_MODEL_MINIMAX_LABEL", "MiniMax M2.7"),
                 "AGENT_MAX_TOOL_ROUNDS": int(os.getenv("AGENT_MAX_TOOL_ROUNDS", "12")),
                 "AGENT_TRACE_SINK_PATH": os.getenv("AGENT_TRACE_SINK_PATH", ""),
@@ -477,13 +481,13 @@ class Pipeline:
 
     def _default_agent_profile(self) -> str:
         normalized = str(self.valves.AGENT_MODEL_DEFAULT_PROFILE or "").strip().lower()
-        return normalized if normalized in {"deepseek", "minimax"} else "deepseek"
+        return normalized if normalized in {"deepseek", "minimax", "apiyi"} else "deepseek"
 
     def _configured_agent_profiles(self) -> List[str]:
         profiles = []
         for raw_value in str(self.valves.AGENT_MODEL_PROFILES or "").split(","):
             profile = raw_value.strip().lower()
-            if profile not in {"deepseek", "minimax"} or profile in profiles:
+            if profile not in {"deepseek", "minimax", "apiyi"} or profile in profiles:
                 continue
             profiles.append(profile)
         if not profiles:
@@ -494,12 +498,16 @@ class Pipeline:
         normalized = str(profile or "").strip().lower()
         if normalized == "minimax":
             return str(self.valves.AGENT_ANTHROPIC_MODEL or "").strip() or "MiniMax-M2.7-highspeed"
+        if normalized == "apiyi":
+            return str(self.valves.AGENT_OPENAI_APIYI_MODEL or "").strip() or "gpt-5.5"
         return str(self.valves.AGENT_OPENAI_MODEL or "").strip() or "deepseek-v4-pro"
 
     def _label_for_profile(self, profile: str) -> str:
         normalized = str(profile or "").strip().lower()
         if normalized == "minimax":
             return str(self.valves.AGENT_MODEL_MINIMAX_LABEL or "MiniMax M2.7").strip() or "MiniMax M2.7"
+        if normalized == "apiyi":
+            return str(self.valves.AGENT_MODEL_APIYI_LABEL or "GPT-5.5").strip() or "GPT-5.5"
         return str(self.valves.AGENT_MODEL_DEEPSEEK_LABEL or "DeepSeek V4 Pro").strip() or "DeepSeek V4 Pro"
 
     def _pipeline_id_for_profile(self, profile: str) -> str:
@@ -1461,7 +1469,24 @@ class Pipeline:
                             raise result_holder["exc"]
                         plan = result_holder.get("plan") or {}
                 except RuntimeError as exc:
-                    if tool_observations:
+                    fallback_tool_name = self._explicit_tool_name_from_text(self._extract_last_user_text(source_messages))
+                    if not tool_observations and fallback_tool_name:
+                        fallback_scene = self._scene_for_explicit_tool(fallback_tool_name, scene)
+                        fallback_step = self._explicit_tool_request_step(source_messages, body, fallback_scene, mode=mode)
+                        if fallback_step is not None:
+                            plan = {
+                                "scene": fallback_scene,
+                                "answer_ready": False,
+                                "final_answer": "",
+                                "reasoning_summary": "planner 调用失败，按用户显式工具请求直接执行目标工具。",
+                                "stop_reason": "explicit_tool_fallback_after_planner_error: %s" % str(exc)[:500],
+                                "action_type": "tool",
+                                "planner_protocol": "explicit_tool_fallback",
+                                "steps": [fallback_step],
+                            }
+                        else:
+                            raise
+                    elif tool_observations:
                         final_answer = self._fallback_answer_from_tool_observations(tool_observations, error=str(exc))
                         for chunk in emit_reasoning_chunks(self._format_agent_progress("模型整理失败，返回工具结果摘要", percent=100)):
                             yield chunk
@@ -1472,7 +1497,8 @@ class Pipeline:
                             answer_started = True
                             yield emit_text_chunk(chunk)
                         break
-                    raise
+                    else:
+                        raise
 
                 scene = str(plan.get("scene") or scene or "general_agent").strip() or "general_agent"
                 explicit_tool_name = ""
@@ -6609,12 +6635,31 @@ class Pipeline:
                     remaining_rounds=max_rounds - round_index,
                 )
             except RuntimeError as exc:
-                if tool_observations:
+                fallback_tool_name = self._explicit_tool_name_from_text(self._extract_last_user_text(source_messages))
+                if not tool_observations and fallback_tool_name:
+                    fallback_scene = self._scene_for_explicit_tool(fallback_tool_name, scene)
+                    fallback_step = self._explicit_tool_request_step(source_messages, body, fallback_scene, mode=mode)
+                    if fallback_step is not None:
+                        plan = {
+                            "scene": fallback_scene,
+                            "answer_ready": False,
+                            "final_answer": "",
+                            "reasoning_summary": "planner 调用失败，按用户显式工具请求直接执行目标工具。",
+                            "stop_reason": "explicit_tool_fallback_after_planner_error: %s" % str(exc)[:500],
+                            "action_type": "tool",
+                            "planner_protocol": "explicit_tool_fallback",
+                            "steps": [fallback_step],
+                        }
+                    else:
+                        persist_trace(status="error")
+                        raise
+                elif tool_observations:
                     answer = self._fallback_answer_from_tool_observations(tool_observations, error=str(exc))
                     persist_trace(status="error", answer_text=answer)
                     return answer
-                persist_trace(status="error")
-                raise
+                else:
+                    persist_trace(status="error")
+                    raise
 
             scene = str(plan.get("scene") or scene or "general_agent").strip() or "general_agent"
             explicit_tool_name = ""
@@ -7037,13 +7082,24 @@ class Pipeline:
 
     def _post_agent_payload(self, payload: dict, model_name: str) -> dict:
         provider = self._get_provider(model_name)
+        body = {"payload": payload}
+        provider_profile = self._provider_profile_for_model_name(model_name)
+        if provider_profile:
+            body["provider_profile"] = provider_profile
         return self._chat_backend_request(
             method="POST",
             path=provider.chat_completions_path(),
-            body={"payload": payload},
+            body=body,
             internal=True,
             timeout=self.valves.DIFY_REQUEST_TIMEOUT,
         )
+
+    def _provider_profile_for_model_name(self, model_name: str) -> Optional[str]:
+        normalized = str(model_name or "").strip().lower()
+        apiyi_model = str(self.valves.AGENT_OPENAI_APIYI_MODEL or "gpt-5.5").strip().lower()
+        if normalized and apiyi_model and normalized == apiyi_model:
+            return "apiyi"
+        return None
 
     def _post_llm_direct(
         self,
@@ -7080,9 +7136,13 @@ class Pipeline:
             return
 
         try:
+            stream_body = {"payload": stream_payload}
+            provider_profile = self._provider_profile_for_model_name(model_name)
+            if provider_profile:
+                stream_body["provider_profile"] = provider_profile
             with self._chat_backend_stream_request(
                 path=provider.chat_completions_stream_path(),
-                body={"payload": stream_payload},
+                body=stream_body,
             ) as response:
                 response.raise_for_status()
                 for event in self._iter_sse_events(response):

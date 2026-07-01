@@ -22,7 +22,7 @@ COMMAND_TO_MODE = {
 }
 
 
-AGENT_PROFILES = {"deepseek", "minimax"}
+AGENT_PROFILES = {"deepseek", "minimax", "apiyi"}
 
 
 class Pipeline:
