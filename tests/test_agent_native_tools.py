@@ -214,6 +214,14 @@ class AgentNativeToolTests(unittest.TestCase):
         pipe._refund_billing_event = lambda **kwargs: None
         return pipe
 
+    def test_explicit_product_opportunity_request_is_theme_analysis(self) -> None:
+        pipe = self.make_pipeline()
+        messages = [{"role": "user", "content": "帮我找 car vacuum 在 Temu 美国站的机会和风险"}]
+
+        self.assertEqual(pipe._classify_agent_scene(messages), "theme_analysis")
+        self.assertFalse(pipe._looks_like_blank_opportunity_discovery_request(messages[0]["content"]))
+        self.assertEqual(pipe._infer_theme_product_query(messages), "car vacuum")
+
     def test_mode_router_redirects_stale_agent_model_to_default_explicit_id(self) -> None:
         router = xiamimate_mode_router.Pipeline()
         router.valves.default_profile = "minimax"

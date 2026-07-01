@@ -57,7 +57,7 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 跨境选品排雷 Agent，产品定�
 你的首要任务不是泛泛推荐商品机会，而是帮助用户对一个商品词、品类或 ASIN 做低成本体检，先判断这个方向是否值得继续看。
 
 工作原则：
-1. 当用户给出明确商品词、品类或 ASIN 时，默认进入“商品方向排雷”流程，优先判断继续看 / 谨慎看 / 暂停。
+1. 当用户给出明确商品词、品类或 ASIN 时，默认进入“商品方向排雷体检”流程，优先输出红黄绿判断：绿灯=继续看，黄灯=谨慎验证，红灯=暂停/不建议新手做。
 2. 排雷重点包括竞争强度、趋势变化、价格带、利润压力、评论壁垒、头部 ASIN 压力、平台规则、合规风险、供应链风险和新手切入难度。
 3. 需要数据时优先调用已挂载的工具，不要凭空编造指标。
 4. 需要平台规则、运营方法、合规要求等知识时，先调用 search_knowledge_base 工具检索知识库，不要依赖自身训练数据。
@@ -66,8 +66,12 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 跨境选品排雷 Agent，产品定�
 7. 当你已经有明确 ASIN，且需要看近 7 到 90 天的销量、价格、BSR、评论变化、L3/leaf 类目或类目路径时，必须优先调用 asin_history_timeseries；它会返回 latest_snapshot.category_path / l3_category_name / leaf_category_name 以及 window_summary.review_growth_window。
 8. keepa_asin_lookup 只用于本地历史没有命中、需要实时商品快照兜底、或明确要求直连 Keepa 的场景；它不能替代 30 天评论增长、历史窗口和本地类目路径分析。
 9. 如果工具尚未返回数据，只能给出分析框架、验证路径和风险提醒，明确标注为待验证。
-10. 输出尽量围绕结论、证据、风险、证据边界和下一步最低成本验证动作。
-11. 每个结论标注数据来源类型：知识库 / 推理 / 工具数据。
+10. /agent 与 /tool 的最终回答默认使用“排雷体检卡”结构，除非用户明确要求其它格式：
+    - `## 排雷结论`：第一行必须给 `绿灯/黄灯/红灯` 与 `继续看/谨慎验证/暂停`，并用一句话说明原因。
+    - `## 主要雷点`：列 3-5 个风险，优先覆盖样本、需求、竞争、价格/利润、评论壁垒、合规/履约、数据就绪度。
+    - `## 证据分层`：按 `工具事实 / 推导指标 / 假设 / 数据不足 / 需要用户补充` 五类归纳；没有某类证据时写“本轮未形成”，不要编造。
+    - `## 下一步最低成本验证`：给 1-3 个可执行动作，优先是 ASIN 时序、利润/ACoS、类目/补池、合规或差评样本。
+11. 每个结论标注数据来源类型：工具事实 / 知识库 / 联网证据 / 推导指标 / 默认假设。不得把推导指标写成工具事实。
 12. 涉及类目归属、竞品筛选、是否排除某 ASIN 时，必须基于工具结果中的事实字段判断，优先引用 latest_snapshot.leaf_category_name / latest_snapshot.category_path，其次引用 l3_category_name；不要仅凭标题、品牌或自身知识补全类目。
 13. 当用户要求“清洗/筛选/过滤上一步候选池”，且上一步 resolve_candidates 已返回 ASIN、品牌、product_title、leaf_category_name、fine_category_name、category_path、match_score、match_reasons 等字段时，直接基于这些字段筛选；不要为了判断标题或类目路径是否包含某词而调用 top_asin_drilldown。只有用户明确要求补充销量、价格、BSR、评论、预测等候选池没有的字段，才调用下游详情工具。
 14. 当 resolve_candidates 返回 pool_quality.is_sufficient_for_analysis=false 时，按闭环流程处理，不要把当前候选池包装成完整品类结论：先引用 pool_quality.insufficient_coverage_reason 说明覆盖不足；再调用 category_resolve 获取稳定 category_id/category_path；随后用 resolve_candidates(recall_mode=hybrid 或 category, category_id/category_path, include_descendants=true) 重试本地类目池；若 pool_quality 仍不足，调用 expand_candidates 创建补池任务，并调用 candidate_expansion_status 查询 queued/waiting_token/discovering/hydrating/syncing/completed 状态和 data_readiness。只有补池 job 的 data_readiness.analysis_ready=true，或本地池已 sufficient 且 stats/trends 有有效数值时，才继续 category_benchmark、candidate_pool_stats、top_asin_drilldown 和强结论；如果 status=completed 但 data_readiness.readiness_status=history_hydration_pending 或 serving_sync_pending，要说明“ASIN 已补入但分析特征未就绪”，建议等待 hydrate/serving sync 或只给待验证框架，不要把空 stats 当成市场事实。
@@ -96,7 +100,7 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 跨境选品排雷 Agent，产品定�
 - category_resolve: 解析商品类目名称或完整类目路径，返回 category_id 与本地覆盖度
 - expand_candidates: 创建 Keepa 补池任务，不在请求路径直接消耗 token
 - candidate_expansion_status: 查询 Keepa 补池任务状态、token 等待状态，以及 data_readiness 分析数据就绪度
-- opportunity_discovery: 发现空白机会或大类细分机会；仅用于用户尚未给出明确商品主题/关键词/ASIN 的场景
+- opportunity_discovery: 发现空白机会或大类细分机会；仅用于用户完全没有明确商品主题、关键词或 ASIN 的场景
 - opportunity_discovery_job: 按机会发现 job_id 回取完整机会卡片和结构化证据
 - candidate_pool_stats: 候选池描述统计，优先使用 resolve_candidates 返回的 candidate_pool_id
 - candidate_pool_slice: 候选池品牌/标题/材质/价格区间切片，返回切片 top ASIN 和评分/评论/销量/价格分布
@@ -205,8 +209,6 @@ POINT_COST_BY_EVENT = {
     "workflow_run": 8,
     "report_quick_run": 8,
     "report_standard_run": 16,
-    "report_deep_run": 24,
-    "report_research_run": 32,
     "kb_retrieve": 2,
     "product_api_call": 2,
     "web_search": 2,
@@ -215,15 +217,11 @@ POINT_COST_BY_EVENT = {
 REPORT_PROFILE_EVENT_TYPES = {
     "quick": "report_quick_run",
     "standard": "report_standard_run",
-    "deep": "report_deep_run",
-    "research": "report_research_run",
 }
 
 REPORT_PROFILE_LABELS = {
-    "quick": "快速报告",
-    "standard": "标准报告",
-    "deep": "深度报告",
-    "research": "研究报告",
+    "quick": "快速排雷",
+    "standard": "商品体检报告",
 }
 
 STRUCTURED_PAYLOAD_START = "<!-- XM_PAYLOAD_START"
@@ -650,7 +648,7 @@ class Pipeline:
             content = (
                 "请在 /help 后面写出你要查询的帮助主题，例如：\n"
                 "/help 新手卖家第一次使用虾米选品，给我 5 条可以直接复制的提示词。\n"
-                "/help /report quick、standard、deep、research 分别适合什么场景？\n"
+                "/help /report quick、standard 分别适合什么场景？\n"
                 "/help 更省积分的提问方式有哪些？"
             )
         else:
@@ -687,7 +685,7 @@ class Pipeline:
             profile=profile,
             mode_tag="report",
             guidance=(
-                "请在 /report 后直接写出调研需求，可选档位为 quick / standard / deep / research，例如：\n"
+                "请在 /report 后直接写出排雷需求，可选档位为 quick / standard，例如：\n"
                 "/report standard 帮我调研一下宠物自动喂食器在 TikTok 美国市场的前景"
             ),
         )
@@ -991,15 +989,15 @@ class Pipeline:
 
     def _report_profile_is_available(self, profile: str) -> bool:
         normalized = str(profile or "").strip().lower()
-        if normalized != "research":
-            return True
-        return bool((os.getenv("DIFY_REPORT_RESEARCH_APP_API_KEY") or "").strip())
+        return normalized in REPORT_PROFILE_EVENT_TYPES
 
     def _report_profile_unavailable_message(self, profile: str) -> str:
         normalized = str(profile or "").strip().lower()
         if normalized == "research":
-            return "当前 /report research 功能待开发，暂未上线。本次不会扣除积分。"
-        return "当前所选报告档位暂不可用。本次不会扣除积分。"
+            return "当前 /report research 已从前台下线，排雷报告先保留 quick 和 standard 两档。本次不会扣除积分。"
+        if normalized == "deep":
+            return "当前 /report deep 已从前台下线，建议先用 /report standard 做商品体检；如需外部政策补证，可单独使用 /web。本次不会扣除积分。"
+        return "当前所选报告档位暂不可用；目前只支持 /report quick 和 /report standard。本次不会扣除积分。"
 
     def _run_web_search(self, query: str, body: dict, model: str, model_name: str = "") -> Union[dict, Iterator[bytes]]:
         query = (query or "").strip()
@@ -1789,6 +1787,8 @@ class Pipeline:
 
         first_token, _, remainder = stripped.partition(" ")
         normalized = first_token.lower().strip()
+        if normalized in {"deep", "research"}:
+            return normalized, remainder.strip()
         if normalized in REPORT_PROFILE_EVENT_TYPES:
             return normalized, remainder.strip()
         return "standard", stripped
@@ -2052,7 +2052,7 @@ class Pipeline:
         text = re.sub(r"(?:编号|#|＃)\s*\d{1,3}", "", text, flags=re.IGNORECASE)
         if self._extract_short_bare_opportunity_rank(text) is not None:
             text = re.sub(r"^\s*\d{1,3}(?:\s*[\.、\)）:：]\s*|\s+)?", "", text, count=1)
-        text = re.sub(r"\b(?:quick|standard|deep|research)\b", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\b(?:quick|standard)\b", "", text, flags=re.IGNORECASE)
         text = re.sub(r"[，。,.；;：:\s]+", " ", text).strip()
         removable = {"请", "帮我", "帮忙", "使用", "用", "分析", "分析一下", "一下", "这个", "这条", "机会", "报告"}
         tokens = [token for token in text.split() if token not in removable]
@@ -2236,7 +2236,7 @@ class Pipeline:
             )
             lines.append("")
             lines.append("- 说明：这里按计费单位统计使用量，不直接等于人民币金额。实际扣费优先消耗月包积分，月包不足时再扣充值包积分。")
-            lines.append("- 常见计价：快速报告 8 积分/次，标准报告 16 积分/次，深度报告 24 积分/次，研究报告 32 积分/次，知识库检索 2 积分/次，商品 API 检索 2 积分/次，网络搜索 2 积分/次。")
+            lines.append("- 常见计价：快速排雷 8 积分/次，商品体检报告 16 积分/次，知识库检索 2 积分/次，商品 API 检索 2 积分/次，网络搜索 2 积分/次。")
             if usage_by_type:
                 lines.append("")
                 lines.append("- 30 天内按事件类型：")
@@ -2334,8 +2334,6 @@ class Pipeline:
             "workflow_run": "Workflow 兼容入口",
             "report_quick_run": "快速报告",
             "report_standard_run": "标准报告",
-            "report_deep_run": "深度报告",
-            "report_research_run": "研究报告",
             "kb_retrieve": "知识库检索",
             "dify_knowledge_retrieve": "知识库检索",
             "product_api_call": "商品 API 检索",
@@ -2420,8 +2418,8 @@ class Pipeline:
             "MiniMax agent request failed": "独立 LLM 请求失败，系统已自动退款。",
             "LLM 请求": "仅未触发工具的独立 LLM 请求计费。",
             "LLM 请求失败，已退款": "独立 LLM 请求失败，系统已自动退款。",
-            "快速报告": "一次快速报告计费，内部步骤只保留审计记录，不重复收费。",
-            "标准报告": "一次标准报告计费，内部步骤只保留审计记录，不重复收费。",
+            "快速报告": "一次快速排雷计费，内部步骤只保留审计记录，不重复收费。",
+            "标准报告": "一次商品体检报告计费，内部步骤只保留审计记录，不重复收费。",
             "深度报告": "一次深度报告计费，内部步骤只保留审计记录，不重复收费。",
             "研究报告": "一次研究报告计费，内部步骤只保留审计记录，不重复收费。",
             "Dify workflow run": "兼容旧入口 /workflow 当前按标准报告语义执行，内部步骤只保留审计记录，不重复收费。",
@@ -2446,8 +2444,8 @@ class Pipeline:
         if entry_type == "consume":
             usage_mapping = {
                 "workflow_run": "兼容旧入口 /workflow 的历史计费记录。",
-                "report_quick_run": "一次快速报告计费，内部检索和工具调用只保留记录，不重复收费。",
-                "report_standard_run": "一次标准报告计费，内部检索和工具调用只保留记录，不重复收费。",
+                "report_quick_run": "一次快速排雷计费，内部检索和工具调用只保留记录，不重复收费。",
+                "report_standard_run": "一次商品体检报告计费，内部检索和工具调用只保留记录，不重复收费。",
                 "report_deep_run": "一次深度报告计费，内部检索和工具调用只保留记录，不重复收费。",
                 "report_research_run": "一次研究报告计费，内部检索和工具调用只保留记录，不重复收费。",
                 "llm_request": "仅未触发工具的独立 LLM 请求计费。",
@@ -5615,12 +5613,12 @@ class Pipeline:
             return "budget_analysis"
         if self._looks_like_foundation_question(text):
             return "foundation_qa"
-        if self._looks_like_blank_opportunity_discovery_request(text):
-            return "blank_opportunity_discovery"
         if self._looks_like_asin_specific_request(text):
             return "asin_specific_analysis"
         if self._looks_like_explicit_theme_analysis_request(text):
             return "theme_analysis"
+        if self._looks_like_blank_opportunity_discovery_request(text):
+            return "blank_opportunity_discovery"
         return "general_agent"
 
     def _looks_like_foundation_question(self, text: str) -> bool:
@@ -5750,7 +5748,8 @@ class Pipeline:
         # 去掉前导命令、礼貌词与动词
         t = re.sub(r"^\s*/(?:agent|tool|web|report|help|wf|workflow)\b\s*", "", t, flags=re.IGNORECASE)
         t = re.sub(r"^(?:请|帮我|麻烦|给我|我想|我要|想|要|看看|看一下|帮忙)+\s*", "", t)
-        t = re.sub(r"^(?:分析|评估|判断|研究|拆解|查询|查|看|获取|返回|列出|找|搜索|解析)\s*(?:下|一下)?\s*", "", t)
+        t = re.sub(r"^(?:分析|评估|判断|研究|拆解|查询|查|看|获取|返回|列出|找|寻找|推荐|搜索|解析)\s*(?:下|一下)?\s*", "", t)
+        t = re.sub(r"\s+在\s+[^，。！？\n]{1,80}?(?:机会|风险|雷点|市场|数据|是否|值不值得|可行|空间).*$", "", t, flags=re.IGNORECASE)
         # 去掉尾部分析性修饰（top-N / 排名 / asin / 候选池 / 销量 / 怎么样 等）
         t = re.sub(r"\s*的?\s*(?:top\s*\d+|前\s*\d+\s*名?|top|排名|榜单).*$", "", t, flags=re.IGNORECASE)
         t = re.sub(
@@ -6367,7 +6366,8 @@ class Pipeline:
                 "content": (
                     "工具调用预算已用完。请停止调用任何工具，必须仅基于上面已经返回的工具结果，"
                     "直接回答用户的原始问题。\n"
-                    "要求：结论前置；把工具事实、推理判断和证据边界分开；如果证据不足，明确说明哪些结论待验证；"
+                    "要求：按排雷体检卡输出，第一屏先给绿灯/黄灯/红灯与继续看/谨慎验证/暂停；"
+                    "把工具事实、推导指标、假设、数据不足、需要用户补充分开；如果证据不足，明确说明哪些结论待验证；"
                     "不要输出内部工具调用标记，不要要求继续调用工具。"
                 ),
             }
@@ -6473,6 +6473,9 @@ class Pipeline:
         content = str(text or "").strip()
         if not content:
             return False
+
+        if self._looks_like_asin_specific_request(content) or self._looks_like_explicit_theme_analysis_request(content):
+            return False
         blank_discovery_patterns = (
             r"不知道.*(?:选什么|分析什么|做什么)",
             r"(?:帮我|给我)?(?:找|发现|挖掘|推荐).{0,18}(?:机会|方向|品类|类目|关键词|商品|产品|选品)",
@@ -6501,6 +6504,7 @@ class Pipeline:
             r"(?:评估|分析|判断|研究|看看|看一下|拆解)\s+[^，。！？\n]{2,90}?\s+在\s+[^，。！？\n]{2,80}?(?:机会|是否|值不值得|可行|空间|市场)",
             r"\b[a-z][a-z0-9][a-z0-9 &+\-/]{1,70}\b\s+在\s+[^，。！？\n]{2,80}?(?:机会|是否|值不值得|可行|空间|市场)",
             r"(?:评估|分析|判断|研究|拆解)\s+\b[a-z][a-z0-9][a-z0-9 &+\-/]{1,70}\b",
+            r"(?:找|寻找|推荐|发现|挖掘)\s+\b[a-z][a-z0-9][a-z0-9 &+\-/]{1,70}\b\s*(?:的)?(?:机会|风险|雷点|竞品|市场|数据)?",
         )
         if any(re.search(pattern, lowered, flags=re.IGNORECASE) for pattern in explicit_patterns):
             return True
@@ -9107,7 +9111,7 @@ class Pipeline:
             details.append("category_path=%s" % category_path)
         if details:
             return "；".join(details) + "，再进入 candidate_pool_stats / candidate_pool_slice / trend 验证。"
-        return "复制该机会编号做 `/report deep`，或先 resolve_candidates 建立候选池后继续验证。"
+        return "复制该机会编号做 `/report standard` 商品体检，或先 resolve_candidates 建立候选池后继续验证。"
 
     def _first_present(self, item: dict, *keys: str) -> Any:
         for key in keys:
