@@ -1255,6 +1255,30 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertIn("resolve_candidates", pipe.agent_harness.planner_allowed_tool_names("theme_analysis", "agent"))
         self.assertNotIn("web_search", pipe.agent_harness.planner_allowed_tool_names("foundation_qa", "tool"))
 
+    def test_agent_prompts_front_load_keepa_red_yellow_green_conclusion(self) -> None:
+        pipe = self.make_pipeline()
+
+        self.assertIn("红黄绿灯结论", xiamimate.AGENT_SYSTEM_PROMPT)
+        self.assertIn("风险判断约 50%", xiamimate.AGENT_SYSTEM_PROMPT)
+        self.assertIn("反直觉排雷", xiamimate.AGENT_SYSTEM_PROMPT)
+        self.assertIn("三条核心理由", xiamimate.AGENT_SYNTHESIS_SYSTEM_PROMPT)
+        self.assertIn("表面看起来是好事", xiamimate.AGENT_SYNTHESIS_SYSTEM_PROMPT)
+        self.assertIn("机会点最多约 10%", xiamimate.AGENT_SYNTHESIS_SYSTEM_PROMPT)
+        self.assertIn("详细 Keepa 解读", xiamimate.AGENT_SYNTHESIS_SYSTEM_PROMPT)
+
+        payload = pipe._prepare_agent_final_synthesis_payload(
+            conversation=[{"role": "user", "content": "解读 ASIN B0GKHB1R96 的 Keepa"}],
+            body={},
+            mode="agent",
+            model_name="deepseek-v4-pro",
+        )
+        final_instruction = payload["messages"][-1]["content"]
+        self.assertIn("一句话红黄绿灯结论", final_instruction)
+        self.assertIn("三条核心理由", final_instruction)
+        self.assertIn("表面好信号背后的排雷解释", final_instruction)
+        self.assertIn("机会点压到很短", final_instruction)
+        self.assertIn("详细 Keepa 解读", final_instruction)
+
     def test_agent_trace_is_included_in_synthesis_context(self) -> None:
         pipe = self.make_pipeline()
         trace = pipe.agent_harness.new_trace(mode="tool", scene="theme_analysis")
