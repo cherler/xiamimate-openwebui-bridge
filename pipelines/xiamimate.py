@@ -1527,14 +1527,28 @@ class Pipeline:
                             mode=mode,
                             stream=True,
                         )
-                    final_answer = self._fallback_opportunity_answer_if_needed(
-                        str(plan.get("final_answer") or "").strip(),
-                        tool_observations,
-                        answer_contract=self._answer_contract_from_messages(source_messages),
-                    )
+                    if tool_observations and mode != "tool" and scene in {"asin_specific_analysis", "theme_analysis"}:
+                        final_answer = self._synthesize_planner_executor_answer(
+                            messages=source_messages,
+                            body=body,
+                            model_name=model_name,
+                            planner_notes=planner_notes,
+                            tool_observations=tool_observations,
+                            agent_trace=agent_trace,
+                        )
+                        final_status = "synthesis_after_planner_final"
+                        progress_text = "工具结果已就绪，正在按最终回答约束生成答复"
+                    else:
+                        final_answer = self._fallback_opportunity_answer_if_needed(
+                            str(plan.get("final_answer") or "").strip(),
+                            tool_observations,
+                            answer_contract=self._answer_contract_from_messages(source_messages),
+                        )
+                        final_status = "planner_final"
+                        progress_text = "Planner 已确认可直接作答，正在生成最终答复"
                     final_answer_for_grade = final_answer
-                    react_runner.final(scene, status="planner_final")
-                    for chunk in emit_reasoning_chunks(self._format_agent_progress("Planner 已确认可直接作答，正在生成最终答复", percent=100)):
+                    react_runner.final(scene, status=final_status)
+                    for chunk in emit_reasoning_chunks(self._format_agent_progress(progress_text, percent=100)):
                         yield chunk
 
                     close_chunk = close_reasoning_chunk()
@@ -6691,12 +6705,23 @@ class Pipeline:
                         mode=mode,
                         stream=False,
                     )
-                react_runner.final(scene, status="planner_final")
-                answer = self._fallback_opportunity_answer_if_needed(
-                    str(plan.get("final_answer") or "").strip(),
-                    tool_observations,
-                    answer_contract=self._answer_contract_from_messages(source_messages),
-                )
+                if tool_observations and mode != "tool" and scene in {"asin_specific_analysis", "theme_analysis"}:
+                    react_runner.final(scene, status="synthesis_after_planner_final")
+                    answer = self._synthesize_planner_executor_answer(
+                        messages=source_messages,
+                        body=body,
+                        model_name=model_name,
+                        planner_notes=planner_notes,
+                        tool_observations=tool_observations,
+                        agent_trace=agent_trace,
+                    )
+                else:
+                    react_runner.final(scene, status="planner_final")
+                    answer = self._fallback_opportunity_answer_if_needed(
+                        str(plan.get("final_answer") or "").strip(),
+                        tool_observations,
+                        answer_contract=self._answer_contract_from_messages(source_messages),
+                    )
                 persist_trace(answer_text=answer)
                 return answer
 

@@ -1492,6 +1492,120 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertEqual(answer, "基于第一步观察作答。")
         self.assertEqual(executed_tools, ["search_knowledge_base"])
 
+    def test_product_planner_final_after_tool_uses_synthesis(self) -> None:
+        pipe = self.make_pipeline()
+        pipe._classify_agent_scene = lambda messages, mode="agent": "asin_specific_analysis"
+        executed_tools = []
+        plan_calls = []
+
+        def plan_agent_next_steps(**kwargs) -> dict:
+            plan_calls.append(1)
+            if kwargs.get("tool_observations"):
+                return {
+                    "scene": "asin_specific_analysis",
+                    "answer_ready": True,
+                    "final_answer": "旧式商品分析报告。",
+                    "reasoning_summary": "已有 Keepa 工具结果，可以作答。",
+                    "steps": [],
+                    "stop_reason": "done",
+                }
+            return {
+                "scene": "asin_specific_analysis",
+                "answer_ready": False,
+                "final_answer": "",
+                "reasoning_summary": "先查 ASIN 历史。",
+                "steps": [
+                    {
+                        "tool_call": {
+                            "name": "asin_history_timeseries",
+                            "parameters": {"asins": "B0GKHB1R96", "marketplace": "US"},
+                        },
+                        "goal": "读取 ASIN 历史",
+                        "required": True,
+                    }
+                ],
+                "stop_reason": "tool_then_answer",
+            }
+
+        def execute_tool_call(tool_call: dict, billing_context: dict, truncate: bool = True) -> str:
+            executed_tools.append(copy.deepcopy(tool_call))
+            return json.dumps({"success": True, "data": {"asin": "B0GKHB1R96", "current_price": 9.99}}, ensure_ascii=False)
+
+        pipe._plan_agent_next_steps = plan_agent_next_steps
+        pipe._execute_tool_call = execute_tool_call
+        pipe._synthesize_planner_executor_answer = lambda **kwargs: "## 排雷结论\n黄灯预警：有销量，但新手不建议直接跟。"
+
+        answer = pipe._run_agent_loop(
+            messages=[{"role": "user", "content": "ASIN解读：B0GKHB1R96 的Keepa中文解读"}],
+            body={},
+            billing_context={"api_key": "test"},
+            model_name="gpt-5.5",
+            mode="agent",
+        )
+
+        self.assertEqual(len(plan_calls), 2)
+        self.assertEqual([call["name"] for call in executed_tools], ["asin_history_timeseries"])
+        self.assertIn("## 排雷结论", answer)
+        self.assertNotIn("旧式商品分析报告", answer)
+
+    def test_stream_planner_final_after_tool_uses_synthesis(self) -> None:
+        pipe = self.make_pipeline()
+        pipe._classify_agent_scene = lambda messages, mode="agent": "asin_specific_analysis"
+        executed_tools = []
+        plan_calls = []
+
+        def plan_agent_next_steps(**kwargs) -> dict:
+            plan_calls.append(1)
+            if kwargs.get("tool_observations"):
+                return {
+                    "scene": "asin_specific_analysis",
+                    "reasoning_summary": "已有 Keepa 工具结果，可以作答。",
+                    "action": {"type": "final", "final_answer": "旧式商品分析报告。"},
+                    "stop_reason": "done",
+                }
+            return {
+                "scene": "asin_specific_analysis",
+                "answer_ready": False,
+                "final_answer": "",
+                "reasoning_summary": "先查 ASIN 历史。",
+                "steps": [
+                    {
+                        "tool_call": {
+                            "name": "asin_history_timeseries",
+                            "parameters": {"asins": "B0GKHB1R96", "marketplace": "US"},
+                        },
+                        "goal": "读取 ASIN 历史",
+                        "required": True,
+                    },
+                ],
+                "stop_reason": "tool_then_answer",
+            }
+
+        def execute_tool_call(tool_call: dict, billing_context: dict, truncate: bool = True) -> str:
+            executed_tools.append(copy.deepcopy(tool_call))
+            return json.dumps({"success": True, "data": {"asin": "B0GKHB1R96", "current_price": 9.99}}, ensure_ascii=False)
+
+        pipe._plan_agent_next_steps = plan_agent_next_steps
+        pipe._execute_tool_call = execute_tool_call
+        pipe._synthesize_planner_executor_answer = lambda **kwargs: "## 排雷结论\n黄灯预警：有销量，但新手不建议直接跟。"
+
+        chunks = list(
+            pipe._run_agent_stream(
+                messages=[{"role": "user", "content": "ASIN解读：B0GKHB1R96 的Keepa中文解读"}],
+                body={},
+                model="xiamimate.agent-apiyi",
+                model_name="gpt-5.5",
+                billing_context={"api_key": "test", "user_id": "test-user"},
+                mode="agent",
+            )
+        )
+        output = b"".join(chunks).decode("utf-8", errors="replace")
+
+        self.assertEqual(len(plan_calls), 2)
+        self.assertEqual([call["name"] for call in executed_tools], ["asin_history_timeseries"])
+        self.assertIn("## 排雷结论", output)
+        self.assertNotIn("旧式商品分析报告", output)
+
     def test_agent_round_limit_forces_final_synthesis_instead_of_error(self) -> None:
         pipe = self.make_pipeline()
         pipe.valves.AGENT_MAX_TOOL_ROUNDS = 2
