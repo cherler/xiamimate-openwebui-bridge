@@ -721,21 +721,39 @@ class Tools:
         self,
         asins: str,
         marketplace: str = "US",
+        include_history: bool = False,
+        window_days: int = 90,
+        interval: str = "day",
+        metrics: str = "",
     ) -> str:
-        """Look up ASIN product details directly from the Keepa API when the local database does not contain the ASIN data. Returns product info in the same format as top_asin_drilldown.
+        """Look up ASIN product details directly from the Keepa API when the local database does not contain the ASIN data. By default, return the current Keepa snapshot and 30-day stats only.
 
-        Use this tool when top_asin_drilldown returns empty results or when you need real-time data for specific ASINs that may not be in the local database.
+        Use this tool when top_asin_drilldown returns empty results or when you need real-time data for specific ASINs that may not be in the local database. Prefer the default snapshot response; set include_history=true only when the user explicitly asks for 7-90 day ASIN history from Keepa and local history is unavailable.
 
         :param asins: CSV string of ASINs to look up (max 20).
         :param marketplace: Marketplace code such as US, UK, DE, or JP.
-        :return: JSON response with ASIN product details from Keepa.
+        :param include_history: Secondary/opt-in mode. Set true only for explicit user requests for Keepa 7-90 day history.
+        :param window_days: Lookback window for optional Keepa history extraction. Current online limit is 90 days.
+        :param interval: day or week for optional history extraction.
+        :param metrics: Optional CSV string such as estimated_daily_sales,effective_price,bsr,review_count.
+        :return: JSON response with ASIN product details from Keepa; optional series/window_summary only when include_history=true.
         """
+        payload = {
+            "asins": self._normalize_csv(asins),
+            "marketplace": marketplace,
+        }
+        if include_history:
+            payload.update(
+                {
+                    "include_history": True,
+                    "window_days": window_days,
+                    "interval": interval,
+                    "metrics": self._normalize_csv(metrics),
+                }
+            )
         return self._request(
             "/api/product-theme/keepa-asin-lookup",
-            {
-                "asins": self._normalize_csv(asins),
-                "marketplace": marketplace,
-            },
+            payload,
         )
 
     def _normalize_csv(self, value) -> List[str]:

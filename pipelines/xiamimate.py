@@ -8071,6 +8071,13 @@ class Pipeline:
                 "candidate_list": "asins",
                 "domain": "marketplace",
                 "market": "marketplace",
+                "history": "include_history",
+                "with_history": "include_history",
+                "include_timeseries": "include_history",
+                "include_time_series": "include_history",
+                "days": "window_days",
+                "lookback_days": "window_days",
+                "history_days": "window_days",
             },
         }
 

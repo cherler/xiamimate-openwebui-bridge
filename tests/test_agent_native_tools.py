@@ -55,6 +55,18 @@ class FakeAgentTools:
         """Load ASIN history timeseries."""
         return ""
 
+    def keepa_asin_lookup(
+        self,
+        asins: str,
+        marketplace: str = "US",
+        include_history: bool = False,
+        window_days: int = 90,
+        interval: str = "day",
+        metrics: str = "",
+    ) -> str:
+        """Look up ASIN product details directly from the Keepa API. By default, return the current Keepa snapshot and 30-day stats only."""
+        return ""
+
     def candidate_pool_stats(
         self,
         candidate_asins: str = "",
@@ -2567,6 +2579,17 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertEqual(compacted["payload"]["data"]["evidence_contract"]["evidence_ledger"][0]["evidence_id"], "asin_history:B08FB31NH5:30d")
         self.assertTrue(item["series"]["_compacted_series"])
         self.assertLessEqual(len(rendered), 4000)
+
+    def test_keepa_lookup_schema_exposes_optional_history_fields(self) -> None:
+        pipe = self.make_pipeline()
+        definitions = pipe._build_agent_tool_definitions()
+        lookup = next(item for item in definitions if item["function"]["name"] == "keepa_asin_lookup")
+        properties = lookup["function"]["parameters"]["properties"]
+
+        self.assertEqual(properties["include_history"]["type"], "boolean")
+        self.assertEqual(properties["window_days"]["type"], "integer")
+        self.assertIn("only", lookup["function"]["description"].lower())
+        self.assertNotIn("include_history", lookup["function"]["parameters"].get("required", []))
 
 
 class SessionContextStoreTests(unittest.TestCase):
