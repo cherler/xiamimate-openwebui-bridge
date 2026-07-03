@@ -400,7 +400,7 @@ TOOL_LAYER_REGISTRY = {
     },
     "keepa_asin_lookup": {
         "layer": "analysis",
-        "capability": "本地没有历史数据时查 Keepa 实时快照",
+        "capability": "本地缺数时查 Keepa 实时快照；明确要求 7-90 天 ASIN 历史且本地历史缺失时，可用 include_history=true 补取 Keepa 历史序列",
         "scene_tags": ["asin_specific_analysis", "theme_analysis", "general_agent"],
     },
     "expand_candidates": {
