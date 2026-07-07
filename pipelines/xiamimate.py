@@ -64,7 +64,7 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 跨境选品排雷 Agent，产品定�
 5. 需要最新外部动态、站外情报、近期政策变化或实时市场讨论时，调用 web_search 工具，不要把旧知识当成最新事实。
 6. 需要商品数据时，先调用 resolve_candidates 拿到 candidate_pool_id 和 candidate_asins；后续 candidate_pool_stats / candidate_pool_slice / candidate_pool_trends / candidate_pool_weak_forecast / product_forecast_explain / top_asin_drilldown / category_benchmark 优先传 candidate_pool_id，只有缺少 pool_id 时才传 candidate_asins。
 7. 当你已经有明确 ASIN，且需要看近 7 到 90 天的销量、价格、BSR、评论变化、L3/leaf 类目或类目路径时，必须优先调用 asin_history_timeseries；它会返回 latest_snapshot.category_path / l3_category_name / leaf_category_name 以及 window_summary.review_growth_window。
-8. keepa_asin_lookup 默认用于本地缺数时的实时 Keepa 快照兜底；当用户明确要求 7 到 90 天 ASIN 历史数据、且本地 asin_history_timeseries 没有可用历史时，它也支持传 include_history=true、window_days=用户要求天数（最多90）、metrics=estimated_daily_sales,effective_price,bsr,review_count,offer_count 来获取 Keepa 历史序列。只有明确要求历史时才启用 include_history。
+8. keepa_asin_lookup 默认用于本地缺数时的实时 Keepa 快照兜底；当 resolve_candidates / candidate_pool_slice 已经给出明确 ASIN，但用户要求销量、价格、评分、评论数、BSR 等对比指标且当前工具结果没有这些有效指标时，必须继续对这些 ASIN 调用 keepa_asin_lookup 补实时快照，不要直接下结论说“没有销量数据”。当用户明确要求 7 到 90 天 ASIN 历史数据、且本地 asin_history_timeseries 没有可用历史时，它也支持传 include_history=true、window_days=用户要求天数（最多90）、metrics=estimated_daily_sales,effective_price,bsr,review_count,offer_count 来获取 Keepa 历史序列。只有明确要求历史时才启用 include_history。
 9. 如果工具尚未返回数据，只能给出分析框架、验证路径和风险提醒，明确标注为待验证。
 10. /agent 与 /tool 的最终回答默认使用“排雷体检卡”结构，除非用户明确要求其它格式。明确 ASIN 或 Keepa 中文解读时，第一屏必须先给“红黄绿灯结论”，让用户立刻记住核心判断，不要先铺长篇商品分析：
     - 第一层 `## 排雷结论`：第一行固定写 `绿灯/黄灯/红灯/黄色预警/红色预警` 之一，加 `继续看/谨慎验证/暂停`，再用一句话说明原因。示例：`黄色预警：有需求，但利润薄、合规重，新手不建议直接跟。`
@@ -76,7 +76,7 @@ AGENT_SYSTEM_PROMPT = """你是 XiaMimate 跨境选品排雷 Agent，产品定�
     - `## 下一步最低成本验证`：给 1-3 个可执行动作，优先是 ASIN 时序、利润/ACoS、类目/补池、合规或差评样本。
 11. 每个结论标注数据来源类型：工具事实 / 知识库 / 联网证据 / 推导指标 / 默认假设。不得把推导指标写成工具事实。
 12. 涉及类目归属、竞品筛选、是否排除某 ASIN 时，必须基于工具结果中的事实字段判断，优先引用 latest_snapshot.leaf_category_name / latest_snapshot.category_path，其次引用 l3_category_name；不要仅凭标题、品牌或自身知识补全类目。
-13. 当用户要求“清洗/筛选/过滤上一步候选池”，且上一步 resolve_candidates 已返回 ASIN、品牌、product_title、leaf_category_name、fine_category_name、category_path、match_score、match_reasons 等字段时，直接基于这些字段筛选；不要为了判断标题或类目路径是否包含某词而调用 top_asin_drilldown。只有用户明确要求补充销量、价格、BSR、评论、预测等候选池没有的字段，才调用下游详情工具。
+13. 当用户要求“清洗/筛选/过滤上一步候选池”，且上一步 resolve_candidates 已返回 ASIN、品牌、product_title、leaf_category_name、fine_category_name、category_path、match_score、match_reasons 等字段时，直接基于这些字段筛选；不要为了判断标题或类目路径是否包含某词而调用 top_asin_drilldown。只有用户明确要求补充销量、价格、BSR、评论、预测等候选池没有的字段，才调用下游详情工具；其中筛选后已经有 ASIN 但本地切片缺销量/价格/评分/评论/BSR 时，优先用 keepa_asin_lookup 补快照。
 14. 当 resolve_candidates 返回 pool_quality.is_sufficient_for_analysis=false 时，按闭环流程处理，不要把当前候选池包装成完整品类结论：先引用 pool_quality.insufficient_coverage_reason 说明覆盖不足；再调用 category_resolve 获取稳定 category_id/category_path；随后用 resolve_candidates(recall_mode=hybrid 或 category, category_id/category_path, include_descendants=true) 重试本地类目池；若 pool_quality 仍不足，调用 expand_candidates 创建补池任务，并调用 candidate_expansion_status 查询 queued/waiting_token/discovering/hydrating/syncing/completed 状态和 data_readiness。只有补池 job 的 data_readiness.analysis_ready=true，或本地池已 sufficient 且 stats/trends 有有效数值时，才继续 category_benchmark、candidate_pool_stats、top_asin_drilldown 和强结论；如果 status=completed 但 data_readiness.readiness_status=history_hydration_pending 或 serving_sync_pending，要说明“ASIN 已补入但分析特征未就绪”，建议等待 hydrate/serving sync 或只给待验证框架，不要把空 stats 当成市场事实。
    - 选品验证路径是自适应的，不是固定的“stats→trends→benchmark→drilldown”流水线，也没有“必须全部通过才算完整”的关卡。某一个维度数据不足，只代表该维度暂时待校准，不要据此宣布“当前选品验证路径还不完整”，更不要把“换关键词”当成唯一收尾。
    - 具体到 category_benchmark：当返回 benchmark_is_precise=false，或 pool_representativeness 偏低、uncategorized_asin_count 较多（锚点只代表候选池里少数 ASIN、多数 ASIN 还没解析出本地 L3 类目）时，这只是“类目基准”这一个维度的证据边界。应照常给出 candidate_pool_stats 盘面、candidate_pool_slice 切片自我对标、top_asin_drilldown 头部下钻、forecast 等其它维度能支撑的结论，只把基准维度标注为“待校准/仅供参考”。
@@ -993,6 +993,18 @@ class Pipeline:
             return self._chat_response(content=message, model=model)
 
         report_label = REPORT_PROFILE_LABELS[profile]
+        if str(profile or "").strip().lower() == "quick":
+            asin = self._extract_report_quick_asin(query)
+            if asin:
+                return self._run_report_asin_quick_profile(
+                    asin=asin,
+                    query=query,
+                    body=body,
+                    model=model,
+                    mode_tag=mode_tag,
+                    report_label=report_label,
+                )
+
         return self._run_dify_chatflow(
             query=query,
             body=body,
@@ -1005,6 +1017,459 @@ class Pipeline:
             guidance=guidance,
             request_payload={"profile": profile},
         )
+
+    def _extract_report_quick_asin(self, text: str) -> str:
+        matches = re.findall(r"(?<![A-Z0-9])([A-Z0-9]{10})(?![A-Z0-9])", str(text or "").upper())
+        for candidate in matches:
+            if any(ch.isalpha() for ch in candidate) and any(ch.isdigit() for ch in candidate):
+                return candidate
+        return ""
+
+    def _run_report_asin_quick_profile(
+        self,
+        *,
+        asin: str,
+        query: str,
+        body: dict,
+        model: str,
+        mode_tag: str,
+        report_label: str,
+    ) -> Union[dict, Iterator[bytes]]:
+        if not self.valves.CHAT_BACKEND_SERVICE_SECRET:
+            message = "CHAT_BACKEND_SERVICE_SECRET 未配置。"
+            if body.get("stream"):
+                return self._stream_text_response(content=message, model=model)
+            return self._chat_response(content=message, model=model)
+
+        try:
+            billing_context = self._ensure_billing_context(body)
+            flow_charge = self._charge_billing_event(
+                billing_context=billing_context,
+                event_type=REPORT_PROFILE_EVENT_TYPES["quick"],
+                description=report_label,
+                meta={
+                    "mode": mode_tag,
+                    "report_profile": "quick",
+                    "report_variant": "asin_quick_analysis",
+                    "stream": bool(body.get("stream")),
+                    "asin": asin,
+                    "query_preview": str(query or "")[:200],
+                },
+            )
+        except RuntimeError as exc:
+            message = self._error_text(str(exc))
+            if body.get("stream"):
+                return self._stream_text_response(content=message, model=model)
+            return self._chat_response(content=message, model=model)
+
+        try:
+            answer = self._run_report_asin_quick_analysis(
+                asin=asin,
+                marketplace=self._report_asin_quick_marketplace(query=query, body=body),
+                body=body,
+                model=model,
+            )
+        except RuntimeError as exc:
+            self._refund_billing_event(
+                billing_context=billing_context,
+                charge=flow_charge,
+                description="%s失败，已退款" % report_label,
+                meta={"mode": mode_tag, "report_profile": "quick", "asin": asin, "error": str(exc)[:500]},
+            )
+            message = self._error_text(str(exc))
+            if body.get("stream"):
+                return self._stream_text_response(content=message, model=model)
+            return self._chat_response(content=message, model=model)
+
+        if body.get("stream"):
+            return self._stream_text_response(content=answer, model=model)
+        return self._chat_response(content=answer, model=model)
+
+    def _report_asin_quick_marketplace(self, *, query: str, body: dict) -> str:
+        for key in ("target_market", "marketplace"):
+            value = self._body_context_value(body, key)
+            if value:
+                normalized = self._normalize_marketplace_value(value)
+                if isinstance(normalized, str) and normalized.strip():
+                    return normalized.strip().upper()
+
+        padded = " %s " % str(query or "").lower()
+        marketplace_markers = [
+            ("UK", ("英国", "英站", "amazon uk", "amazon.co.uk", " uk ")),
+            ("DE", ("德国", "德站", "amazon de", "amazon.de", " de ")),
+            ("JP", ("日本", "日站", "amazon jp", "amazon.co.jp", " jp ")),
+            ("CA", ("加拿大", "加站", "amazon ca", "amazon.ca", " ca ")),
+            ("US", ("美国", "美站", "amazon us", "amazon.com", " us ")),
+        ]
+        for code, markers in marketplace_markers:
+            if any(marker in padded for marker in markers):
+                return code
+        return "US"
+
+    def _run_report_asin_quick_analysis(self, *, asin: str, marketplace: str, body: Optional[dict] = None, model: str = "") -> str:
+        history_result = self._call_report_asin_quick_tool(
+            "asin_history_timeseries",
+            {
+                "asins": asin,
+                "marketplace": marketplace,
+                "window_days": 90,
+                "interval": "day",
+                "metrics": "estimated_daily_sales,effective_price,bsr,review_count,offer_count",
+            },
+        )
+        tool_results = [history_result]
+        history_payload = dict(history_result.get("payload") or {})
+        selected_result = history_result if history_result.get("ok") and self._report_asin_quick_payload_has_evidence(history_payload) else None
+        if not (history_result.get("ok") and self._report_asin_quick_payload_has_history_evidence(history_payload)):
+            keepa_result = self._call_report_asin_quick_tool(
+                "keepa_asin_lookup",
+                {
+                    "asins": asin,
+                    "marketplace": marketplace,
+                    "include_history": True,
+                    "window_days": 90,
+                    "interval": "day",
+                    "metrics": "estimated_daily_sales,effective_price,bsr,review_count,offer_count",
+                },
+            )
+            tool_results.append(keepa_result)
+            keepa_payload = dict(keepa_result.get("payload") or {})
+            if keepa_result.get("ok") and (self._report_asin_quick_payload_has_history_evidence(keepa_payload) or selected_result is None and self._report_asin_quick_payload_has_evidence(keepa_payload)):
+                selected_result = keepa_result
+
+        if selected_result is None:
+            first_error = next((str(result.get("error") or "") for result in tool_results if result.get("error")), "ASIN 历史/Keepa 查询暂未返回可用数据")
+            raise RuntimeError(first_error[:4000])
+
+        selected_name = str(selected_result.get("name") or "")
+        selected_payload = dict(selected_result.get("payload") or {})
+        source_label = "本地 ASIN 历史时序" if selected_name == "asin_history_timeseries" else "Keepa 历史补充（include_history=true）"
+
+        current_snapshot = "；".join([
+            self._report_asin_quick_metric_pair(selected_payload, "标题", {"product_title", "title"}),
+            self._report_asin_quick_metric_pair(selected_payload, "品牌", {"brand", "brand_name"}),
+            self._report_asin_quick_metric_pair(selected_payload, "类目", {"category", "leaf_category_name", "l3_category_name", "category_path"}),
+            self._report_asin_quick_metric_pair(selected_payload, "当前价格", {"effective_price", "price", "current_price"}),
+            self._report_asin_quick_metric_pair(selected_payload, "预估日销", {"estimated_daily_sales", "sales_daily_avg"}),
+            self._report_asin_quick_metric_pair(selected_payload, "BSR", {"bsr", "current_bsr", "best_sellers_rank"}),
+            self._report_asin_quick_metric_pair(selected_payload, "评分", {"rating", "review_rating", "average_rating"}),
+            self._report_asin_quick_metric_pair(selected_payload, "评论数", {"review_count", "reviews"}),
+        ])
+        change_30_90 = "；".join([
+            "**近 30 天**：%s" % self._report_asin_quick_series_delta_text(selected_payload, 30),
+            "**近 90 天**：%s" % self._report_asin_quick_series_delta_text(selected_payload, 90),
+            "**窗口摘要**：%s" % self._report_asin_quick_window_summary_text(selected_payload),
+        ])
+        review_barrier = "；".join([
+            self._report_asin_quick_metric_pair(selected_payload, "当前评分", {"rating", "review_rating", "average_rating"}),
+            self._report_asin_quick_metric_pair(selected_payload, "评论总数", {"review_count", "reviews"}),
+            self._report_asin_quick_metric_pair(selected_payload, "90天评论增长", {"review_growth", "review_growth_window", "review_growth_90d", "review_count_change"}),
+        ])
+        volatility_text = "；".join([
+            "**价格/BSR/销量**：%s" % self._report_asin_quick_window_summary_text(selected_payload),
+            "**数据来源**：%s" % source_label,
+        ])
+        conclusion = self._report_asin_quick_light(0 if selected_result.get("ok") else 1, review_barrier, volatility_text)
+
+        if conclusion.startswith("绿灯"):
+            research_action = "可以作为竞品、跟卖参考或选品样本继续研究，但仍要补利润、合规和供应链验证。"
+        elif conclusion.startswith("黄灯"):
+            research_action = "可以作为竞品观察样本，但不建议直接跟卖；先验证利润空间、评论壁垒和销量稳定性。"
+        else:
+            research_action = "暂时不建议作为跟卖参考或选品样本投入预算；除非后续补到更稳定的销量、评论和利润证据。"
+
+        deterministic_answer = "\n".join([
+            "# ASIN 快速排雷：%s" % asin,
+            "",
+            "**最终结论：%s**" % conclusion,
+            "",
+            "## 当前盘面",
+            current_snapshot,
+            "",
+            "## 近 30/90 天变化",
+            change_30_90,
+            "",
+            "## 评论增长与壁垒",
+            review_barrier,
+            "",
+            "## 价格 / BSR / 销量波动",
+            volatility_text,
+            "",
+            "## 是否值得继续研究",
+            research_action,
+        ])
+        return self._synthesize_report_asin_quick_answer(
+            asin=asin,
+            marketplace=marketplace,
+            deterministic_answer=deterministic_answer,
+            tool_results=tool_results,
+            selected_name=selected_name,
+            selected_payload=selected_payload,
+            body=body or {},
+            model=model,
+        )
+
+    def _synthesize_report_asin_quick_answer(
+        self,
+        *,
+        asin: str,
+        marketplace: str,
+        deterministic_answer: str,
+        tool_results: List[dict],
+        selected_name: str,
+        selected_payload: dict,
+        body: dict,
+        model: str,
+    ) -> str:
+        if not isinstance(body, dict) or not model:
+            return deterministic_answer
+        tool_decision = {
+            "tool_chain": [result.get("name") for result in tool_results],
+            "selected_tool": selected_name,
+            "keepa_include_history": any(result.get("name") == "keepa_asin_lookup" for result in tool_results),
+            "history_evidence_ready": self._report_asin_quick_payload_has_history_evidence(selected_payload),
+        }
+        evidence = {
+            "current_snapshot": self._report_asin_quick_current_snapshot(selected_payload),
+            "series_delta_30d": self._report_asin_quick_series_delta_text(selected_payload, 30),
+            "series_delta_90d": self._report_asin_quick_series_delta_text(selected_payload, 90),
+            "window_summary": self._report_asin_quick_window_summary_text(selected_payload),
+            "tool_decision": tool_decision,
+            "draft_answer": deterministic_answer,
+        }
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "你是虾米选品的 ASIN 快速排雷分析师。请基于下面的工具证据输出一份中文 Markdown 快速排雷报告，"
+                    "保持红/黄/绿灯结论先行，不要再要求或模拟调用任何工具，不要编造评论主题、差评关键词、政策或供应链信息。"
+                    "你需要复核工具决策：如果 tool_chain 含 keepa_asin_lookup，说明 asin_history_timeseries 只有快照或缺历史窗口，"
+                    "Keepa 已带 include_history=true 补足历史；报告中应明确引用这些历史窗口证据。"
+                    "结构固定为：# ASIN 快速排雷、最终结论、当前盘面、近 30/90 天变化、评论增长与壁垒、价格 / BSR / 销量波动、是否值得继续研究。\n\n"
+                    "ASIN：%s\n站点：%s\n证据 JSON：\n%s"
+                )
+                % (asin, marketplace, json.dumps(evidence, ensure_ascii=False)[:6000]),
+            }
+        ]
+        try:
+            payload = self._prepare_agent_payload(messages=messages, body=body, mode="report", model_name=model)
+            payload["stream"] = False
+            payload.pop("tools", None)
+            payload.pop("tool_choice", None)
+            response = self._post_agent_payload(payload, model_name=model)
+            content = self._clean_agent_content(self._extract_assistant_content(response), model_name=model).strip()
+        except Exception:
+            return deterministic_answer
+        if not content or self._looks_like_planner_json(content):
+            return deterministic_answer
+        return content
+
+    def _call_report_asin_quick_tool(self, name: str, parameters: Dict[str, Any]) -> dict:
+        method = getattr(self.agent_tools, name, None) if self.agent_tools is not None else None
+        if method is None:
+            return {"name": name, "ok": False, "payload": {}, "summary": "暂缺：工具未加载", "error": "工具 %s 未加载或不可用。" % name}
+        try:
+            raw_result = str(method(**parameters) or "")
+        except Exception as exc:
+            return {"name": name, "ok": False, "payload": {}, "summary": "暂缺：%s" % str(exc)[:180], "error": str(exc)}
+        payload = self._load_tool_json_payload(raw_result) or {}
+        ok = bool(payload) and not self._tool_result_has_error(raw_result) and str(payload.get("success", True)).lower() != "false"
+        summary = self._report_asin_quick_tool_summary(payload) if ok else "暂缺：%s" % (str(payload.get("message") or payload.get("detail") or raw_result)[:180] or "工具返回为空")
+        return {"name": name, "ok": ok, "payload": payload, "summary": summary, "error": "" if ok else summary}
+
+    def _report_asin_quick_payload_has_evidence(self, payload: dict) -> bool:
+        evidence_keys = {
+            "product_title",
+            "title",
+            "brand",
+            "brand_name",
+            "leaf_category_name",
+            "l3_category_name",
+            "category_path",
+            "effective_price",
+            "price",
+            "current_price",
+            "bsr",
+            "current_bsr",
+            "best_sellers_rank",
+            "rating",
+            "review_rating",
+            "average_rating",
+            "review_count",
+            "reviews",
+            "estimated_daily_sales",
+            "sales_daily_avg",
+            "sales_window_sum",
+            "window_summary",
+            "review_growth_window",
+            "change_30d",
+            "change_90d",
+            "series",
+            "latest_snapshot",
+            "keepa_snapshot",
+        }
+        return self._report_asin_quick_find_value(payload, evidence_keys) not in (None, "", [], {})
+
+    def _report_asin_quick_payload_has_history_evidence(self, payload: dict) -> bool:
+        series = self._report_asin_quick_find_value(payload, {"series"})
+        if isinstance(series, list) and len(series) >= 2:
+            return True
+        window_summary = self._report_asin_quick_find_value(payload, {"window_summary"})
+        if isinstance(window_summary, dict) and window_summary:
+            return True
+        return self._report_asin_quick_find_value(payload, {"change_30d", "change_90d", "review_growth_window", "sales_window_sum"}) not in (None, "", [], {})
+
+    def _report_asin_quick_find_value(self, payload: Any, keys: set, depth: int = 0) -> Any:
+        if depth > 7:
+            return None
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                if str(key) in keys and value not in (None, "", [], {}):
+                    return value
+            for value in payload.values():
+                found = self._report_asin_quick_find_value(value, keys, depth + 1)
+                if found not in (None, "", [], {}):
+                    return found
+        elif isinstance(payload, list):
+            for item in payload[:12]:
+                found = self._report_asin_quick_find_value(item, keys, depth + 1)
+                if found not in (None, "", [], {}):
+                    return found
+        return None
+
+    def _report_asin_quick_metric_text(self, payload: dict, keys: set, default: str = "暂缺") -> str:
+        value = self._report_asin_quick_find_value(payload, keys)
+        if value in (None, "", [], {}):
+            return default
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False)[:260]
+        return str(value)[:260]
+
+    def _report_asin_quick_series(self, payload: dict) -> List[dict]:
+        series = self._report_asin_quick_find_value(payload, {"series"})
+        if not isinstance(series, list):
+            return []
+        return [item for item in series if isinstance(item, dict)]
+
+    def _report_asin_quick_number_value(self, payload: dict, keys: set) -> Optional[float]:
+        value = self._report_asin_quick_find_value(payload, keys)
+        if isinstance(value, bool) or value in (None, "", [], {}):
+            return None
+        try:
+            return float(str(value).replace(",", ""))
+        except Exception:
+            return None
+
+    def _report_asin_quick_format_number(self, value: Any, suffix: str = "") -> str:
+        if value in (None, "", [], {}):
+            return "暂缺"
+        try:
+            number = float(str(value).replace(",", ""))
+            text = str(int(number)) if number.is_integer() else ("%.2f" % number).rstrip("0").rstrip(".")
+            return "%s%s" % (text, suffix)
+        except Exception:
+            return str(value)
+
+    def _report_asin_quick_series_delta_text(self, payload: dict, days: int) -> str:
+        series = self._report_asin_quick_series(payload)
+        if len(series) < 2:
+            return "暂缺"
+        window = series[-days:] if len(series) > days else series
+        first = window[0]
+        last = window[-1]
+        parts = []
+        review_first = self._report_asin_quick_number_value(first, {"review_count", "reviews"})
+        review_last = self._report_asin_quick_number_value(last, {"review_count", "reviews"})
+        if review_first is not None and review_last is not None:
+            parts.append("评论 +%s" % self._report_asin_quick_format_number(review_last - review_first))
+        sales_first = self._report_asin_quick_number_value(first, {"estimated_daily_sales", "sales_daily_avg"})
+        sales_last = self._report_asin_quick_number_value(last, {"estimated_daily_sales", "sales_daily_avg"})
+        if sales_first is not None and sales_last is not None:
+            parts.append("日销 %s -> %s" % (self._report_asin_quick_format_number(sales_first), self._report_asin_quick_format_number(sales_last)))
+        price_values = [self._report_asin_quick_number_value(item, {"effective_price", "price", "current_price"}) for item in window]
+        price_values = [value for value in price_values if value is not None]
+        if price_values:
+            parts.append("价格 %s-%s" % (self._report_asin_quick_format_number(min(price_values)), self._report_asin_quick_format_number(max(price_values))))
+        bsr_first = self._report_asin_quick_number_value(first, {"bsr", "current_bsr", "best_sellers_rank"})
+        bsr_last = self._report_asin_quick_number_value(last, {"bsr", "current_bsr", "best_sellers_rank"})
+        if bsr_first is not None and bsr_last is not None:
+            parts.append("BSR %s -> %s" % (self._report_asin_quick_format_number(bsr_first), self._report_asin_quick_format_number(bsr_last)))
+        return "；".join(parts) if parts else "暂缺"
+
+    def _report_asin_quick_current_snapshot(self, payload: dict) -> dict:
+        snapshot = {}
+        for output_key, keys in [
+            ("title", {"product_title", "title"}),
+            ("brand", {"brand", "brand_name"}),
+            ("category", {"category", "leaf_category_name", "l3_category_name", "category_path"}),
+            ("price", {"effective_price", "price", "current_price"}),
+            ("estimated_daily_sales", {"estimated_daily_sales", "sales_daily_avg"}),
+            ("bsr", {"bsr", "current_bsr", "best_sellers_rank"}),
+            ("rating", {"rating", "review_rating", "average_rating"}),
+            ("review_count", {"review_count", "reviews"}),
+        ]:
+            value = self._report_asin_quick_find_value(payload, keys)
+            if value not in (None, "", [], {}):
+                snapshot[output_key] = value
+        return snapshot
+
+    def _report_asin_quick_window_summary_text(self, payload: dict) -> str:
+        summary = self._report_asin_quick_find_value(payload, {"window_summary"})
+        if not isinstance(summary, dict):
+            summary = {}
+        parts = []
+        if summary.get("sales_daily_avg") not in (None, "", [], {}):
+            parts.append("90天日销均值 %s" % self._report_asin_quick_format_number(summary.get("sales_daily_avg")))
+        if summary.get("sales_window_sum") not in (None, "", [], {}):
+            parts.append("窗口销量 %s" % self._report_asin_quick_format_number(summary.get("sales_window_sum")))
+        if summary.get("price_min_window") not in (None, "", [], {}) or summary.get("price_max_window") not in (None, "", [], {}):
+            parts.append("价格区间 %s-%s" % (self._report_asin_quick_format_number(summary.get("price_min_window")), self._report_asin_quick_format_number(summary.get("price_max_window"))))
+        if summary.get("review_growth_window") not in (None, "", [], {}):
+            parts.append("评论增长 +%s" % self._report_asin_quick_format_number(summary.get("review_growth_window")))
+        if summary.get("bsr_avg_window") not in (None, "", [], {}):
+            parts.append("BSR均值 %s" % self._report_asin_quick_format_number(summary.get("bsr_avg_window")))
+        if summary.get("coverage_ratio") not in (None, "", [], {}):
+            parts.append("覆盖率 %s" % self._report_asin_quick_format_number(float(summary.get("coverage_ratio")) * 100, "%"))
+        row_count = summary.get("series_row_count") or len(self._report_asin_quick_series(payload))
+        if row_count:
+            parts.append("历史点 %s 条" % row_count)
+        return "；".join(parts) if parts else "暂缺"
+
+    def _report_asin_quick_metric_pair(self, payload: dict, label: str, keys: set) -> str:
+        return "**%s**：%s" % (label, self._report_asin_quick_metric_text(payload, keys))
+
+    def _report_asin_quick_tool_summary(self, payload: dict) -> str:
+        parts = []
+        for label, keys in [
+            ("标题", {"product_title", "title"}),
+            ("品牌", {"brand", "brand_name"}),
+            ("类目", {"leaf_category_name", "l3_category_name", "category_path"}),
+            ("价格", {"effective_price", "price", "current_price"}),
+            ("BSR", {"bsr", "current_bsr"}),
+            ("评论", {"review_count", "reviews", "rating"}),
+            ("销量", {"estimated_daily_sales", "sales_daily_avg", "sales_window_sum"}),
+            ("预测", {"driver_summary_text", "primary_driver_label", "forecast_summary"}),
+        ]:
+            value = self._report_asin_quick_find_value(payload, keys)
+            if value in (None, "", [], {}):
+                continue
+            if isinstance(value, (dict, list)):
+                value_text = json.dumps(value, ensure_ascii=False)[:220]
+            else:
+                value_text = str(value)[:220]
+            parts.append("%s：%s" % (label, value_text))
+            if len(parts) >= 4:
+                break
+        return "；".join(parts) if parts else "已返回结构化证据，需结合完整数据继续判断。"
+
+    def _report_asin_quick_light(self, unavailable_count: int, risk_text: str, volatility_text: str) -> str:
+        risk_blob = ("%s %s" % (risk_text, volatility_text)).lower()
+        high_risk_markers = ["high", "red", "下降", "下滑", "异常", "风险", "暂缺", "provider_required", "insufficient"]
+        if unavailable_count >= 3 or sum(1 for marker in high_risk_markers if marker in risk_blob) >= 3:
+            return "红灯：暂时放弃"
+        if unavailable_count >= 1 or any(marker in risk_blob for marker in ["异常", "风险", "暂缺", "下降", "下滑"]):
+            return "黄灯：谨慎验证"
+        return "绿灯：值得继续研究"
 
     def _report_profile_is_available(self, profile: str) -> bool:
         normalized = str(profile or "").strip().lower()
@@ -1520,6 +1985,15 @@ class Pipeline:
                 react_runner.plan_note(scene, plan)
 
                 if not explicit_tool_name and plan.get("answer_ready") and str(plan.get("final_answer") or "").strip():
+                    metric_gap_step = self._metric_gap_keepa_step_if_needed(source_messages, scene, tool_observations)
+                    if metric_gap_step is not None:
+                        plan = dict(plan)
+                        plan["answer_ready"] = False
+                        plan["final_answer"] = ""
+                        plan["action_type"] = "tool"
+                        plan["steps"] = [metric_gap_step]
+
+                if not explicit_tool_name and plan.get("answer_ready") and str(plan.get("final_answer") or "").strip():
                     if mode == "agent" and not used_tools:
                         self._charge_standalone_llm_request(
                             billing_context=billing_context,
@@ -1577,6 +2051,9 @@ class Pipeline:
                     steps = self._enforce_theme_resolve_first_step(steps, scene, source_messages, body, tool_observations)
                 steps = self._repair_planner_steps_required_arguments(steps, source_messages, body)
                 steps = self._filter_redundant_planner_steps(steps, scene, tool_observations)
+                metric_gap_step = self._metric_gap_keepa_step_if_needed(source_messages, scene, tool_observations)
+                if metric_gap_step is not None:
+                    steps = [metric_gap_step]
                 react_runner.validation(scene, steps)
                 if not steps:
                     if not tool_observations and str(plan.get("action_type") or "").strip() in {"", "none"}:
@@ -5737,6 +6214,153 @@ class Pipeline:
     def _observed_tool_names(self, tool_observations: List[dict]) -> List[str]:
         return self.agent_harness.observed_tool_names(tool_observations)
 
+    def _metric_gap_keepa_step_if_needed(self, messages: List[dict], scene: str, tool_observations: List[dict]) -> Optional[dict]:
+        if scene not in {"theme_analysis", "asin_specific_analysis", "general_agent"}:
+            return None
+        if "keepa_asin_lookup" in self._observed_tool_names(tool_observations):
+            return None
+        if not self._user_requests_asin_metric_comparison(self._extract_last_user_text(messages)):
+            return None
+        asins = self._asins_from_observations_for_keepa_gap(tool_observations)
+        if not asins or not self._observations_have_metric_gap(tool_observations):
+            return None
+        tool_call = self._normalize_tool_call(
+            name="keepa_asin_lookup",
+            parameters={
+                "asins": ",".join(asins[:10]),
+                "marketplace": self._marketplace_from_observations(tool_observations) or "US",
+            },
+        )
+        if tool_call is None:
+            return None
+        return {
+            "tool_call": tool_call,
+            "goal": "候选 ASIN 已明确但本地指标缺失，直连 Keepa 补实时销量、价格、评分和评论快照。",
+            "required": True,
+        }
+
+    def _user_requests_asin_metric_comparison(self, text: str) -> bool:
+        content = str(text or "").lower()
+        if not content:
+            return False
+        metric_markers = ("销量", "sales", "价格", "price", "评分", "rating", "评论", "review", "bsr")
+        comparison_markers = ("对比", "比较", "分别", "排名", "最高", "top", "候选", "asin")
+        return any(marker in content for marker in metric_markers) and any(marker in content for marker in comparison_markers)
+
+    def _asins_from_observations_for_keepa_gap(self, tool_observations: List[dict]) -> List[str]:
+        asins: List[str] = []
+        for observation in tool_observations or []:
+            tool_name = str((observation or {}).get("tool_name") or "").strip()
+            if tool_name not in {"resolve_candidates", "candidate_pool_slice", "candidate_pool_stats", "top_asin_drilldown"}:
+                continue
+            payload = self._load_tool_json_payload(str((observation or {}).get("raw_result") or ""))
+            if payload is not None:
+                asins.extend(self._extract_asins_from_json_value(payload))
+        seen: List[str] = []
+        seen_set = set()
+        for asin in asins:
+            normalized = asin.strip().upper()
+            if normalized and normalized not in seen_set:
+                seen.append(normalized)
+                seen_set.add(normalized)
+        return seen
+
+    def _extract_asins_from_json_value(self, value: Any) -> List[str]:
+        found: List[str] = []
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if str(key or "").lower() in {"asin", "asins", "candidate_asins", "top_asins", "slice_top_asins"}:
+                    found.extend(self._normalize_asin_values(item))
+                else:
+                    found.extend(self._extract_asins_from_json_value(item))
+        elif isinstance(value, list):
+            for item in value:
+                found.extend(self._extract_asins_from_json_value(item))
+        return found
+
+    def _normalize_asin_values(self, value: Any) -> List[str]:
+        if value in (None, "", [], {}):
+            return []
+        if isinstance(value, dict):
+            asin = str(value.get("asin") or value.get("ASIN") or "").strip().upper()
+            return [asin] if re.fullmatch(r"B[A-Z0-9]{9}", asin) else []
+        if isinstance(value, str):
+            return re.findall(r"\bB[A-Z0-9]{9}\b", value.upper())
+        if isinstance(value, (list, tuple, set)):
+            normalized: List[str] = []
+            for item in value:
+                normalized.extend(self._normalize_asin_values(item))
+            return normalized
+        return []
+
+    def _observations_have_metric_gap(self, tool_observations: List[dict]) -> bool:
+        saw_candidate_tool = False
+        for observation in tool_observations or []:
+            tool_name = str((observation or {}).get("tool_name") or "").strip()
+            if tool_name not in {"resolve_candidates", "candidate_pool_slice", "candidate_pool_stats", "top_asin_drilldown"}:
+                continue
+            saw_candidate_tool = True
+            payload = self._load_tool_json_payload(str((observation or {}).get("raw_result") or ""))
+            if payload is not None and self._json_has_nonempty_asin_metric(payload):
+                return False
+        return saw_candidate_tool
+
+    def _json_has_nonempty_asin_metric(self, value: Any) -> bool:
+        metric_keys = {
+            "sales_window_sum",
+            "sales_daily_avg",
+            "estimated_daily_sales",
+            "estimated_monthly_sales",
+            "effective_price",
+            "latest_effective_price",
+            "price",
+            "rating",
+            "current_rating",
+            "latest_rating",
+            "review_count",
+            "current_review_count",
+            "latest_review_count",
+            "bsr",
+            "latest_bsr",
+        }
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if str(key or "").lower() in metric_keys and item not in (None, "", [], {}):
+                    return True
+                if self._json_has_nonempty_asin_metric(item):
+                    return True
+        if isinstance(value, list):
+            return any(self._json_has_nonempty_asin_metric(item) for item in value)
+        return False
+
+    def _marketplace_from_observations(self, tool_observations: List[dict]) -> str:
+        for observation in reversed(tool_observations or []):
+            args = (observation or {}).get("arguments") if isinstance((observation or {}).get("arguments"), dict) else {}
+            marketplace = str(args.get("marketplace") or "").strip().upper()
+            if marketplace:
+                return marketplace
+            payload = self._load_tool_json_payload(str((observation or {}).get("raw_result") or ""))
+            if isinstance(payload, dict):
+                marketplace = str(self._find_first_json_key(payload, "marketplace") or "").strip().upper()
+                if marketplace:
+                    return marketplace
+        return ""
+
+    def _find_first_json_key(self, value: Any, wanted_key: str) -> Any:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if str(key or "").lower() == wanted_key:
+                    return item
+                found = self._find_first_json_key(item, wanted_key)
+                if found not in (None, "", [], {}):
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = self._find_first_json_key(item, wanted_key)
+                if found not in (None, "", [], {}):
+                    return found
+        return None
+
     def _scene_single_execution_tools(self, scene: str) -> set:
         return self.agent_harness.scene_single_execution_tools(scene)
 
@@ -6698,6 +7322,15 @@ class Pipeline:
             react_runner.plan_note(scene, plan)
 
             if not explicit_tool_name and plan.get("answer_ready") and str(plan.get("final_answer") or "").strip():
+                metric_gap_step = self._metric_gap_keepa_step_if_needed(source_messages, scene, tool_observations)
+                if metric_gap_step is not None:
+                    plan = dict(plan)
+                    plan["answer_ready"] = False
+                    plan["final_answer"] = ""
+                    plan["action_type"] = "tool"
+                    plan["steps"] = [metric_gap_step]
+
+            if not explicit_tool_name and plan.get("answer_ready") and str(plan.get("final_answer") or "").strip():
                 if charge_llm and mode == "agent" and not used_tools:
                     self._charge_standalone_llm_request(
                         billing_context=billing_context,
@@ -6742,6 +7375,9 @@ class Pipeline:
                 steps = self._enforce_theme_resolve_first_step(steps, scene, source_messages, body, tool_observations)
             steps = self._repair_planner_steps_required_arguments(steps, source_messages, body)
             steps = self._filter_redundant_planner_steps(steps, scene, tool_observations)
+            metric_gap_step = self._metric_gap_keepa_step_if_needed(source_messages, scene, tool_observations)
+            if metric_gap_step is not None:
+                steps = [metric_gap_step]
             react_runner.validation(scene, steps)
             if not steps:
                 if not tool_observations and str(plan.get("action_type") or "").strip() in {"", "none"}:

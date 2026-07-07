@@ -96,6 +96,18 @@ class FakeAgentTools:
         """Slice candidate pool by brand, title, material, or price range."""
         return ""
 
+    def product_forecast_explain(
+        self,
+        candidate_asins: str = "",
+        candidate_pool_id: str = "",
+        marketplace: str = "US",
+        window_days: int = 30,
+        top_n: int = 10,
+        product_query: str = "",
+    ) -> str:
+        """Return trained sales forecast fields and explainability summaries."""
+        return ""
+
     def asin_review_insights(
         self,
         candidate_asins: str = "",
@@ -225,6 +237,244 @@ class AgentNativeToolTests(unittest.TestCase):
         pipe._charge_billing_event = lambda **kwargs: {"points_charged": 0}
         pipe._refund_billing_event = lambda **kwargs: None
         return pipe
+
+    def test_report_quick_single_asin_uses_history_first_chain(self) -> None:
+        calls = []
+        charges = []
+        synthesis_calls = []
+
+        class RecordingAgentTools(FakeAgentTools):
+            def asin_history_timeseries(self, **kwargs) -> str:
+                calls.append(("asin_history_timeseries", copy.deepcopy(kwargs)))
+                return json.dumps(
+                    {
+                        "success": True,
+                        "data": {
+                            "latest_snapshot": {
+                                "asin": "B0TEST1234",
+                                "product_title": "Portable blender",
+                                "effective_price": 19.99,
+                                "bsr": 1234,
+                                "rating": 4.4,
+                                "review_count": 238,
+                            },
+                            "series": [
+                                {"date": "2026-04-01", "estimated_daily_sales": 10, "effective_price": 18.5, "bsr": 1500, "review_count": 210},
+                                {"date": "2026-07-01", "estimated_daily_sales": 18, "effective_price": 19.99, "bsr": 1234, "review_count": 238},
+                            ],
+                            "window_summary": {"review_growth_window": 28, "sales_daily_avg": 14, "sales_window_sum": 1260, "series_row_count": 2, "coverage_ratio": 1.0},
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+
+            def top_asin_drilldown(self, **kwargs) -> str:
+                raise AssertionError("formal ASIN quick should not call top_asin_drilldown")
+
+            def product_forecast_explain(self, **kwargs) -> str:
+                raise AssertionError("formal ASIN quick should not call product_forecast_explain")
+
+            def keepa_asin_lookup(self, **kwargs) -> str:
+                raise AssertionError("history evidence should avoid Keepa fallback")
+
+            def asin_review_insights(self, **kwargs) -> str:
+                raise AssertionError("formal ASIN quick must not call asin_review_insights")
+
+        pipe = self.make_pipeline()
+        pipe.agent_tools = RecordingAgentTools()
+        pipe.valves.CHAT_BACKEND_SERVICE_SECRET = "test-secret"
+        pipe._ensure_billing_context = lambda body: {"user_id": "u1", "api_key": "key"}
+        pipe._charge_billing_event = lambda **kwargs: charges.append(copy.deepcopy(kwargs)) or {"points_charged": 8}
+        pipe._refund_billing_event = lambda **kwargs: (_ for _ in ()).throw(AssertionError("successful ASIN quick must not refund"))
+        pipe._run_dify_chatflow = lambda **kwargs: (_ for _ in ()).throw(AssertionError("formal ASIN quick must not call Dify report quick"))
+        pipe._post_agent_payload = lambda payload, model_name: synthesis_calls.append(copy.deepcopy(payload)) or {
+            "choices": [
+                {
+                    "message": {
+                        "content": "# ASIN 快速排雷：B0TEST1234\n\n**最终结论：黄灯：谨慎验证**\n\n## 当前盘面\n模型复核：Portable blender。\n\n## 近 30/90 天变化\n窗口摘要：90天日销均值 14。\n\n## 评论增长与壁垒\n本地 ASIN 历史时序。\n\n## 价格 / BSR / 销量波动\n无明显异常。\n\n## 是否值得继续研究\n谨慎继续。"
+                    }
+                }
+            ]
+        }
+
+        result = pipe._run_report_profile(
+            query="请体检 ASIN B0TEST1234 在 Amazon 美国站是否值得继续看",
+            body={"stream": False, "messages": []},
+            model="xiamimate.agent-apiyi",
+            profile="quick",
+            mode_tag="report",
+            guidance="guide",
+        )
+
+        answer = result["choices"][0]["message"]["content"]
+        self.assertEqual([name for name, _ in calls], ["asin_history_timeseries"])
+        self.assertEqual(len(synthesis_calls), 1)
+        self.assertNotIn("tools", synthesis_calls[0])
+        self.assertEqual(charges[0]["event_type"], "report_quick_run")
+        self.assertEqual(charges[0]["meta"]["report_variant"], "asin_quick_analysis")
+        self.assertEqual(calls[0][1]["asins"], "B0TEST1234")
+        self.assertIn("# ASIN 快速排雷：B0TEST1234", answer)
+        self.assertIn("**最终结论：", answer)
+        self.assertIn("## 当前盘面", answer)
+        self.assertIn("## 近 30/90 天变化", answer)
+        self.assertIn("## 评论增长与壁垒", answer)
+        self.assertIn("本地 ASIN 历史时序", answer)
+        self.assertIn("窗口摘要", answer)
+        self.assertIn("90天日销均值 14", answer)
+        self.assertIn("模型复核", answer)
+        self.assertNotIn("## 销量预测及覆盖状态", answer)
+        self.assertNotIn("product_forecast_explain", answer)
+        self.assertNotIn("真实差评主题：", answer)
+        self.assertNotIn("评论关键词：", answer)
+        self.assertNotIn("痛点聚类：", answer)
+
+    def test_report_quick_single_asin_falls_back_to_keepa_when_history_empty(self) -> None:
+        calls = []
+
+        class RecordingAgentTools(FakeAgentTools):
+            def asin_history_timeseries(self, **kwargs) -> str:
+                calls.append(("asin_history_timeseries", copy.deepcopy(kwargs)))
+                return json.dumps({"success": True, "data": {"history_status": "not_found"}}, ensure_ascii=False)
+
+            def keepa_asin_lookup(self, **kwargs) -> str:
+                calls.append(("keepa_asin_lookup", copy.deepcopy(kwargs)))
+                return json.dumps(
+                    {
+                        "success": True,
+                        "data": {
+                            "items": [
+                                {
+                                    "asin": "B0TEST1234",
+                                    "title": "Keepa fallback item",
+                                    "price": 21.5,
+                                    "bsr": 2222,
+                                    "rating": 4.3,
+                                    "review_count": 108,
+                                    "estimated_daily_sales": 16,
+                                    "series": [
+                                        {"date": "2026-04-01", "estimated_daily_sales": 10, "effective_price": 19.9, "bsr": 2600, "review_count": 90},
+                                        {"date": "2026-07-01", "estimated_daily_sales": 16, "effective_price": 21.5, "bsr": 2222, "review_count": 108},
+                                    ],
+                                    "window_summary": {"sales_daily_avg": 14, "sales_window_sum": 1260, "review_growth_window": 18, "bsr_avg_window": 2400, "series_row_count": 2, "coverage_ratio": 1.0},
+                                }
+                            ]
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+
+            def top_asin_drilldown(self, **kwargs) -> str:
+                raise AssertionError("formal ASIN quick should not call top_asin_drilldown")
+
+            def product_forecast_explain(self, **kwargs) -> str:
+                raise AssertionError("formal ASIN quick should not call product_forecast_explain")
+
+        pipe = self.make_pipeline()
+        pipe.agent_tools = RecordingAgentTools()
+        pipe.valves.CHAT_BACKEND_SERVICE_SECRET = "test-secret"
+        pipe._ensure_billing_context = lambda body: {"user_id": "u1", "api_key": "key"}
+        pipe._charge_billing_event = lambda **kwargs: {"points_charged": 8}
+        pipe._run_dify_chatflow = lambda **kwargs: (_ for _ in ()).throw(AssertionError("formal ASIN quick must not call Dify report quick"))
+        pipe._post_agent_payload = lambda payload, model_name: (_ for _ in ()).throw(RuntimeError("LLM unavailable in unit test"))
+
+        result = pipe._run_report_profile(
+            query="请体检 ASIN B0TEST1234 在 Amazon 美国站是否值得继续看",
+            body={"stream": False, "messages": []},
+            model="xiamimate.agent-apiyi",
+            profile="quick",
+            mode_tag="report",
+            guidance="guide",
+        )
+
+        answer = result["choices"][0]["message"]["content"]
+        self.assertEqual([name for name, _ in calls], ["asin_history_timeseries", "keepa_asin_lookup"])
+        self.assertTrue(calls[1][1]["include_history"])
+        self.assertIn("Keepa 历史补充", answer)
+        self.assertIn("Keepa fallback item", answer)
+        self.assertIn("90天日销均值 14", answer)
+
+    def test_report_quick_single_asin_supplements_keepa_when_history_only_has_snapshot(self) -> None:
+        calls = []
+
+        class RecordingAgentTools(FakeAgentTools):
+            def asin_history_timeseries(self, **kwargs) -> str:
+                calls.append(("asin_history_timeseries", copy.deepcopy(kwargs)))
+                return json.dumps(
+                    {
+                        "success": True,
+                        "data": {
+                            "items": [
+                                {
+                                    "asin": "B0TEST1234",
+                                    "latest_snapshot": {
+                                        "product_title": "Snapshot only item",
+                                        "effective_price": 19.99,
+                                        "bsr": 100,
+                                        "review_count": 200,
+                                    },
+                                    "series": [],
+                                    "window_summary": None,
+                                }
+                            ]
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+
+            def keepa_asin_lookup(self, **kwargs) -> str:
+                calls.append(("keepa_asin_lookup", copy.deepcopy(kwargs)))
+                return json.dumps(
+                    {
+                        "success": True,
+                        "data": {
+                            "items": [
+                                {
+                                    "asin": "B0TEST1234",
+                                    "title": "Keepa history item",
+                                    "price": 18.8,
+                                    "bsr": 80,
+                                    "rating": 4.5,
+                                    "review_count": 260,
+                                    "series": [
+                                        {"date": "2026-04-01", "estimated_daily_sales": 20, "effective_price": 20.0, "bsr": 110, "review_count": 210},
+                                        {"date": "2026-07-01", "estimated_daily_sales": 24, "effective_price": 18.8, "bsr": 80, "review_count": 260},
+                                    ],
+                                    "window_summary": {"sales_daily_avg": 22, "sales_window_sum": 1980, "review_growth_window": 50, "bsr_avg_window": 95, "series_row_count": 2, "coverage_ratio": 1.0},
+                                }
+                            ]
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+
+            def top_asin_drilldown(self, **kwargs) -> str:
+                raise AssertionError("formal ASIN quick should not call top_asin_drilldown")
+
+            def product_forecast_explain(self, **kwargs) -> str:
+                raise AssertionError("formal ASIN quick should not call product_forecast_explain")
+
+        pipe = self.make_pipeline()
+        pipe.agent_tools = RecordingAgentTools()
+        pipe.valves.CHAT_BACKEND_SERVICE_SECRET = "test-secret"
+        pipe._ensure_billing_context = lambda body: {"user_id": "u1", "api_key": "key"}
+        pipe._charge_billing_event = lambda **kwargs: {"points_charged": 8}
+        pipe._run_dify_chatflow = lambda **kwargs: (_ for _ in ()).throw(AssertionError("formal ASIN quick must not call Dify report quick"))
+        pipe._post_agent_payload = lambda payload, model_name: (_ for _ in ()).throw(RuntimeError("LLM unavailable in unit test"))
+
+        result = pipe._run_report_profile(
+            query="请体检 ASIN B0TEST1234 在 Amazon 美国站是否值得继续看",
+            body={"stream": False, "messages": []},
+            model="xiamimate.agent-apiyi",
+            profile="quick",
+            mode_tag="report",
+            guidance="guide",
+        )
+
+        answer = result["choices"][0]["message"]["content"]
+        self.assertEqual([name for name, _ in calls], ["asin_history_timeseries", "keepa_asin_lookup"])
+        self.assertTrue(calls[1][1]["include_history"])
+        self.assertIn("Keepa 历史补充", answer)
+        self.assertIn("90天日销均值 22", answer)
 
     def test_explicit_product_opportunity_request_is_theme_analysis(self) -> None:
         pipe = self.make_pipeline()
@@ -971,6 +1221,115 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertEqual(executed_calls[0]["parameters"]["product_query"], "humidifier")
         self.assertEqual(executed_calls[0]["parameters"]["marketplace"], "US")
         self.assertIn("humidifier 候选池已成功解析", answer)
+
+    def test_metric_gap_after_candidate_slice_forces_keepa_lookup(self) -> None:
+        pipe = self.make_pipeline()
+        pipe._classify_agent_scene = lambda messages, mode="agent": "theme_analysis"
+        executed_calls = []
+
+        def plan_agent_next_steps(**kwargs) -> dict:
+            observed_names = [item.get("tool_name") for item in kwargs.get("tool_observations") or []]
+            if not observed_names:
+                return {
+                    "scene": "theme_analysis",
+                    "answer_ready": False,
+                    "final_answer": "",
+                    "reasoning_summary": "先按车型和类目切片候选池。",
+                    "steps": [
+                        {
+                            "tool_call": {
+                                "name": "candidate_pool_slice",
+                                "parameters": {
+                                    "candidate_pool_id": "pool-steering",
+                                    "marketplace": "US",
+                                    "title_keywords": "Honda Civic",
+                                    "top_n": 3,
+                                },
+                            },
+                            "goal": "筛选 Honda Civic Automotive > Steering Wheels ASIN",
+                            "required": True,
+                        }
+                    ],
+                    "stop_reason": "拿到切片后对比指标。",
+                }
+            if "keepa_asin_lookup" not in observed_names:
+                return {
+                    "scene": "theme_analysis",
+                    "answer_ready": True,
+                    "final_answer": "当前没有该 ASIN 的销量、价格、评论数，不能判断。",
+                    "reasoning_summary": "planner 过早 final，执行器应补 Keepa。",
+                    "steps": [],
+                    "stop_reason": "done",
+                }
+            return {
+                "scene": "theme_analysis",
+                "answer_ready": True,
+                "final_answer": "已补 Keepa 快照。",
+                "reasoning_summary": "Keepa 已补齐指标。",
+                "steps": [],
+                "stop_reason": "done",
+            }
+
+        pipe._plan_agent_next_steps = plan_agent_next_steps
+        pipe._synthesize_planner_executor_answer = lambda **kwargs: "已基于 Keepa 快照补充 Honda Civic ASIN 指标。"
+
+        def execute_tool_call(tool_call: dict, billing_context: dict, truncate: bool = True) -> str:
+            executed_calls.append(copy.deepcopy(tool_call))
+            if tool_call["name"] == "candidate_pool_slice":
+                return json.dumps(
+                    {
+                        "success": True,
+                        "data": {
+                            "marketplace": "US",
+                            "slice_count": 1,
+                            "top_asins": [
+                                {
+                                    "asin": "B0CR1HF8WQ",
+                                    "product_title": "Honda Civic Gen 10 Carbon Fiber Steering Wheel",
+                                    "category_path": "Automotive > Replacement Parts > Body & Trim > Trim > Interior > Steering Wheels",
+                                }
+                            ],
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+            return json.dumps(
+                {
+                    "success": True,
+                    "data": {
+                        "items": [
+                            {
+                                "asin": "B0CR1HF8WQ",
+                                "effective_price": 399.99,
+                                "rating": 4.4,
+                                "review_count": 18,
+                                "estimated_daily_sales": 1.2,
+                            }
+                        ]
+                    },
+                },
+                ensure_ascii=False,
+            )
+
+        pipe._execute_tool_call = execute_tool_call
+
+        answer = pipe._run_agent_loop(
+            messages=[
+                {
+                    "role": "user",
+                    "content": "请分别只保留 Ford F150、Honda Civic、Dodge Charger 三个词下 Automotive > Steering Wheels 的 ASIN，并对比销量、价格、评分、评论数和匹配度最高的 ASIN。",
+                }
+            ],
+            body={},
+            billing_context={"api_key": "test"},
+            model_name="deepseek-v4-pro",
+            mode="agent",
+        )
+
+        self.assertEqual([call["name"] for call in executed_calls], ["candidate_pool_slice", "keepa_asin_lookup"])
+        self.assertEqual(executed_calls[1]["parameters"]["asins"], "B0CR1HF8WQ")
+        self.assertEqual(executed_calls[1]["parameters"]["marketplace"], "US")
+        self.assertIn("Keepa", answer)
 
     def test_explicit_resolve_candidates_tool_request_repairs_required_product_query(self) -> None:
         pipe = self.make_pipeline()
