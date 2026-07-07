@@ -1169,14 +1169,10 @@ class Pipeline:
             "**价格/BSR/销量**：%s" % self._report_asin_quick_window_summary_text(selected_payload),
             "**数据来源**：%s" % source_label,
         ])
-        conclusion = self._report_asin_quick_light(0 if selected_result.get("ok") else 1, review_barrier, volatility_text)
-
-        if conclusion.startswith("绿灯"):
-            research_action = "可以作为竞品、跟卖参考或选品样本继续研究，但仍要补利润、合规和供应链验证。"
-        elif conclusion.startswith("黄灯"):
-            research_action = "可以作为竞品观察样本，但不建议直接跟卖；先验证利润空间、评论壁垒和销量稳定性。"
-        else:
-            research_action = "暂时不建议作为跟卖参考或选品样本投入预算；除非后续补到更稳定的销量、评论和利润证据。"
+        risk_assessment = self._report_asin_quick_risk_assessment(selected_payload)
+        conclusion = str(risk_assessment["conclusion"])
+        risk_text = "\n".join("- %s" % flag for flag in risk_assessment["flags"])
+        research_action = str(risk_assessment["action"])
 
         deterministic_answer = "\n".join([
             "# ASIN 快速排雷：%s" % asin,
@@ -1194,6 +1190,9 @@ class Pipeline:
             "",
             "## 价格 / BSR / 销量波动",
             volatility_text,
+            "",
+            "## 核心排雷风险",
+            risk_text,
             "",
             "## 是否值得继续研究",
             research_action,
@@ -1234,6 +1233,7 @@ class Pipeline:
             "series_delta_30d": self._report_asin_quick_series_delta_text(selected_payload, 30),
             "series_delta_90d": self._report_asin_quick_series_delta_text(selected_payload, 90),
             "window_summary": self._report_asin_quick_window_summary_text(selected_payload),
+            "risk_assessment": self._report_asin_quick_risk_assessment(selected_payload),
             "tool_decision": tool_decision,
             "draft_answer": deterministic_answer,
         }
@@ -1243,9 +1243,12 @@ class Pipeline:
                 "content": (
                     "你是虾米选品的 ASIN 快速排雷分析师。请基于下面的工具证据输出一份中文 Markdown 快速排雷报告，"
                     "保持红/黄/绿灯结论先行，不要再要求或模拟调用任何工具，不要编造评论主题、差评关键词、政策或供应链信息。"
+                    "灯号含义是判断是否适合新手直接跟卖/仿款切入，不是判断这个 ASIN 是否有研究价值。"
+                    "如果证据显示低价、超高评论壁垒、BSR 头部爆款或少数卖家控制，不能因为销量强、覆盖率高就给绿灯；"
+                    "这种情况应给红灯或黄色预警，并说明它最多适合作为类目需求验证样本。"
                     "你需要复核工具决策：如果 tool_chain 含 keepa_asin_lookup，说明 asin_history_timeseries 只有快照或缺历史窗口，"
                     "Keepa 已带 include_history=true 补足历史；报告中应明确引用这些历史窗口证据。"
-                    "结构固定为：# ASIN 快速排雷、最终结论、当前盘面、近 30/90 天变化、评论增长与壁垒、价格 / BSR / 销量波动、是否值得继续研究。\n\n"
+                    "结构固定为：# ASIN 快速排雷、最终结论、当前盘面、近 30/90 天变化、评论增长与壁垒、价格 / BSR / 销量波动、核心排雷风险、是否值得继续研究。\n\n"
                     "ASIN：%s\n站点：%s\n证据 JSON：\n%s"
                 )
                 % (asin, marketplace, json.dumps(evidence, ensure_ascii=False)[:6000]),
@@ -1412,6 +1415,49 @@ class Pipeline:
             if value not in (None, "", [], {}):
                 snapshot[output_key] = value
         return snapshot
+
+    def _report_asin_quick_risk_assessment(self, payload: dict) -> dict:
+        price = self._report_asin_quick_number_value(payload, {"effective_price", "price", "current_price"})
+        review_count = self._report_asin_quick_number_value(payload, {"review_count", "reviews"})
+        bsr = self._report_asin_quick_number_value(payload, {"bsr", "current_bsr", "best_sellers_rank"})
+        daily_sales = self._report_asin_quick_number_value(payload, {"estimated_daily_sales", "sales_daily_avg"})
+        offer_count = self._report_asin_quick_number_value(payload, {"offer_count", "offer_count_avg_window"})
+
+        flags = []
+        red_signals = 0
+        if price is not None and price <= 12:
+            flags.append("低价利润压力：当前价格 %s，新手容易被履约、广告和退货成本吃掉利润" % self._report_asin_quick_format_number(price))
+            red_signals += 1
+        elif price is not None and price <= 18:
+            flags.append("价格带偏低：当前价格 %s，需要先核算 FBA/头程/广告后再判断" % self._report_asin_quick_format_number(price))
+
+        if review_count is not None and review_count >= 30000:
+            flags.append("评论壁垒极高：评论数 %s，新链接很难直接对抗转化信任" % self._report_asin_quick_format_number(review_count))
+            red_signals += 1
+        elif review_count is not None and review_count >= 5000:
+            flags.append("评论壁垒较高：评论数 %s，新品切入需要明显差异化" % self._report_asin_quick_format_number(review_count))
+
+        if bsr is not None and bsr <= 100:
+            sales_text = "，预估日销 %s" % self._report_asin_quick_format_number(daily_sales) if daily_sales is not None else ""
+            flags.append("头部爆款竞争：BSR %s%s，说明需求强但正面竞争门槛也高" % (self._report_asin_quick_format_number(bsr), sales_text))
+            if daily_sales is not None and daily_sales >= 500:
+                red_signals += 1
+        elif bsr is not None and bsr <= 1000:
+            flags.append("排名靠前：BSR %s，需要验证是否被头部卖家锁定" % self._report_asin_quick_format_number(bsr))
+
+        if offer_count is not None and offer_count <= 3 and daily_sales is not None and daily_sales >= 300:
+            flags.append("少数卖家控制：Offer 数约 %s，不应简单理解为竞争轻" % self._report_asin_quick_format_number(offer_count))
+
+        if red_signals >= 2 or (price is not None and price <= 12 and review_count is not None and review_count >= 10000):
+            conclusion = "红灯：不适合新手直接跟卖/仿款切入"
+            action = "不建议直接跟卖或做同款仿款；它更适合作为类目需求验证样本，下一步应找更高客单价、更低评论壁垒或更明确差异化的中腰部 ASIN。"
+        elif flags:
+            conclusion = "黄灯：谨慎验证"
+            action = "可以作为竞品观察样本，但不要只看销量；先验证利润空间、评论壁垒、差异化和广告试错成本。"
+        else:
+            conclusion = "绿灯：值得继续研究"
+            action = "可以继续作为候选样本研究，但仍要补利润、合规、供应链和广告成本验证。"
+        return {"conclusion": conclusion, "flags": flags or ["暂未从价格、评论、BSR、销量中识别到明显硬阻断项"], "action": action}
 
     def _report_asin_quick_window_summary_text(self, payload: dict) -> str:
         summary = self._report_asin_quick_find_value(payload, {"window_summary"})

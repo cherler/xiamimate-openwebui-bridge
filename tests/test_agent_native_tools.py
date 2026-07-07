@@ -310,6 +310,7 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertEqual([name for name, _ in calls], ["asin_history_timeseries"])
         self.assertEqual(len(synthesis_calls), 1)
         self.assertNotIn("tools", synthesis_calls[0])
+        self.assertIn("低价、超高评论壁垒、BSR 头部爆款", synthesis_calls[0]["messages"][-1]["content"])
         self.assertEqual(charges[0]["event_type"], "report_quick_run")
         self.assertEqual(charges[0]["meta"]["report_variant"], "asin_quick_analysis")
         self.assertEqual(calls[0][1]["asins"], "B0TEST1234")
@@ -475,6 +476,24 @@ class AgentNativeToolTests(unittest.TestCase):
         self.assertTrue(calls[1][1]["include_history"])
         self.assertIn("Keepa 历史补充", answer)
         self.assertIn("90天日销均值 22", answer)
+
+    def test_report_quick_asin_risk_assessment_red_for_low_price_review_wall_head_asin(self) -> None:
+        pipe = self.make_pipeline()
+        result = pipe._report_asin_quick_risk_assessment(
+            {
+                "effective_price": 9.37,
+                "review_count": 48654,
+                "bsr": 10,
+                "estimated_daily_sales": 1333.3,
+                "offer_count": 1,
+            }
+        )
+
+        self.assertTrue(result["conclusion"].startswith("红灯"))
+        self.assertTrue(any("低价利润压力" in item for item in result["flags"]))
+        self.assertTrue(any("评论壁垒极高" in item for item in result["flags"]))
+        self.assertTrue(any("头部爆款竞争" in item for item in result["flags"]))
+        self.assertIn("不建议直接跟卖", result["action"])
 
     def test_explicit_product_opportunity_request_is_theme_analysis(self) -> None:
         pipe = self.make_pipeline()
